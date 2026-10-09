@@ -28,3 +28,7 @@ Thumbs.db
 
 # prototype single-file scripts (kept locally, not published)
 legacy/
+
+# ---- local artifacts (apk builds / account backups) ----
+*.apk
+accounts.json.bak*
