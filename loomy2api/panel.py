@@ -20,17 +20,41 @@ Endpoints
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from . import constants as C
 from .account import Account, AccountError
 from .pool import PoolError
+from .upstream import UpstreamError
 
 __all__ = ["Panel"]
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 PANEL_HTML = WEB_DIR / "index.html"
+
+#: points multiplier shipped inside the upstream model ``name``, e.g.
+#: ``DeepSeek V4 Flash 0731（x3.0）`` / ``GLM 5.3 Flash(x0.8)``
+_MULTIPLIER_RE = re.compile(r"[（(]\s*(x?\s*[\d.]+)\s*[）)]")
+
+
+def parse_multiplier(name: str) -> Optional[float]:
+    """Points multiplier for a model, or ``None`` when the upstream omits it."""
+    match = _MULTIPLIER_RE.search(str(name or ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(1).replace("x", "").replace(" ", ""))
+    except ValueError:
+        return None
+
+
+def pretty_model_name(name: str) -> str:
+    """Strip the multiplier suffix so the table can show it in its own column."""
+    return _MULTIPLIER_RE.sub("", str(name or "")).strip(" ·-") or str(name or "")
+
 
 #: Hidden phone number for the panel: 138****0000
 def mask_phone(value: str) -> str:
@@ -38,6 +62,21 @@ def mask_phone(value: str) -> str:
     if len(digits) < 7:
         return str(value or "")
     return f"{digits[:3]}****{digits[-4:]}"
+
+
+#: The 8 onboarding tasks the mobile client submits one by one via
+#: ``POST /onboarding/tasks/complete`` — same keys / order / rewards as the
+#: Android app (q1/Y; static list).
+ONBOARDING_TASKS = [
+    ("first_message", "首次对话", 500),
+    ("pick_skill", "选择技能", 1000),
+    ("generate_ppt", "生成 PPT", 1500),
+    ("set_schedule", "设置日程", 1000),
+    ("install_skill", "安装技能", 1500),
+    ("configure_remote", "配置远程", 1000),
+    ("create_soul", "创建人格", 1500),
+    ("share_soul", "分享人格", 2000),
+]
 
 
 class Panel:
@@ -156,6 +195,111 @@ class Panel:
         result["state"] = self.state()
         return result
 
+    def import_accounts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Bulk import from the Android app's export file (accounts array).
+
+        Accepts either ``{"accounts": [...]}`` or a bare list.  Fields mirror
+        the export: name/loginid/session/userid/expireAt/obtainedAt/identity.
+        Skips accounts whose name already exists (``skip_existing``), otherwise
+        updates the session of an existing entry.  ``expireAt``/``obtainedAt``
+        are normalised: the export stores milliseconds, the pool wants seconds.
+        """
+        items = payload.get("accounts")
+        if not isinstance(items, list):
+            if isinstance(payload.get("list"), list):
+                items = payload["list"]
+            else:
+                raise PoolError("需要 accounts 数组 / expected {accounts: [...]}")
+
+        mode = str(payload.get("mode") or "skip")     # skip | update
+        added, updated, skipped = [], [], []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw = dict(item)
+            for key in ("expireAt", "obtainedAt"):
+                try:
+                    v = int(raw.get(key) or 0)
+                except (TypeError, ValueError):
+                    v = 0
+                if v > 10**11:                        # ms → s
+                    raw[key] = v // 1000
+            name = str(raw.get("name") or raw.get("loginid") or "").strip()
+            session = str(raw.get("session") or "").strip()
+            if not name or not session:
+                skipped.append(name or "<unnamed>")
+                continue
+            existing = self.pool.get(name)
+            if existing is not None:
+                if mode == "update":
+                    existing.session = session
+                    existing.userid = str(raw.get("userid") or existing.userid)
+                    existing.expire_at = int(raw.get("expireAt") or 0)
+                    existing.obtained_at = int(raw.get("obtainedAt") or 0)
+                    if raw.get("identity"):
+                        existing.identity = dict(raw["identity"])
+                    updated.append(name)
+                else:
+                    skipped.append(name)
+                continue
+            self.pool.add_account(
+                name, loginid=str(raw.get("loginid") or ""),
+                session=session, userid=str(raw.get("userid") or ""),
+                identity=dict(raw["identity"]) if raw.get("identity") else None)
+            acc = self.pool.get(name)
+            if acc is not None and raw.get("expireAt"):
+                acc.expire_at = int(raw["expireAt"])
+            if acc is not None and raw.get("obtainedAt"):
+                acc.obtained_at = int(raw["obtainedAt"])
+            added.append(name)
+
+        self.pool.save(force=True)
+        self.log(f"[panel] 批量导入：新增 {len(added)} 更新 {len(updated)} "
+                 f"跳过 {len(skipped)}")
+        return {"ok": True, "added": added, "updated": updated,
+                "skipped": skipped, "state": self.state()}
+
+    def sms_send(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Step 1 of SMS login: send the code, hand back the ``msgid``."""
+        phone = str(payload.get("loginid") or payload.get("phone") or "").strip()
+        if not phone:
+            raise PoolError("需要手机号 / phone is required")
+        result = self.pool.client.send_sms_code(phone)
+        node = result.get("data") if isinstance(result.get("data"), dict) else result
+        msgid = str((node or {}).get("msgid") or "")
+        if not msgid:
+            raise PoolError(f"上游未返回 msgid / no msgid returned: {result}")
+        self.log(f"[panel] 已向 {mask_phone(phone)} 下发验证码")
+        return {"ok": True, "msgid": msgid, "phone": phone}
+
+    def sms_login(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Step 2 of SMS login: exchange the code for a session."""
+        name = str(payload.get("name") or "").strip()
+        phone = str(payload.get("loginid") or payload.get("phone") or "").strip()
+        code = str(payload.get("code") or "").strip()
+        msgid = str(payload.get("msgid") or "").strip()
+        if not phone or not code or not msgid:
+            raise PoolError("需要手机号、验证码和 msgid / phone, code and msgid required")
+        if not name:
+            name = phone
+
+        got = self.pool.client.login_by_sms(phone, code, msgid)
+        acc = self.pool.get(name)
+        if acc is None:
+            acc = self.pool.add_account(name, loginid=phone)
+        acc.session = got["session"]
+        acc.userid = got.get("userid", "")
+        acc.obtained_at = int(time.time())
+        acc.expire_at = acc.obtained_at + C.SESSION_EXPIRE_SECONDS
+        try:
+            self.pool.refresh_quota(acc)
+        except Exception as exc:                         # noqa: BLE001
+            self.log(f"[panel] {name} 额度刷新失败：{exc}")
+        self.pool.save(force=True)
+        self.log(f"[panel] {name} 验证码登录成功 userid={acc.userid}")
+        return {"ok": True, "name": acc.name, "userid": acc.userid,
+                "state": self.state()}
+
     def update_account(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         name = str(payload.get("name") or "").strip()
         fields: Dict[str, Any] = {}
@@ -217,6 +361,148 @@ class Panel:
             self.pool.save(force=True)
         return {"ok": True, "name": name, "identity": acc.identity_view(),
                 "state": self.state()}
+
+    def models(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Catalogue with the points multiplier pulled out of the upstream name."""
+        if (payload or {}).get("refresh"):
+            try:
+                self.gw.refresh_models()
+            except Exception as exc:                     # noqa: BLE001
+                self.log(f"[panel] 刷新模型列表失败：{exc}")
+        items = []
+        for raw in self.gw.catalogue():
+            name = str(raw.get("name") or raw.get("id") or "")
+            caps = raw.get("capabilities") or {}
+            items.append({
+                "id": raw.get("id"),
+                "name": pretty_model_name(name),
+                "multiplier": parse_multiplier(name),
+                "context_length": raw.get("context_length"),
+                "max_output_tokens": raw.get("max_output_tokens"),
+                "type": raw.get("type"),
+                "reasoning": bool(caps.get("reasoning")),
+                "vision": bool(caps.get("vision")),
+                "function_calling": bool(caps.get("function_calling")),
+                "input_modalities": caps.get("input_modalities") or [],
+                "is_default": bool(raw.get("is_default_model")),
+                "default_model": raw.get("id") == self.gw.cfg.get("default_model"),
+            })
+        items.sort(key=lambda m: (m["multiplier"] is None, m["multiplier"] or 0, m["id"] or ""))
+        return {"ok": True, "count": len(items), "models": items}
+
+    def _pick_account(self, name: Any = None) -> Account:
+        """Resolve an account by name, else the first usable, else the first."""
+        wanted = str(name or "").strip()
+        acc = self.pool.get(wanted) if wanted else None
+        if acc is None:
+            usable = self.pool.usable()
+            acc = usable[0] if usable else (self.pool.accounts[0] if self.pool.accounts else None)
+        if acc is None or not acc.session:
+            raise PoolError("没有可用账号 / no usable account")
+        return acc
+
+    def points(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Daily grant, invitation codes and recent ledger (read-only)."""
+        payload = payload or {}
+        acc = self._pick_account(payload.get("name"))
+        gw = self.gw.models_client
+        overview = gw.points_overview(acc.session)
+        ledger = {"total": 0, "rows": []}
+        if payload.get("ledger", True):
+            try:
+                ledger = gw.points_ledger(acc.session,
+                                          page_size=int(payload.get("size") or 50))
+            except Exception as exc:                     # noqa: BLE001
+                self.log(f"[panel] 读取积分流水失败：{exc}")
+        return {"ok": True, "account": acc.name, "overview": overview,
+                "ledger": ledger}
+
+    def points_activate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Submit an invitation code for one account (mutates account state)."""
+        code = str(payload.get("code") or "").strip()
+        if not code:
+            raise PoolError("需要邀请码 / invite code is required")
+        acc = self._pick_account(payload.get("name"))
+        dev = (acc.identity or {}).get("campus_device_id") or ""
+        data = self.gw.models_client.points_activate(acc.session, dev, code)
+        self.log(f"[panel] {acc.name} 提交邀请码 {code}："
+                 f"activated={data.get('activated')} "
+                 f"already={data.get('alreadyActivated')}")
+        return {"ok": True, "account": acc.name, "code": code, "result": data,
+                "points": self.points({"name": acc.name, "ledger": False})}
+
+    def onboarding(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """One-click onboarding: submit all 8 tasks via the dedicated endpoint.
+
+        Mirrors the mobile client's "一键新手任务" (`q1/s;->j`): each task key
+        goes through ``POST /onboarding/tasks/complete`` and the response
+        reports ``success``/``completed`` plus awarded ``points``.  Each task
+        is idempotent server-side, so re-running only reports state.
+        """
+        payload = payload or {}
+        acc = self._pick_account(payload.get("name"))
+        gw = self.gw.models_client
+        results = []
+        gained = 0
+        # capture balance before the run so "gained" is a real delta
+        try:
+            balance_before = int(gw.quota(acc.session).get("balance") or 0)
+        except Exception:                                # noqa: BLE001
+            balance_before = None
+        for key, label, _reward in ONBOARDING_TASKS:
+            row: Dict[str, Any] = {"key": key, "name": label,
+                                   "expected": _reward}
+            try:
+                data = gw.onboarding_complete(acc.session, key)
+                # live shape: {alreadyCompleted: bool, balance: <permanent>}
+                row.update({"ok": True,
+                            "already": bool(data.get("alreadyCompleted")),
+                            "balance": data.get("balance")})
+            except Exception as exc:                     # noqa: BLE001
+                row.update({"ok": False, "error": str(exc)[:200]})
+            results.append(row)
+        # points actually gained = balance delta across the run
+        gained = 0
+        try:
+            balance_now = int(gw.quota(acc.session).get("balance") or 0)
+            if balance_before is not None:
+                gained = max(0, balance_now - balance_before)
+        except Exception:                                # noqa: BLE001
+            pass
+        self.log(f"[panel] {acc.name} 新手任务完成：gained={gained} "
+                 f"ok={sum(1 for r in results if r.get('ok'))}/8")
+        return {"ok": True, "account": acc.name, "gained": gained,
+                "tasks": results,
+                "points": self.points({"name": acc.name, "ledger": False})}
+
+    def onboarding_state(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Read-only task list + completion state (``GET /onboarding/tasks``)."""
+        acc = self._pick_account((payload or {}).get("name"))
+        data = self.gw.models_client.onboarding_tasks(acc.session)
+        return {"ok": True, "account": acc.name, "tasks": data}
+
+    def checkin(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Daily check-in — the mobile client's use of ``points/first-login``.
+
+        Idempotent per daily cycle: a repeat call comes back with
+        ``alreadyProcessed`` and today's balances.
+        """
+        payload = payload or {}
+        acc = self._pick_account(payload.get("name"))
+        dev = (acc.identity or {}).get("campus_device_id") or ""
+        data = self.gw.models_client.points_first_login(acc.session, dev)
+        already = bool(data.get("alreadyProcessed"))
+        self.log(f"[panel] {acc.name} 签到：{'今日已领' if already else '已签到'} "
+                 f"balance={data.get('currentBalance') or data.get('permanentBalance')}")
+        return {"ok": True, "account": acc.name, "already": already,
+                "code": data.get("code"),
+                "current_balance": data.get("currentBalance"),
+                "permanent_balance": data.get("permanentBalance"),
+                "daily_balance": data.get("dailyBalance"),
+                "daily_quota": data.get("dailyQuota"),
+                "daily_cycle_date": data.get("dailyCycleDate"),
+                "desc": data.get("desc"),
+                "points": self.points({"name": acc.name, "ledger": False})}
 
     def logs(self, lines: int = 200) -> Dict[str, Any]:
         path = self.gw.log.path

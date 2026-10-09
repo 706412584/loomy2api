@@ -100,18 +100,101 @@
   </section>
 
   <section>
-    <h2>添加账号 <small>add account</small></h2>
-    <div class="grid">
-      <div><label>名称 name</label><input id="f-name" placeholder="main"></div>
-      <div><label>手机号 phone</label><input id="f-phone" placeholder="13800000000"></div>
-      <div><label>密码 password</label><input id="f-pass" type="password" placeholder="账号中心里设的密码"></div>
-      <div><label>或 session（可选）</label><input id="f-session" placeholder="32 位 session"></div>
-      <div><label>策略 strategy</label><select id="f-login">
-        <option value="1">添加后立即登录</option><option value="0">只保存不登录</option>
-      </select></div>
-      <div><button class="primary" id="add">添加并绑定设备标识</button></div>
+    <h2>模型列表 <small id="modelCount">models</small>
+      <button id="loadModels" style="float:right">刷新模型（含倍率）</button>
+    </h2>
+    <table>
+      <thead>
+        <tr>
+          <th>模型 ID</th><th>名称</th><th>倍率</th><th>上下文</th>
+          <th>最大输出</th><th>能力</th>
+        </tr>
+      </thead>
+      <tbody id="modelRows"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+    </table>
+    <div class="hint">倍率即积分消耗系数（越低越便宜），从上游模型名中解析；「限时免费」等未标注倍率的模型显示为 —。</div>
+  </section>
+
+  <section>
+    <h2>积分与邀请码 <small id="pointsFor">points &amp; invites</small>
+      <button id="loadPoints" style="float:right">刷新</button>
+    </h2>
+    <div class="cards" id="pointCards"></div>
+    <div id="inviteWrap" style="margin-top:12px">
+      <div class="hint" style="margin-bottom:6px">我的邀请码（每个可用 1 次，好友注册时填写可各得奖励）</div>
+      <div id="inviteCodes" class="row" style="flex-wrap:wrap;gap:8px"></div>
     </div>
-    <div class="hint">密码需要先在讯飞账号中心设置一次；添加成功后会自动为本账号随机生成一套设备标识（devid / 校园设备号）并绑定，之后每次续期都用同一套。</div>
+    <div class="row" style="margin-top:14px;gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <div style="flex:1;min-width:200px">
+        <label>填写别人的邀请码 <small class="muted">（每个账号仅能填一次）</small></label>
+        <input id="inviteInput" placeholder="输入邀请码" style="width:100%">
+      </div>
+      <button id="applyInvite">提交邀请码</button>
+      <button id="doCheckin">每日签到</button>
+      <button class="primary" id="doOnboarding">一键新手任务</button>
+    </div>
+    <div id="taskResults" style="margin-top:10px;display:none">
+      <table>
+        <thead><tr><th>任务</th><th>key</th><th>状态</th><th>到账积分</th><th>预期</th></tr></thead>
+        <tbody id="taskRows"></tbody>
+      </table>
+    </div>
+    <div class="hint" id="pointsMsg"></div>
+    <details style="margin-top:12px">
+      <summary>积分流水 <small>recent ledger</small></summary>
+      <table style="margin-top:8px">
+        <thead><tr><th>时间</th><th>模型</th><th>方向</th><th>积分</th><th>余额</th></tr></thead>
+        <tbody id="ledgerRows"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </details>
+  </section>
+
+  <section>
+    <h2>添加账号 <small>add account</small>
+      <button class="primary" id="showAdd" style="float:right">＋ 添加账号</button>
+    </h2>
+    <div id="addPanel" style="display:none">
+      <div class="row" style="gap:8px;margin-bottom:10px">
+        <button id="tabPwd" class="primary">密码登录</button>
+        <button id="tabSms">验证码登录</button>
+        <button id="tabImport">批量导入</button>
+      </div>
+
+      <div id="panePwd" class="grid">
+        <div><label>名称 name</label><input id="f-name" placeholder="main"></div>
+        <div><label>手机号 phone</label><input id="f-phone" placeholder="13800000000"></div>
+        <div><label>密码 password</label><input id="f-pass" type="password" placeholder="账号中心里设的密码"></div>
+        <div><label>或 session（可选）</label><input id="f-session" placeholder="32 位 session"></div>
+        <div><label>登录方式</label><select id="f-login">
+          <option value="1">添加后立即登录</option><option value="0">只保存不登录</option>
+        </select></div>
+        <div><button class="primary" id="add">添加并绑定设备标识</button></div>
+      </div>
+
+      <div id="paneSms" class="grid" style="display:none">
+        <div><label>名称 name（可选）</label><input id="s-name" placeholder="留空则用手机号"></div>
+        <div><label>手机号 phone</label><input id="s-phone" placeholder="13800000000"></div>
+        <div><label>验证码 code</label>
+          <div class="row" style="gap:6px">
+            <input id="s-code" placeholder="6 位验证码" style="flex:1">
+            <button id="smsSend">获取验证码</button>
+          </div>
+        </div>
+        <div><button class="primary" id="smsLogin">验证码登录</button></div>
+      </div>
+
+      <div id="paneImport" style="display:none">
+        <div class="hint" style="margin-bottom:6px">粘贴手机 App 导出的 JSON（含 accounts 数组）或纯账号列表；同名账号默认跳过，也可选覆盖更新。毫秒时间戳会自动归一化为秒。</div>
+        <textarea id="importText" rows="8" style="width:100%;font-family:monospace" placeholder='{"accounts":[{"name":"13800000000","session":"…","userid":"…"}]}'></textarea>
+        <div class="row" style="margin-top:8px;gap:8px">
+          <select id="importMode"><option value="skip">跳过同名</option><option value="update">覆盖同名 session</option></select>
+          <button class="primary" id="doImport">导入</button>
+          <label style="display:flex;align-items:center;gap:4px"><input type="file" id="importFile" accept=".json,application/json" style="display:none"><button onclick="document.getElementById('importFile').click()">选择文件…</button></label>
+        </div>
+      </div>
+
+      <div class="hint">密码登录：需先在讯飞账号中心设置密码，可自动续期。验证码登录：无需密码，但 session 14 天后过期需重新登录。添加成功后会为账号随机生成设备标识（devid / 校园设备号）并绑定。</div>
+    </div>
   </section>
 
   <section>
@@ -239,6 +322,83 @@ async function act(kind, name, value) {
   }
 }
 
+function showTab(which) {
+  $('panePwd').style.display = which === 'pwd' ? '' : 'none';
+  $('paneSms').style.display = which === 'sms' ? '' : 'none';
+  $('paneImport').style.display = which === 'import' ? '' : 'none';
+  $('tabPwd').className = which === 'pwd' ? 'primary' : '';
+  $('tabSms').className = which === 'sms' ? 'primary' : '';
+  $('tabImport').className = which === 'import' ? 'primary' : '';
+}
+
+async function doImport() {
+  const raw = $('importText').value.trim();
+  if (!raw) { toast('请先粘贴导出的 JSON', 'err'); return; }
+  let items;
+  try {
+    const parsed = JSON.parse(raw);
+    items = Array.isArray(parsed) ? parsed : (parsed.accounts || parsed.list);
+  } catch (e) { toast('JSON 解析失败：' + e.message, 'err'); return; }
+  if (!Array.isArray(items) || !items.length) { toast('没有找到 accounts 数组', 'err'); return; }
+  try {
+    const res = await api('/api/panel/accounts/import', {
+      method: 'POST',
+      body: JSON.stringify({accounts: items, mode: $('importMode').value})
+    });
+    $('pointsMsg') && ($('pointsMsg').textContent = '');
+    toast('导入完成：新增 ' + res.added.length + '，更新 ' + res.updated.length
+      + '，跳过 ' + res.skipped.length, 'ok');
+    $('importText').value = '';
+    if (res.state) render(res.state);
+  } catch (e) {
+    toast('导入失败：' + e.message, 'err');
+  }
+}
+
+$('importFile') && ($('importFile').onchange = (ev) => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  const fr = new FileReader();
+  fr.onload = () => { $('importText').value = fr.result; };
+  fr.readAsText(f);
+});
+
+let SMS_MSGID = '';
+
+async function sendSms() {
+  const phone = $('s-phone').value.trim();
+  if (!phone) { toast('请先填手机号', 'err'); return; }
+  try {
+    const res = await api('/api/panel/accounts/sms', {
+      method: 'POST', body: JSON.stringify({loginid: phone})
+    });
+    SMS_MSGID = res.msgid;
+    toast('验证码已发送到 ' + phone, 'ok');
+  } catch (e) {
+    toast('发送失败：' + e.message, 'err');
+  }
+}
+
+async function smsLogin() {
+  const phone = $('s-phone').value.trim();
+  const code = $('s-code').value.trim();
+  const name = $('s-name').value.trim() || phone;
+  if (!phone || !code) { toast('请填手机号和验证码', 'err'); return; }
+  if (!SMS_MSGID) { toast('请先点「获取验证码」', 'err'); return; }
+  try {
+    const res = await api('/api/panel/accounts/sms-login', {
+      method: 'POST',
+      body: JSON.stringify({name, loginid: phone, code, msgid: SMS_MSGID})
+    });
+    toast('已添加 ' + res.name + '（userid ' + res.userid + '）', 'ok');
+    $('s-name').value = $('s-phone').value = $('s-code').value = '';
+    SMS_MSGID = '';
+    if (res.state) render(res.state);
+  } catch (e) {
+    toast('登录失败：' + e.message, 'err');
+  }
+}
+
 async function addAccount() {
   const body = {
     name: $('f-name').value.trim(),
@@ -258,6 +418,175 @@ async function addAccount() {
   }
 }
 
+function capChips(m) {
+  const chips = [];
+  if (m.reasoning) chips.push('推理');
+  if (m.function_calling) chips.push('工具');
+  if (m.vision) chips.push('视觉');
+  (m.input_modalities || []).forEach(x => { if (x !== 'text') chips.push(x); });
+  return chips.length ? chips.join(' · ') : '—';
+}
+
+function fmtTokens(v) {
+  if (!v) return '—';
+  return v >= 1024 ? Math.round(v / 1024) + 'K' : String(v);
+}
+
+function renderModels(data) {
+  const list = data.models || [];
+  $('modelCount').textContent = 'models · ' + list.length + ' 个';
+  if (!list.length) {
+    $('modelRows').innerHTML = '<tr><td colspan="6" class="muted">暂无模型</td></tr>';
+    return;
+  }
+  $('modelRows').innerHTML = list.map(m => {
+    const mult = m.multiplier === null || m.multiplier === undefined
+      ? '<span class="muted">—</span>'
+      : '<b>x' + m.multiplier + '</b>' + (m.multiplier <= 1 ? ' <span class="badge b-ok">便宜</span>' : '');
+    const tag = m.is_default ? ' <span class="badge b-ok">上游默认</span>'
+      : (m.default_model ? ' <span class="badge b-ok">本网关默认</span>' : '');
+    return '<tr>'
+      + '<td class="mono"><b>' + m.id + '</b>' + tag + '</td>'
+      + '<td>' + m.name + '</td>'
+      + '<td>' + mult + '</td>'
+      + '<td class="mono">' + fmtTokens(m.context_length) + '</td>'
+      + '<td class="mono">' + fmtTokens(m.max_output_tokens) + '</td>'
+      + '<td>' + capChips(m) + '</td>'
+      + '</tr>';
+  }).join('');
+}
+
+async function loadModels(refresh) {
+  try {
+    const data = await api('/api/panel/models' + (refresh ? '?refresh=1' : ''));
+    renderModels(data);
+  } catch (e) {
+    $('modelRows').innerHTML = '<tr><td colspan="6" class="muted">读取失败：' + e.message + '</td></tr>';
+  }
+}
+
+function renderPoints(data) {
+  const o = data.overview || {};
+  $('pointsFor').textContent = 'points · ' + data.account;
+  const quota = o.daily_quota, used = o.daily_consumed;
+  const left = (quota != null && used != null) ? (quota - used) : null;
+  $('pointCards').innerHTML = [
+    ['永久积分 Permanent', num(o.permanent_balance)],
+    ['今日剩余 Daily left', (left === null ? '—' : left) + ' <small>/ ' + num(quota) + '</small>'],
+    ['今日已用 Consumed', num(used)],
+    ['周期 Cycle date', '<small>' + (o.daily_cycle_date || '—') + '</small>'],
+    ['激活状态 Activated', o.activated ? '<span class="badge b-ok">已激活</span>' : '<span class="badge b-warn">未激活</span>'],
+    ['已用邀请码 Invite', '<small class="mono">' + (o.applied_invitation_code || '—') + '</small>'],
+  ].map(([k, v]) => '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>').join('');
+
+  const codes = o.invitation_codes || [];
+  if (!codes.length) {
+    $('inviteCodes').innerHTML = '<span class="muted">无邀请码</span>';
+  } else {
+    $('inviteCodes').innerHTML = codes.map(c => {
+      const used = c.usedCount >= c.maxUses;
+      return '<span class="badge ' + (used ? 'b-off' : 'b-ok') + ' mono" style="font-size:13px;padding:4px 10px" '
+        + 'title="已用 ' + c.usedCount + '/' + c.maxUses + '">'
+        + c.inviteCode + (used ? ' (已用)' : '') + '</span>';
+    }).join('');
+  }
+
+  const rows = (data.ledger && data.ledger.rows) || [];
+  if (!rows.length) {
+    $('ledgerRows').innerHTML = '<tr><td colspan="5" class="muted">暂无流水</td></tr>';
+    return;
+  }
+  $('ledgerRows').innerHTML = rows.slice(0, 40).map(r => {
+    const when = r.created_at ? new Date(r.created_at * 1000).toLocaleString('zh-CN') : '—';
+    const dir = r.direction === 'debit' ? '<span class="badge b-warn">支出</span>' : '<span class="badge b-ok">收入</span>';
+    const pts = r.direction === 'debit' ? '-' + num(r.points) : '+' + num(r.points);
+    return '<tr><td class="mono">' + when + '</td><td>' + num(r.model) + '</td><td>' + dir
+      + '</td><td><b>' + pts + '</b></td><td class="mono">' + num(r.balance_after) + '</td></tr>';
+  }).join('');
+}
+
+async function loadPoints() {
+  try {
+    const data = await api('/api/panel/points');
+    renderPoints(data);
+  } catch (e) {
+    $('pointCards').innerHTML = '<div class="card"><div class="k">读取失败</div><div class="v">' + e.message + '</div></div>';
+    $('inviteCodes').innerHTML = '';
+    $('ledgerRows').innerHTML = '<tr><td colspan="5" class="muted">' + e.message + '</td></tr>';
+  }
+}
+
+async function applyInvite() {
+  const code = $('inviteInput').value.trim();
+  if (!code) { toast('请输入邀请码', 'err'); return; }
+  if (!confirm('提交邀请码 ' + code + '？\n每个账号只能填写一次，提交后不可撤销。')) return;
+  $('pointsMsg').textContent = '提交中…';
+  try {
+    const res = await api('/api/panel/points/activate', {
+      method: 'POST', body: JSON.stringify({code})
+    });
+    const r = res.result || {};
+    if (r.alreadyActivated) {
+      $('pointsMsg').textContent = '该账号已激活过（已用邀请码 ' + (r.appliedInvitationCode || '—') + '）';
+      toast('该账号已激活', 'err');
+    } else {
+      $('pointsMsg').textContent = '✓ 邀请码已提交，当前余额 ' + (r.permanentBalance ?? '—');
+      toast('邀请码提交成功', 'ok');
+    }
+    $('inviteInput').value = '';
+    if (res.points) renderPoints(res.points);
+  } catch (e) {
+    $('pointsMsg').textContent = '提交失败：' + e.message;
+    toast('提交失败：' + e.message, 'err');
+  }
+}
+
+async function doOnboarding() {
+  $('pointsMsg').textContent = '逐个提交新手任务（8 项，约几秒）…';
+  const box = $('taskResults'), rows = $('taskRows');
+  box.style.display = ''; rows.innerHTML = '<tr><td colspan="5" class="muted">提交中…</td></tr>';
+  try {
+    const res = await api('/api/panel/points/onboarding', {
+      method: 'POST', body: JSON.stringify({})
+    });
+    rows.innerHTML = (res.tasks || []).map(t => {
+      const status = t.ok ? (t.already ? '已完成（重复）' : '✓ 成功')
+                          : ('✗ ' + (t.error || '失败'));
+      return '<tr><td>' + (t.name || '') + '</td><td class="muted">' + t.key +
+        '</td><td>' + status + '</td><td>' + (t.points ?? '—') +
+        '</td><td class="muted">' + (t.expected ?? '—') + '</td></tr>';
+    }).join('');
+    $('pointsMsg').textContent = '新手任务合计到账 ' + (res.gained ?? 0) + ' 积分（账号 ' + res.account + '）';
+    toast('新手任务完成（+' + (res.gained ?? 0) + '）', res.gained > 0 ? 'ok' : 'err');
+    if (res.points) renderPoints(res.points);
+  } catch (e) {
+    rows.innerHTML = '<tr><td colspan="5" class="muted">' + e.message + '</td></tr>';
+    $('pointsMsg').textContent = '新手任务失败：' + e.message;
+    toast('新手任务失败：' + e.message, 'err');
+  }
+}
+
+async function doCheckin() {
+  $('pointsMsg').textContent = '签到中…';
+  try {
+    const res = await api('/api/panel/points/checkin', {
+      method: 'POST', body: JSON.stringify({})
+    });
+    if (res.already) {
+      $('pointsMsg').textContent = '今日已签到（当前余额 ' + (res.current_balance ?? '—') + '）';
+      toast('今日已签到', 'err');
+    } else {
+      $('pointsMsg').textContent = '✓ 签到成功，余额 ' + (res.current_balance ?? '—') +
+        '，每日 ' + (res.daily_balance ?? '—') + '/' + (res.daily_quota ?? '—');
+      toast('签到成功', 'ok');
+    }
+    if (res.points) renderPoints(res.points);
+  } catch (e) {
+    $('pointsMsg').textContent = '签到失败：' + e.message;
+    toast('签到失败：' + e.message, 'err');
+  }
+}
+
 async function loadLog() {
   try {
     const res = await api('/api/panel/logs?lines=250');
@@ -270,6 +599,23 @@ async function loadLog() {
 $('refresh').onclick = () => load(true).then(loadLog);
 $('add').onclick = addAccount;
 $('loadLog').onclick = loadLog;
+$('loadModels').onclick = () => loadModels(true);
+$('loadPoints').onclick = loadPoints;
+$('applyInvite').onclick = applyInvite;
+$('doOnboarding').onclick = doOnboarding;
+$('doCheckin').onclick = doCheckin;
+$('showAdd').onclick = () => {
+  const el = $('addPanel');
+  const open = el.style.display !== 'none';
+  el.style.display = open ? 'none' : '';
+  $('showAdd').textContent = open ? '＋ 添加账号' : '收起';
+};
+$('tabPwd').onclick = () => showTab('pwd');
+$('tabSms').onclick = () => showTab('sms');
+$('tabImport').onclick = () => showTab('import');
+$('doImport').onclick = doImport;
+$('smsSend').onclick = sendSms;
+$('smsLogin').onclick = smsLogin;
 $('saveKey').onclick = () => {
   KEY = $('apiKey').value.trim();
   localStorage.setItem('loomy2api_key', KEY);
@@ -278,7 +624,7 @@ $('saveKey').onclick = () => {
 };
 $('apiKey').value = KEY;
 
-load(); loadLog();
+load(); loadLog(); loadModels(false); loadPoints();
 setInterval(() => { if ($('auto').checked) load(); }, 10000);
 setInterval(() => { if ($('auto').checked) loadLog(); }, 30000);
 </script>

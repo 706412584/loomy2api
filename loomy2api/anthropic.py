@@ -35,9 +35,22 @@ def _blocks_to_text(content: Any) -> str:
 
 def _tool_result_text(block: Dict[str, Any]) -> str:
     content = block.get("content")
-    if isinstance(content, str):
-        return content
-    return _blocks_to_text(content)
+    text = content if isinstance(content, str) else _blocks_to_text(content)
+    # an empty tool result makes some upstreams reject the whole request
+    return text or "(empty)"
+
+
+def _image_part(block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Anthropic image block -> OpenAI ``image_url`` content part."""
+    source = block.get("source") or {}
+    if source.get("type") == "base64":
+        media = source.get("media_type") or "image/png"
+        url = f"data:{media};base64,{source.get('data') or ''}"
+    elif source.get("type") == "url":
+        url = source.get("url") or ""
+    else:
+        return None
+    return {"type": "image_url", "image_url": {"url": url}} if url else None
 
 
 def anthropic_to_openai(req: Dict[str, Any]) -> Dict[str, Any]:
@@ -46,7 +59,12 @@ def anthropic_to_openai(req: Dict[str, Any]) -> Dict[str, Any]:
 
     system = req.get("system")
     if system:
-        messages.append({"role": "system", "content": _blocks_to_text(system)})
+        text = _blocks_to_text(system)
+        # the billing header is Claude-Code private; upstream should not see it
+        text = "\n".join(line for line in text.splitlines()
+                         if "x-anthropic-billing-header" not in line).strip()
+        if text:
+            messages.append({"role": "system", "content": text})
 
     for message in req.get("messages") or []:
         role = message.get("role")
@@ -56,14 +74,26 @@ def anthropic_to_openai(req: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         texts: List[str] = []
+        parts: List[Dict[str, Any]] = []          # ordered text/image parts
+        images: List[Dict[str, Any]] = []
         tool_calls: List[Dict[str, Any]] = []
+        thinking: List[str] = []
         tool_messages: List[Dict[str, Any]] = []
+
         for block in content or []:
             if not isinstance(block, dict):
                 continue
             kind = block.get("type")
             if kind == "text":
-                texts.append(str(block.get("text") or ""))
+                text = str(block.get("text") or "")
+                if text:
+                    texts.append(text)
+                    parts.append({"type": "text", "text": text})
+            elif kind == "image":
+                part = _image_part(block)
+                if part:
+                    images.append(part)
+                    parts.append(part)
             elif kind == "tool_use":
                 tool_calls.append({
                     "id": block.get("id") or f"call_{uuid.uuid4().hex[:12]}",
@@ -80,18 +110,48 @@ def anthropic_to_openai(req: Dict[str, Any]) -> Dict[str, Any]:
                     "tool_call_id": block.get("tool_use_id") or "",
                     "content": _tool_result_text(block),
                 })
+                # images inside a tool_result ride along on the user turn
+                inner = block.get("content")
+                if isinstance(inner, list):
+                    for item in inner:
+                        if isinstance(item, dict) and item.get("type") == "image":
+                            part = _image_part(item)
+                            if part:
+                                images.append(part)
+                                parts.append(part)
+            elif kind == "thinking":
+                chunk = str(block.get("thinking") or "")
+                if chunk:
+                    thinking.append(chunk)
 
-        # tool_result blocks arrive inside a *user* message; they become
-        # standalone "tool" messages, and no empty user scaffold is emitted.
-        if texts or tool_calls:
+        if role == "assistant":
             out_message: Dict[str, Any] = {
-                "role": role,
-                "content": "\n".join(t for t in texts if t) or None,
+                "role": "assistant",
+                "content": "\n".join(texts) or None,
             }
             if tool_calls:
                 out_message["tool_calls"] = tool_calls
-            messages.append(out_message)
+                # DeepSeek's thinking mode requires the reasoning that produced
+                # a tool call to be replayed, or it rejects the request (400)
+                if thinking:
+                    out_message["reasoning_content"] = "\n".join(thinking)
+            if out_message["content"] or tool_calls:
+                messages.append(out_message)
+            continue
+
+        # tool_result blocks arrive inside a *user* message: they become
+        # standalone "tool" messages, then the remaining text/images follow.
         messages.extend(tool_messages)
+        if texts or images:
+            body: Any = parts if images else "\n".join(texts)
+            messages.append({"role": role, "content": body})
+        elif not tool_messages:
+            # an empty user/assistant turn still needs a slot; the upstream
+            # accepts empty content but rejects an entirely empty list
+            messages.append({"role": role, "content": ""})
+
+    if not messages:
+        messages.append({"role": "user", "content": ""})
 
     out: Dict[str, Any] = {
         "model": req.get("model"),
@@ -104,6 +164,9 @@ def anthropic_to_openai(req: Dict[str, Any]) -> Dict[str, Any]:
             out[dst] = req[src]
     if req.get("stop_sequences"):
         out["stop"] = req["stop_sequences"]
+    if isinstance(req.get("metadata"), dict):
+        out["metadata"] = req["metadata"]
+    out["parallel_tool_calls"] = True
 
     tools = req.get("tools") or []
     if tools:
@@ -123,6 +186,8 @@ def anthropic_to_openai(req: Dict[str, Any]) -> Dict[str, Any]:
             out["tool_choice"] = "auto"
         elif choice.get("type") == "any":
             out["tool_choice"] = "required"
+        elif choice.get("type") == "none":
+            out["tool_choice"] = "none"
         elif choice.get("type") == "tool" and choice.get("name"):
             out["tool_choice"] = {"type": "function",
                                  "function": {"name": choice["name"]}}
@@ -135,7 +200,7 @@ def openai_to_anthropic(obj: Dict[str, Any], model: str) -> Dict[str, Any]:
     message = choice.get("message") or {}
     content: List[Dict[str, Any]] = []
 
-    reasoning = message.get("reasoning_content")
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
     if reasoning:
         content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
     if message.get("content"):
@@ -193,9 +258,15 @@ class StreamTranslator:
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.usage: Dict[str, Any] = {}
         self.finish_reason: Optional[str] = None
-        self._text_open = False
-        self._text_index = 0
-        self._think_open = False
+        # every content block (thinking / text / each tool_use) needs its own
+        # index; allocate monotonically instead of pinning them all to 0
+        self._next_index = 0
+        self._think_index: Optional[int] = None
+        self._think_sig = ""
+        self._text_index: Optional[int] = None
+        # upstream streams tool_calls in fragments: OpenAI tool index -> block
+        self._tools: Dict[int, Dict[str, Any]] = {}
+        self._open_tool: Optional[int] = None
 
     # -- helpers --------------------------------------------------------
 
@@ -217,6 +288,25 @@ class StreamTranslator:
             },
         })
 
+    def _close_think(self) -> Iterable:
+        if self._think_index is not None:
+            # Claude Code replays thinking blocks verbatim on the next turn;
+            # a signature_delta lets it carry this block back (empty is fine
+            # when the upstream signs nothing).
+            yield self._ev("content_block_delta", {
+                "type": "content_block_delta", "index": self._think_index,
+                "delta": {"type": "signature_delta", "signature": self._think_sig}})
+            yield self._ev("content_block_stop", {
+                "type": "content_block_stop", "index": self._think_index})
+            self._think_index = None
+            self._think_sig = ""
+
+    def _close_text(self) -> Iterable:
+        if self._text_index is not None:
+            yield self._ev("content_block_stop", {
+                "type": "content_block_stop", "index": self._text_index})
+            self._text_index = None
+
     def feed(self, obj: Dict[str, Any]) -> Iterable:
         usage = obj.get("usage")
         if isinstance(usage, dict):
@@ -228,26 +318,27 @@ class StreamTranslator:
         choice = choices[0]
         delta = choice.get("delta") or {}
 
-        thinking = delta.get("reasoning_content")
+        thinking = delta.get("reasoning_content") or delta.get("reasoning")
         if thinking:
-            if not self._think_open:
-                self._think_open = True
+            # a tool call or text ends the thinking block
+            if self._think_index is None:
+                yield from self._close_text()
+                self._think_index = self._next_index
+                self._next_index += 1
                 yield self._ev("content_block_start", {
-                    "type": "content_block_start", "index": 0,
+                    "type": "content_block_start", "index": self._think_index,
                     "content_block": {"type": "thinking", "thinking": ""}})
             yield self._ev("content_block_delta", {
-                "type": "content_block_delta", "index": 0,
+                "type": "content_block_delta", "index": self._think_index,
                 "delta": {"type": "thinking_delta", "thinking": thinking}})
 
         text = delta.get("content")
         if text:
-            if self._think_open and not self._text_open:
-                self._think_open = False
-                yield self._ev("content_block_stop", {
-                    "type": "content_block_stop", "index": 0})
-            if not self._text_open:
-                self._text_open = True
-                self._text_index = 0
+            if self._think_index is not None:
+                yield from self._close_think()
+            if self._text_index is None:
+                self._text_index = self._next_index
+                self._next_index += 1
                 yield self._ev("content_block_start", {
                     "type": "content_block_start", "index": self._text_index,
                     "content_block": {"type": "text", "text": ""}})
@@ -255,40 +346,64 @@ class StreamTranslator:
                 "type": "content_block_delta", "index": self._text_index,
                 "delta": {"type": "text_delta", "text": text}})
 
-        # tool calls are streamed as complete blocks (upstream sends them whole)
+        # upstream streams tool calls in fragments: the first fragment carries
+        # id/name and an empty arguments string, later fragments carry argument
+        # text only.  Accumulate per OpenAI tool index and forward the raw JSON
+        # text, so the client can reassemble full arguments.
         for call in delta.get("tool_calls") or []:
             fn = call.get("function") or {}
-            if not fn.get("name"):
-                continue
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except Exception:                           # noqa: BLE001
-                args = {}
-            index = self._text_index + 1 if self._text_open else 0
-            yield self._ev("content_block_start", {
-                "type": "content_block_start", "index": index,
-                "content_block": {"type": "tool_use",
-                                  "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                                  "name": fn["name"], "input": {}}})
-            yield self._ev("content_block_delta", {
-                "type": "content_block_delta", "index": index,
-                "delta": {"type": "input_json_delta",
-                          "partial_json": json.dumps(args, ensure_ascii=False)}})
-            yield self._ev("content_block_stop", {
-                "type": "content_block_stop", "index": index})
+            tidx = call.get("index")
+            if tidx is None:
+                tidx = len(self._tools)
+            block = self._tools.get(tidx)
+            if block is None:
+                # a new tool call begins; close whatever block is still open
+                if self._think_index is not None:
+                    yield from self._close_think()
+                if self._text_index is not None:
+                    yield from self._close_text()
+                block = {
+                    "index": self._next_index,
+                    "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                    "name": fn.get("name") or "",
+                }
+                self._next_index += 1
+                self._tools[tidx] = block
+                yield self._ev("content_block_start", {
+                    "type": "content_block_start", "index": block["index"],
+                    "content_block": {"type": "tool_use", "id": block["id"],
+                                      "name": block["name"], "input": {}}})
+            # a later fragment may supply the id/name the first one omitted
+            if not block["id"] and call.get("id"):
+                block["id"] = call["id"]
+            if not block["name"] and fn.get("name"):
+                block["name"] = fn["name"]
+            args = fn.get("arguments")
+            if args:
+                block["args_seen"] = True
+                yield self._ev("content_block_delta", {
+                    "type": "content_block_delta", "index": block["index"],
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": args}})
 
         self.finish_reason = choice.get("finish_reason") or self.finish_reason
 
     def finish(self) -> Iterable:
-        if self._think_open:
-            self._think_open = False
-            yield self._ev("content_block_stop", {"type": "content_block_stop", "index": 0})
-        if self._text_open:
-            self._text_open = False
+        yield from self._close_think()
+        yield from self._close_text()
+        for block in self._tools.values():
+            # some clients only build tool input from deltas, so a tool with no
+            # arguments at all still needs an explicit empty object
+            if not block.get("args_seen"):
+                yield self._ev("content_block_delta", {
+                    "type": "content_block_delta", "index": block["index"],
+                    "delta": {"type": "input_json_delta", "partial_json": "{}"}})
             yield self._ev("content_block_stop", {
-                "type": "content_block_stop", "index": self._text_index})
+                "type": "content_block_stop", "index": block["index"]})
+        has_tool = bool(self._tools)
+        self._tools.clear()
         stop_reason = {"length": "max_tokens", "tool_calls": "tool_use"}.get(
-            self.finish_reason, "end_turn")
+            self.finish_reason, "tool_use" if has_tool else "end_turn")
         yield self._ev("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},

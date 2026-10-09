@@ -45,6 +45,9 @@ DEFAULTS: Dict[str, Any] = {
     "accounts_file": "accounts.json",
     "strategy": "balance",        # balance | round_robin | lru
     "max_retries": 2,             # extra accounts tried on auth/quota errors
+    "stream_retries": 2,          # extra attempts when a stream dies mid-flight
+    "stream_stall_seconds": 180,  # abort/retry a stream that stalls this long
+    "thinking_stall_seconds": 240,  # abort/retry a reasoning loop with no output
     "cooldown_seconds": 300,
     "session_renew_before_days": 3,
     "quota_refresh_minutes": 30,

@@ -22,6 +22,15 @@ from .upstream import ModelGateway, sse_usage, human_usage
 __all__ = ["Gateway", "serve"]
 
 
+class StreamStalled(Exception):
+    """The upstream stopped sending data for longer than we tolerate."""
+
+    def __init__(self, seconds: float, kind: str = "idle"):
+        super().__init__(f"upstream stream stalled for {seconds:.0f}s ({kind})")
+        self.seconds = seconds
+        self.kind = kind
+
+
 class Logger:
     """Timestamped file+console logger (never raises)."""
 
@@ -128,6 +137,60 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):             # silence default access log
         return
 
+    def _clean_sse_block(self, block: bytes) -> Optional[bytes]:
+        """Validate one upstream SSE event; return it, or ``None`` to drop it.
+
+        The gateway passes model output through verbatim, but the upstream
+        sometimes injects a fragment that is not valid JSON.  Forwarding it
+        corrupts the client's stream — notably tool arguments, which the client
+        reassembles from ``input_json_delta`` pieces.  Comment/blank-only blocks
+        and the terminal ``[DONE]`` are always forwarded untouched.
+        """
+        lines = block.split(b"\n")
+        data_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(b"data:"):
+                data_lines.append(stripped[5:].strip())
+        if not data_lines:
+            return block                      # keepalive / comment-only event
+        for payload in data_lines:
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                json.loads(payload)
+            except Exception:                 # noqa: BLE001
+                return None
+        return block
+
+    def _read_chunk(self, conn, resp, idle_seconds: float, *,
+                    thinking_seconds: float = 0.0,
+                    saw_output: bool = True,
+                    content_started: float = 0.0) -> bytes:
+        """Read one chunk, aborting if the upstream goes quiet too long.
+
+        ``http.client`` cannot resume a read after a socket timeout, so the
+        idle budget is applied as the socket timeout itself rather than by
+        polling: a timeout means the upstream really went silent, and the
+        caller abandons the connection (retrying when nothing was sent yet).
+
+        ``thinking_seconds`` bounds how long a reasoning-only stream may run.
+        A looping model keeps sending reasoning deltas, so this is checked
+        between reads, not via the socket timeout.
+        """
+        start = time.time()
+        if (not saw_output and thinking_seconds and content_started
+                and time.time() - content_started > thinking_seconds):
+            raise StreamStalled(time.time() - content_started, "thinking-only")
+        if conn is not None and getattr(conn, "sock", None) is not None:
+            conn.sock.settimeout(idle_seconds)
+        try:
+            return resp.read(4096)
+        except socket.timeout as exc:
+            raise StreamStalled(idle_seconds, "idle") from exc
+        except (OSError, ValueError) as exc:
+            raise StreamStalled(time.time() - start, f"io:{exc}") from exc
+
     def _json(self, status: int, obj: Any, extra: Optional[dict] = None) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -161,6 +224,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.rfile.read(length)
             except Exception:                           # noqa: BLE001
                 pass
+
+    def _query(self, name: str, default: str = "") -> str:
+        from urllib.parse import parse_qs, urlparse as _urlparse
+        values = parse_qs(_urlparse(self.path).query).get(name) or []
+        return values[0] if values else default
 
     def _query_int(self, name: str, default: int) -> int:
         from urllib.parse import parse_qs, urlparse as _urlparse
@@ -292,6 +360,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/panel/logs":
                 lines = self._query_int("lines", 200)
                 return self._json(200, self.gateway.panel.logs(lines))
+            if path == "/api/panel/models":
+                refresh = "refresh=1" in (self.path or "")
+                return self._json(200, self.gateway.panel.models({"refresh": refresh}))
+            if path == "/api/panel/points":
+                name = self._query("name")
+                return self._json(200, self.gateway.panel.points({"name": name}))
             if path == "/favicon.ico":
                 return self._error(404, "no favicon")
             return self._error(404, f"未知路径 / unknown path: {self.path}")
@@ -348,7 +422,14 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._read_json()
         panel = self.gateway.panel
         handlers = {
+            "/api/panel/points/activate": panel.points_activate,
+            "/api/panel/points/onboarding": panel.onboarding,
+            "/api/panel/points/onboarding-state": panel.onboarding_state,
+            "/api/panel/points/checkin": panel.checkin,
             "/api/panel/accounts": panel.add_account,
+            "/api/panel/accounts/import": panel.import_accounts,
+            "/api/panel/accounts/sms": panel.sms_send,
+            "/api/panel/accounts/sms-login": panel.sms_login,
             "/api/panel/accounts/update": panel.update_account,
             "/api/panel/accounts/remove": panel.remove_account,
             "/api/panel/accounts/renew": panel.renew_account,
@@ -446,6 +527,16 @@ class Handler(BaseHTTPRequestHandler):
         model = gw.resolve_model(req.get("model"))
         stream = bool(req.get("stream"))
 
+        # an OpenAI-shaped caller (health probes, protocol bridges) sometimes
+        # sends no messages at all; the upstream rejects an empty list outright,
+        # so substitute a harmless placeholder turn instead of failing.
+        if not req.get("messages"):
+            keys = ",".join(sorted(req.keys())) or "-"
+            gw.log(f"[warn] /v1/chat/completions 入站 messages 为空/缺失"
+                   f"（model={model} stream={stream} keys=[{keys}] ua="
+                   f"{(self.headers.get('User-Agent') or '')[:60]}），已补占位 user 消息")
+            req["messages"] = [{"role": "user", "content": ""}]
+
         extra: Dict[str, str] = {}
         for src, dst in (("chat_id", "ChatId"), ("msg_id", "MsgId"),
                          ("turn_id", "TurnId")):
@@ -500,7 +591,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(status or 502, data[:500].decode("utf-8", "replace"),
                                "upstream_error")
 
-    def _chat_stream(self, req: Dict[str, Any], extra: Dict[str, str]) -> None:
+    def _open_stream(self, req: Dict[str, Any], extra: Optional[Dict[str, str]],
+                     *, log_tag: str) -> Tuple[Optional[Any], Optional[Any], Optional[Any]]:
+        """Acquire an account and open a 200 stream, retrying other accounts.
+
+        Returns ``(acc, conn, resp)``; ``acc`` is ``None`` when every attempt
+        failed (``resp`` then carries the last error response, if any).
+        """
         gw = self.gateway
         model = req.get("model")
         tried: list = []
@@ -511,70 +608,209 @@ class Handler(BaseHTTPRequestHandler):
                 acc = gw.pool.acquire(exclude=tried)
             except PoolError as exc:
                 gw.log(f"[warn] {exc}")
-                break
+                return None, None, resp
             tried.append(acc.name)
-            conn, resp = gw.models_client.stream(acc.session, "chat/completions", req, extra)
+            conn, resp = gw.models_client.stream(acc.session, "chat/completions",
+                                                 req, extra)
             if resp.status == 200:
-                break
+                return acc, conn, resp
             data = resp.read()
             conn.close()
             if resp.status in self.ACCOUNT_FAULT:
-                gw.log(f"[call] {acc.name} {model} stream http={resp.status}"
+                gw.log(f"[{log_tag}] {acc.name} {model} stream http={resp.status}"
                        f" → 账号问题，换账号重试")
                 gw.pool.report_failure(acc, resp.status,
                                        data[:200].decode("utf-8", "replace"))
             else:
-                gw.log(f"[call] {acc.name} {model} stream http={resp.status}"
+                gw.log(f"[{log_tag}] {acc.name} {model} stream http={resp.status}"
                        f" → 上游异常，换账号重试（不冷却该账号）")
             conn = resp = None
+        return None, None, resp
 
-        if resp is None:
-            return self._error(502, "所有账号都失败了 / all accounts failed",
-                               "upstream_error")
-        if resp.status != 200:
-            data = resp.read()
-            conn.close()
-            try:
-                return self._json(resp.status, json.loads(data.decode("utf-8")))
-            except Exception:                           # noqa: BLE001
-                return self._error(resp.status, data[:500].decode("utf-8", "replace"),
-                                   "upstream_error")
+    def _chat_stream(self, req: Dict[str, Any], extra: Dict[str, str]) -> None:
+        gw = self.gateway
+        model = req.get("model")
 
-        started = time.time()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.close_connection = True
-
-        usage: Dict[str, Any] = {}
+        # --- retry loop: while the client has received nothing yet, a stalled
+        #     or truncated upstream stream can be retried transparently. -----
         buffer = b""
-        try:
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    sse_usage(line.strip(), usage)
-            if buffer:
-                sse_usage(buffer.strip(), usage)
+        usage: Dict[str, Any] = {}
+        dropped = 0
+        attempts = int(gw.cfg.get("stream_retries") or 0) + 1
+        stall_seconds = float(gw.cfg.get("stream_stall_seconds") or 180)
+        think_seconds = float(gw.cfg.get("thinking_stall_seconds") or 240)
+        disable_thinking = bool(req.pop("_no_thinking", False))
+
+        for attempt in range(attempts):
+            body = dict(req)
+            if disable_thinking:
+                # second attempt onwards: ask the model to skip reasoning so a
+                # reasoning loop cannot stall the stream again
+                body["enable_thinking"] = False
+                body["chat_template_kwargs"] = {"enable_thinking": False}
+
+            acc, conn, resp = self._open_stream(body, extra, log_tag="call")
+            if acc is None:
+                if resp is None:
+                    return self._error(502, "所有账号都失败了 / all accounts failed",
+                                       "upstream_error")
+                data = resp.read()
+                resp.close() if hasattr(resp, "close") else None
+                try:
+                    return self._json(resp.status, json.loads(data.decode("utf-8")))
+                except Exception:                       # noqa: BLE001
+                    return self._error(resp.status,
+                                       data[:500].decode("utf-8", "replace"),
+                                       "upstream_error")
+
+            started = time.time()
+            first = attempt == 0
+            if first:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.close_connection = True
+
+            saw_content = False          # any text/tool/reasoning forwarded
+            saw_output = False           # text or tool (not just reasoning)
+            finished = False             # upstream sent finish_reason
+            content_started = 0.0        # when the first content block arrived
+            stalled: Optional[StreamStalled] = None
+            try:
+                while True:
+                    chunk = self._read_chunk(conn, resp, stall_seconds,
+                                             thinking_seconds=think_seconds,
+                                             saw_output=saw_output,
+                                             content_started=content_started)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n\n" in buffer:
+                        block, buffer = buffer.split(b"\n\n", 1)
+                        out = self._clean_sse_block(block)
+                        if out is None:
+                            dropped += 1
+                            continue
+                        if not saw_content:
+                            saw_content = True
+                            content_started = time.time()
+                        if not saw_output and self._block_has_output(out):
+                            saw_output = True
+                        if self._block_is_final(out):
+                            finished = True
+                        self.wfile.write(out + b"\n\n")
+                        self.wfile.flush()
+                        sse_usage(out.split(b"\n", 1)[0].strip(), usage)
+                if buffer.strip():
+                    out = self._clean_sse_block(buffer)
+                    if out is not None:
+                        self.wfile.write(out + b"\n\n")
+                        self.wfile.flush()
+                        sse_usage(out.split(b"\n", 1)[0].strip(), usage)
+                        if not saw_content:
+                            saw_content = True
+                            content_started = time.time()
+                        if self._block_has_output(out):
+                            saw_output = True
+            except StreamStalled as exc:
+                stalled = exc
+            except (BrokenPipeError, ConnectionResetError):
+                gw.log(f"[call] {acc.name} {model} client disconnected")
+                try:
+                    conn.close()
+                except Exception:                       # noqa: BLE001
+                    pass
+                return
+            finally:
+                try:
+                    conn.close()
+                except Exception:                       # noqa: BLE001
+                    pass
+
+            # --- decide: retry (nothing sent yet) or terminate the stream ---
+            # A retry is only safe while the client has received nothing at all,
+            # so a normal reply that happens to be reasoning-only still counts
+            # as "content sent" and must never be replayed.
+            can_retry = attempt + 1 < attempts and not saw_content
+            if can_retry and stalled is not None:
+                disable_thinking = True
+                gw.log(f"[call] {acc.name} {model} 流卡住（{stalled.kind} "
+                       f"{stalled.seconds:.0f}s）且未输出内容 → 第 {attempt + 2} 次重试")
+                buffer = b""
+                continue
+            if can_retry and not finished:
+                gw.log(f"[call] {acc.name} {model} 上游流未产生内容就结束 "
+                       f"→ 第 {attempt + 2} 次重试")
+                buffer = b""
+                continue
+
+            # cannot retry any more (or content already went out): close cleanly
+            if not finished:
+                reason = (f"流中断（{stalled.kind}）" if stalled
+                          else "上游未发送结束事件")
+                gw.log(f"[call] {acc.name} {model} {reason}"
+                       f"{'，已输出部分内容' if saw_content else ''} → 补发终止事件")
+                self._terminate_sse(reason)
             gw.pool.report_success(acc, usage)
             gw.log(f"[call] {acc.name} {model} {time.time() - started:.1f}s "
-                   f"http=200 {human_usage(usage)} stream")
-        except (BrokenPipeError, ConnectionResetError):
-            gw.log(f"[call] {acc.name} {model} client disconnected")
-        finally:
+                   f"http=200 {human_usage(usage)} stream"
+                   + (f" attempt={attempt + 1}" if attempt else "")
+                   + (f" dropped={dropped}" if dropped else ""))
+            return
+
+    def _block_is_final(self, block: bytes) -> bool:
+        """True when an SSE block carries a non-null ``finish_reason``."""
+        for line in block.split(b"\n"):
+            if not line.strip().startswith(b"data:"):
+                continue
             try:
-                conn.close()
+                obj = json.loads(line.strip()[5:].strip())
             except Exception:                           # noqa: BLE001
-                pass
+                continue
+            for choice in obj.get("choices") or []:
+                if choice.get("finish_reason"):
+                    return True
+        return False
+
+    def _block_has_output(self, block: bytes) -> bool:
+        """True when an SSE block carries real output (text or a tool call).
+
+        Reasoning-only deltas (``reasoning_content``) do **not** count: a model
+        that never stops thinking must be treated as stalled.
+        """
+        if b"tool_calls" in block:
+            return True
+        for line in block.split(b"\n"):
+            if not line.strip().startswith(b"data:"):
+                continue
+            try:
+                obj = json.loads(line.strip()[5:].strip())
+            except Exception:                           # noqa: BLE001
+                continue
+            if obj.get("choices"):
+                delta = (obj["choices"][0].get("delta") or {})
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    return True
+        return False
+
+    def _terminate_sse(self, reason: str) -> None:
+        """Emit a terminal event so the client does not see a silent truncation."""
+        try:
+            self.wfile.write(
+                b"data: " + json.dumps({
+                    "choices": [{"index": 0, "delta": {},
+                                 "finish_reason": "stop"}],
+                    "loomy2api_warning": reason,
+                }, ensure_ascii=False).encode("utf-8") + b"\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     # -------------------------------------------------- anthropic messages
 
@@ -623,49 +859,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _messages_stream(self, payload: Dict[str, Any], model: str) -> None:
         gw = self.gateway
-        tried: list = []
-        conn = resp = None
 
-        for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
-            try:
-                acc = gw.pool.acquire(exclude=tried)
-            except PoolError as exc:
-                gw.log(f"[warn] {exc}")
-                break
-            tried.append(acc.name)
-            conn, resp = gw.models_client.stream(acc.session, "chat/completions", payload)
-            if resp.status == 200:
-                break
-            data = resp.read()
-            conn.close()
-            if resp.status in self.ACCOUNT_FAULT:
-                gw.pool.report_failure(acc, resp.status,
-                                       data[:200].decode("utf-8", "replace"))
-                gw.log(f"[messages] {acc.name} {model} stream http={resp.status}"
-                       f" → 账号问题，换账号重试")
-            else:
-                gw.log(f"[messages] {acc.name} {model} stream http={resp.status}"
-                       f" → 上游异常，换账号重试（不冷却该账号）")
-            conn = resp = None
-
-        if resp is None:
-            return self._json(502, {"type": "error", "error": {
-                "type": "api_error", "message": "all accounts failed"}})
-        if resp.status != 200:
-            data = resp.read()
-            conn.close()
-            return self._json(resp.status, {"type": "error", "error": {
-                "type": "api_error", "message": data[:500].decode("utf-8", "replace")}})
-
-        translator = anth.StreamTranslator(model)
-        started = time.time()
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.close_connection = True
+        attempts = int(gw.cfg.get("stream_retries") or 0) + 1
+        stall_seconds = float(gw.cfg.get("stream_stall_seconds") or 180)
+        think_seconds = float(gw.cfg.get("thinking_stall_seconds") or 240)
+        disable_thinking = bool(payload.pop("_no_thinking", False))
 
         def emit(event: str, data: Dict[str, Any]) -> None:
             self.wfile.write(
@@ -673,41 +871,130 @@ class Handler(BaseHTTPRequestHandler):
                 .encode("utf-8"))
             self.wfile.flush()
 
-        buffer = b""
-        try:
-            for event, data in translator.start():
-                emit(event, data)
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    line = line.strip()
-                    if not line.startswith(b"data:"):
-                        continue
-                    body = line[5:].strip()
-                    if not body or body == b"[DONE]":
-                        continue
-                    try:
-                        obj = json.loads(body)
-                    except Exception:                   # noqa: BLE001
-                        continue
-                    for event, data in translator.feed(obj):
-                        emit(event, data)
-            for event, data in translator.finish():
-                emit(event, data)
+        for attempt in range(attempts):
+            body = dict(payload)
+            if disable_thinking:
+                body["enable_thinking"] = False
+                body["chat_template_kwargs"] = {"enable_thinking": False}
+
+            acc, conn, resp = self._open_stream(body, None, log_tag="messages")
+            if acc is None:
+                if resp is None:
+                    return self._json(502, {"type": "error", "error": {
+                        "type": "api_error", "message": "all accounts failed"}})
+                data = resp.read()
+                resp.close() if hasattr(resp, "close") else None
+                return self._json(resp.status, {"type": "error", "error": {
+                    "type": "api_error",
+                    "message": data[:500].decode("utf-8", "replace")}})
+
+            translator = anth.StreamTranslator(model)
+            started = time.time()
+            if attempt == 0:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.close_connection = True
+
+            buffer = b""
+            saw_content = False
+            saw_output = False
+            finished = False
+            content_started = 0.0
+            stalled: Optional[StreamStalled] = None
+            try:
+                for event, data in translator.start():
+                    emit(event, data)
+                while True:
+                    chunk = self._read_chunk(conn, resp, stall_seconds,
+                                             thinking_seconds=think_seconds,
+                                             saw_output=saw_output,
+                                             content_started=content_started)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        line = line.strip()
+                        if not line.startswith(b"data:"):
+                            continue
+                        text = line[5:].strip()
+                        if not text or text == b"[DONE]":
+                            continue
+                        try:
+                            obj = json.loads(text)
+                        except Exception:               # noqa: BLE001
+                            continue
+                        choice = (obj.get("choices") or [{}])[0]
+                        delta = choice.get("delta") or {}
+                        if not saw_output and (delta.get("content")
+                                               or delta.get("tool_calls")):
+                            saw_output = True
+                        if choice.get("finish_reason"):
+                            finished = True
+                        events = list(translator.feed(obj))
+                        for event, data in events:
+                            if event != "ping":
+                                if not saw_content:
+                                    content_started = time.time()
+                                saw_content = True
+                            emit(event, data)
+                for event, data in translator.finish():
+                    emit(event, data)
+            except StreamStalled as exc:
+                stalled = exc
+            except (BrokenPipeError, ConnectionResetError):
+                gw.log(f"[messages] {acc.name} {model} client disconnected")
+                try:
+                    conn.close()
+                except Exception:                       # noqa: BLE001
+                    pass
+                return
+            finally:
+                try:
+                    conn.close()
+                except Exception:                       # noqa: BLE001
+                    pass
+
+            # only safe to replay while the client has received nothing at all
+            retryable = not saw_content and attempt + 1 < attempts
+            if retryable and stalled is not None:
+                disable_thinking = True
+                gw.log(f"[messages] {acc.name} {model} 流卡住（{stalled.kind} "
+                       f"{stalled.seconds:.0f}s）且无输出 → 第 {attempt + 2} 次重试")
+                continue
+            if retryable and stalled is None:
+                gw.log(f"[messages] {acc.name} {model} 上游流无输出即结束 "
+                       f"→ 第 {attempt + 2} 次重试")
+                continue
+
+            if stalled is not None:
+                # content already reached the client: end the stream properly
+                gw.log(f"[messages] {acc.name} {model} 流中断（{stalled.kind} "
+                       f"{stalled.seconds:.0f}s）→ 补发终止事件")
+                self._terminate_anthropic("upstream stream interrupted")
             gw.pool.report_success(acc, translator.usage)
             gw.log(f"[messages] {acc.name} {model} {time.time() - started:.1f}s "
-                   f"http=200 {human_usage(translator.usage)} stream")
-        except (BrokenPipeError, ConnectionResetError):
-            gw.log(f"[messages] {acc.name} {model} client disconnected")
-        finally:
-            try:
-                conn.close()
-            except Exception:                           # noqa: BLE001
-                pass
+                   f"http=200 {human_usage(translator.usage)} stream"
+                   + (f" attempt={attempt + 1}" if attempt else ""))
+            return
+
+    def _terminate_anthropic(self, reason: str) -> None:
+        """Close an Anthropic SSE stream cleanly after a mid-stream failure."""
+        try:
+            self.wfile.write(
+                f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': reason}}, ensure_ascii=False)}\n\n"
+                .encode("utf-8"))
+            self.wfile.write(
+                f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 0}}, ensure_ascii=False)}\n\n"
+                .encode("utf-8"))
+            self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
 
 class Server(ThreadingHTTPServer):
