@@ -65,6 +65,21 @@
   .muted{color:var(--muted)}
   .hint{color:var(--muted);font-size:12px;margin-top:8px}
   details summary{cursor:pointer;color:var(--muted);font-size:12px}
+  /* account action modal */
+  #modalMask{position:fixed;inset:0;background:rgba(4,8,16,.62);z-index:8;
+    display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:40px 14px}
+  #modalMask.open{display:flex}
+  #modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    width:100%;max-width:520px;box-shadow:0 18px 60px rgba(0,0,0,.5)}
+  #modal header{display:flex;align-items:center;justify-content:space-between;
+    padding:14px 16px;border-bottom:1px solid var(--line)}
+  #modal header h3{margin:0;font-size:15px}
+  #modal header small{color:var(--muted);font-weight:400;margin-left:8px}
+  #modalBody{padding:14px 16px}
+  #modalBody .grid{margin-bottom:12px}
+  #modalBody .ops{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+  #modalBody .ops button{height:32px;padding:0 12px;font-size:12px}
+  #modalBody .hint{margin-top:10px}
   @media (max-width:760px){table{display:block;overflow-x:auto;white-space:nowrap}}
 </style>
 </head>
@@ -86,7 +101,9 @@
   <div class="cards" id="cards"></div>
 
   <section>
-    <h2>账号 <small>accounts</small></h2>
+    <h2>账号 <small>accounts</small>
+      <button class="primary" id="showAdd" style="float:right">＋ 添加账号</button>
+    </h2>
     <table>
       <thead>
         <tr>
@@ -117,6 +134,7 @@
 
   <section>
     <h2>积分与邀请码 <small id="pointsFor">points &amp; invites</small>
+      <select id="pointsAccount" style="margin-left:10px;font-weight:normal"></select>
       <button id="loadPoints" style="float:right">刷新</button>
     </h2>
     <div class="cards" id="pointCards"></div>
@@ -150,54 +168,6 @@
   </section>
 
   <section>
-    <h2>添加账号 <small>add account</small>
-      <button class="primary" id="showAdd" style="float:right">＋ 添加账号</button>
-    </h2>
-    <div id="addPanel" style="display:none">
-      <div class="row" style="gap:8px;margin-bottom:10px">
-        <button id="tabPwd" class="primary">密码登录</button>
-        <button id="tabSms">验证码登录</button>
-        <button id="tabImport">批量导入</button>
-      </div>
-
-      <div id="panePwd" class="grid">
-        <div><label>名称 name</label><input id="f-name" placeholder="main"></div>
-        <div><label>手机号 phone</label><input id="f-phone" placeholder="13800000000"></div>
-        <div><label>密码 password</label><input id="f-pass" type="password" placeholder="账号中心里设的密码"></div>
-        <div><label>或 session（可选）</label><input id="f-session" placeholder="32 位 session"></div>
-        <div><label>登录方式</label><select id="f-login">
-          <option value="1">添加后立即登录</option><option value="0">只保存不登录</option>
-        </select></div>
-        <div><button class="primary" id="add">添加并绑定设备标识</button></div>
-      </div>
-
-      <div id="paneSms" class="grid" style="display:none">
-        <div><label>名称 name（可选）</label><input id="s-name" placeholder="留空则用手机号"></div>
-        <div><label>手机号 phone</label><input id="s-phone" placeholder="13800000000"></div>
-        <div><label>验证码 code</label>
-          <div class="row" style="gap:6px">
-            <input id="s-code" placeholder="6 位验证码" style="flex:1">
-            <button id="smsSend">获取验证码</button>
-          </div>
-        </div>
-        <div><button class="primary" id="smsLogin">验证码登录</button></div>
-      </div>
-
-      <div id="paneImport" style="display:none">
-        <div class="hint" style="margin-bottom:6px">粘贴手机 App 导出的 JSON（含 accounts 数组）或纯账号列表；同名账号默认跳过，也可选覆盖更新。毫秒时间戳会自动归一化为秒。</div>
-        <textarea id="importText" rows="8" style="width:100%;font-family:monospace" placeholder='{"accounts":[{"name":"13800000000","session":"…","userid":"…"}]}'></textarea>
-        <div class="row" style="margin-top:8px;gap:8px">
-          <select id="importMode"><option value="skip">跳过同名</option><option value="update">覆盖同名 session</option></select>
-          <button class="primary" id="doImport">导入</button>
-          <label style="display:flex;align-items:center;gap:4px"><input type="file" id="importFile" accept=".json,application/json" style="display:none"><button onclick="document.getElementById('importFile').click()">选择文件…</button></label>
-        </div>
-      </div>
-
-      <div class="hint">密码登录：需先在讯飞账号中心设置密码，可自动续期。验证码登录：无需密码，但 session 14 天后过期需重新登录。添加成功后会为账号随机生成设备标识（devid / 校园设备号）并绑定。</div>
-    </div>
-  </section>
-
-  <section>
     <h2>运行日志 <small>recent log</small></h2>
     <div class="row" style="margin-bottom:8px">
       <button id="loadLog">刷新日志</button>
@@ -216,6 +186,13 @@
   </details>
 </div>
 <div id="toast"></div>
+
+<div id="modalMask" onclick="if(event.target===this)closeAccountModal()">
+  <div id="modal">
+    <header><h3 id="modalTitle">账号</h3><button onclick="closeAccountModal()">关闭</button></header>
+    <div id="modalBody"></div>
+  </div>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -274,9 +251,11 @@ function render(state) {
     $('rows').innerHTML = '<tr><td colspan="9" class="muted">还没有账号，用下面的表单添加</td></tr>';
     return;
   }
+  fillAccountPicker(state);
+  LAST_STATE = state;
   $('rows').innerHTML = state.accounts.map(a => {
     const id = a.identity || {};
-    return '<tr>'
+    return '<tr onclick="openAccountModal(\'' + a.name + '\')" style="cursor:pointer">'
       + '<td><b>' + a.name + '</b><div class="mono">' + (a.source === 'client' ? 'client 导入' : (a.mode === 'session' ? '仅 session' : '手机号+密码')) + '</div></td>'
       + '<td class="mono">' + (a.loginid_masked || '—') + '</td>'
       + '<td>' + badge(a) + '</td>'
@@ -284,13 +263,187 @@ function render(state) {
       + '<td><b>' + num(a.available) + '</b><div class="mono">余额 ' + num(a.balance) + ' + 每日 ' + num(a.daily_balance) + '</div></td>'
       + '<td>' + a.requests + '</td><td>' + a.points_used + '</td>'
       + '<td class="mono" title="' + (id.campus_device_id || '') + '">' + (id.devid || '—') + '</td>'
-      + '<td><div class="row" style="gap:6px">'
-      + '<button onclick="act(\'renew\',\'' + a.name + '\')">续期</button>'
-      + '<button onclick="act(\'identity\',\'' + a.name + '\')">换标识</button>'
-      + '<button onclick="act(\'toggle\',\'' + a.name + '\',' + (!a.enabled) + ')">' + (a.enabled ? '禁用' : '启用') + '</button>'
-      + '<button class="danger" onclick="act(\'remove\',\'' + a.name + '\')">删除</button>'
-      + '</div></td></tr>';
+      + '<td><button onclick="event.stopPropagation();openAccountModal(\'' + a.name + '\')">管理</button></td></tr>';
   }).join('');
+}
+
+function pickAndLoad(name) {
+  const sel = $('pointsAccount');
+  if ([...sel.options].some(op => op.value === name)) {
+    sel.value = name;
+    POINTS_ACC = name; localStorage.setItem('loomy2api_points_acc', name);
+  }
+  document.querySelector('#pointsAccount').scrollIntoView({behavior: 'smooth', block: 'center'});
+  loadPoints();
+}
+
+let LAST_STATE = null;
+let MODAL_ACC = '';
+
+function openAccountModal(name) {
+  const a = ((LAST_STATE && LAST_STATE.accounts) || []).find(x => x.name === name);
+  if (!a) { toast('账号状态未加载', 'err'); return; }
+  MODAL_ACC = name;
+  $('modalTitle').innerHTML = name + '<small>' + (a.loginid_masked || '') + '</small>';
+  const id = a.identity || {};
+  $('modalBody').innerHTML =
+    '<div class="cards" style="grid-template-columns:1fr 1fr;margin-bottom:10px">'
+    + '<div class="card"><div class="k">状态</div><div class="v">' + badge(a) + '</div></div>'
+    + '<div class="card"><div class="k">可用积分</div><div class="v">' + num(a.available)
+    + '<small>余额 ' + num(a.balance) + ' + 每日 ' + num(a.daily_balance) + '</small></div></div>'
+    + '<div class="card"><div class="k">session 剩余</div><div class="v">'
+    + (a.session_days_left === null ? '—' : a.session_days_left.toFixed(1) + ' 天') + '</div></div>'
+    + '<div class="card"><div class="k">设备标识</div><div class="v"><small class="mono" style="white-space:normal">'
+    + (id.devid || '—') + '</small></div></div>'
+    + '</div>'
+    + '<div class="ops">'
+    + '<button class="primary" onclick="modalAct(\'points\')">查积分</button>'
+    + '<button onclick="modalAct(\'checkin\')">每日签到</button>'
+    + '<button onclick="modalAct(\'onboarding\')">新手任务</button>'
+    + '<button onclick="modalAct(\'renew\')">续期重登</button>'
+    + '<button onclick="modalAct(\'identity\')">换设备标识</button>'
+    + '<button onclick="modalAct(\'toggle\')">' + (a.enabled ? '禁用' : '启用') + '</button>'
+    + '<button class="danger" onclick="modalAct(\'remove\')">删除</button>'
+    + '</div>'
+    + '<div id="modalMsg" class="hint"></div>';
+  $('modalMask').classList.add('open');
+  // this account also becomes the points-section target
+  const sel = $('pointsAccount');
+  if ([...sel.options].some(op => op.value === name)) {
+    sel.value = name; POINTS_ACC = name; localStorage.setItem('loomy2api_points_acc', name);
+  }
+}
+
+function closeAccountModal() { $('modalMask').classList.remove('open'); }
+
+function modalMsg(text) { const el = $('modalMsg'); if (el) el.textContent = text; }
+
+async function modalAct(kind) {
+  const name = MODAL_ACC;
+  const acc = ((LAST_STATE && LAST_STATE.accounts) || []).find(x => x.name === name) || {};
+  modalMsg('执行中…');
+  try {
+    if (kind === 'points') {
+      const data = await api('/api/panel/points?name=' + encodeURIComponent(name));
+      renderPoints(data);
+      modalMsg('已加载积分（下方积分区同步更新）');
+    } else if (kind === 'checkin') {
+      const res = await api('/api/panel/points/checkin', {
+        method: 'POST', body: JSON.stringify({name})});
+      modalMsg(res.already ? '今日已签到（余额 ' + (res.current_balance ?? '—') + '）'
+        : '✓ 签到成功，余额 ' + (res.current_balance ?? '—'));
+      if (res.points) renderPoints(res.points);
+    } else if (kind === 'onboarding') {
+      modalMsg('逐个提交 8 项任务…');
+      const res = await api('/api/panel/points/onboarding', {
+        method: 'POST', body: JSON.stringify({name})});
+      const okN = (res.tasks || []).filter(t => t.ok).length;
+      modalMsg('新手任务 ' + okN + '/8 ok，合计到账 ' + (res.gained ?? 0) + ' 积分');
+      if (res.points) renderPoints(res.points);
+    } else if (kind === 'remove') {
+      if (!confirm('确认删除账号 ' + name + '？')) { modalMsg(''); return; }
+      await api('/api/panel/accounts/remove', {
+        method: 'POST', body: JSON.stringify({name})});
+      toast(name + ' 已删除', 'ok');
+      closeAccountModal(); load(); loadPoints();
+      return;
+    } else {
+      const map = {
+        renew: ['/api/panel/accounts/renew', {name}],
+        identity: ['/api/panel/accounts/identity', {name, regenerate: true}],
+        toggle: ['/api/panel/accounts/update', {name, enabled: !acc.enabled}],
+      };
+      const [path, body] = map[kind];
+      const res = await api(path, {method: 'POST', body: JSON.stringify(body)});
+      if (kind === 'identity') modalMsg('已换新设备标识：' + res.identity.devid);
+      else modalMsg(name + ' 操作完成');
+      if (res.state) { LAST_STATE = res.state; render(res.state); }
+    }
+  } catch (e) {
+    modalMsg('失败：' + e.message);
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeAccountModal();
+});
+
+let ADD_TAB = 'pwd';
+
+function openAddModal(tab) {
+  MODAL_ACC = '';
+  ADD_TAB = tab || 'pwd';
+  $('modalTitle').textContent = '添加账号';
+  const pwdPane =
+    '<div class="grid">'
+    + '<div><label>名称 name</label><input id="f-name" placeholder="main"></div>'
+    + '<div><label>手机号 phone</label><input id="f-phone" placeholder="13800000000"></div>'
+    + '<div><label>密码 password</label><input id="f-pass" type="password" placeholder="账号中心里设的密码"></div>'
+    + '<div><label>或 session（可选）</label><input id="f-session" placeholder="32 位 session"></div>'
+    + '<div><label>登录方式</label><select id="f-login">'
+    + '<option value="1">添加后立即登录</option><option value="0">只保存不登录</option></select></div>'
+    + '<div><button class="primary" id="add">添加并绑定设备标识</button></div></div>';
+  const smsPane =
+    '<div class="grid">'
+    + '<div><label>名称 name（可选）</label><input id="s-name" placeholder="留空则用手机号"></div>'
+    + '<div><label>手机号 phone</label><input id="s-phone" placeholder="13800000000"></div>'
+    + '<div><label>验证码 code</label><div class="row" style="gap:6px">'
+    + '<input id="s-code" placeholder="6 位验证码" style="flex:1">'
+    + '<button id="smsSend">获取验证码</button></div></div>'
+    + '<div><button class="primary" id="smsLogin">验证码登录</button></div></div>';
+  const importPane =
+    '<div class="hint" style="margin-bottom:6px">粘贴手机 App 导出的 JSON（含 accounts 数组）或纯账号列表；同名账号默认跳过，也可选覆盖更新。毫秒时间戳会自动归一化为秒。</div>'
+    + '<textarea id="importText" rows="8" style="width:100%;font-family:monospace" '
+    + 'placeholder=\'{"accounts":[{"name":"13800000000","session":"…","userid":"…"}]}\'></textarea>'
+    + '<div class="row" style="margin-top:8px;gap:8px">'
+    + '<select id="importMode"><option value="skip">跳过同名</option>'
+    + '<option value="update">覆盖同名 session</option></select>'
+    + '<button class="primary" id="doImport">导入</button>'
+    + '<label style="display:flex;align-items:center;gap:4px">'
+    + '<input type="file" id="importFile" accept=".json,application/json" style="display:none">'
+    + '<button onclick="document.getElementById(\'importFile\').click()">选择文件…</button></label></div>';
+  $('modalBody').innerHTML =
+    '<div class="row" style="gap:8px;margin-bottom:10px">'
+    + '<button id="tabPwd">密码登录</button><button id="tabSms">验证码登录</button>'
+    + '<button id="tabImport">批量导入</button></div>'
+    + '<div id="modalPane"></div>'
+    + '<div class="hint">密码登录：需先在讯飞账号中心设置密码，可自动续期。验证码登录：无需密码，但 session 14 天后过期需重新登录。添加成功后会为账号随机生成设备标识（devid / 校园设备号）并绑定。</div>'
+    + '<div id="modalMsg" class="hint"></div>';
+  $('modalPane').innerHTML =
+    ADD_TAB === 'pwd' ? pwdPane : ADD_TAB === 'sms' ? smsPane : importPane;
+  $('modalMask').classList.add('open');
+  renderAddTabs();
+  $('tabPwd').onclick = () => switchAddTab('pwd');
+  $('tabSms').onclick = () => switchAddTab('sms');
+  $('tabImport').onclick = () => switchAddTab('import');
+  if (ADD_TAB === 'pwd') $('add').onclick = addAccount;
+  if (ADD_TAB === 'sms') { $('smsSend').onclick = sendSms; $('smsLogin').onclick = smsLogin; }
+  if (ADD_TAB === 'import') { $('doImport').onclick = doImport; bindImportFile(); }
+}
+
+function renderAddTabs() {
+  const on = {pwd: 'tabPwd', sms: 'tabSms', import: 'tabImport'}[ADD_TAB];
+  for (const id of ['tabPwd', 'tabSms', 'tabImport']) {
+    const el = $(id); if (el) el.className = id === on ? 'primary' : '';
+  }
+}
+
+function switchAddTab(tab) {
+  ADD_TAB = tab;
+  renderAddTabs();
+  $('modalPane').innerHTML = '';
+  openAddModal(tab);
+}
+
+function bindImportFile() {
+  const el = $('importFile');
+  if (el) el.onchange = (ev) => {
+    const f = ev.target.files[0];
+    if (!f) return;
+    const fr = new FileReader();
+    fr.onload = () => { $('importText').value = fr.result; };
+    fr.readAsText(f);
+  };
 }
 
 async function load(refresh) {
@@ -316,19 +469,10 @@ async function act(kind, name, value) {
     if (res.error) { toast(name + '：' + res.error, 'err'); }
     else if (kind === 'identity') { toast(name + ' 已换新设备标识：' + res.identity.devid, 'ok'); }
     else { toast(name + ' 操作完成', 'ok'); }
-    if (res.state) render(res.state); else load();
+    if (res.state) { LAST_STATE = res.state; render(res.state); } else load();
   } catch (e) {
     toast(name + ' 操作失败：' + e.message, 'err');
   }
-}
-
-function showTab(which) {
-  $('panePwd').style.display = which === 'pwd' ? '' : 'none';
-  $('paneSms').style.display = which === 'sms' ? '' : 'none';
-  $('paneImport').style.display = which === 'import' ? '' : 'none';
-  $('tabPwd').className = which === 'pwd' ? 'primary' : '';
-  $('tabSms').className = which === 'sms' ? 'primary' : '';
-  $('tabImport').className = which === 'import' ? 'primary' : '';
 }
 
 async function doImport() {
@@ -349,19 +493,12 @@ async function doImport() {
     toast('导入完成：新增 ' + res.added.length + '，更新 ' + res.updated.length
       + '，跳过 ' + res.skipped.length, 'ok');
     $('importText').value = '';
-    if (res.state) render(res.state);
+    if (res.state) { LAST_STATE = res.state; render(res.state); }
+    closeAccountModal();
   } catch (e) {
     toast('导入失败：' + e.message, 'err');
   }
 }
-
-$('importFile') && ($('importFile').onchange = (ev) => {
-  const f = ev.target.files[0];
-  if (!f) return;
-  const fr = new FileReader();
-  fr.onload = () => { $('importText').value = fr.result; };
-  fr.readAsText(f);
-});
 
 let SMS_MSGID = '';
 
@@ -391,9 +528,9 @@ async function smsLogin() {
       body: JSON.stringify({name, loginid: phone, code, msgid: SMS_MSGID})
     });
     toast('已添加 ' + res.name + '（userid ' + res.userid + '）', 'ok');
-    $('s-name').value = $('s-phone').value = $('s-code').value = '';
     SMS_MSGID = '';
-    if (res.state) render(res.state);
+    if (res.state) { LAST_STATE = res.state; render(res.state); }
+    closeAccountModal();
   } catch (e) {
     toast('登录失败：' + e.message, 'err');
   }
@@ -411,8 +548,8 @@ async function addAccount() {
     const res = await api('/api/panel/accounts', {method: 'POST', body: JSON.stringify(body)});
     if (res.logged_in === false) toast('已添加，但登录失败：' + res.error, 'err');
     else toast('已添加 ' + res.name + '（devid ' + res.identity.devid + '）', 'ok');
-    $('f-name').value = $('f-phone').value = $('f-pass').value = $('f-session').value = '';
-    if (res.state) render(res.state);
+    if (res.state) { LAST_STATE = res.state; render(res.state); }
+    closeAccountModal();
   } catch (e) {
     toast('添加失败：' + e.message, 'err');
   }
@@ -465,9 +602,34 @@ async function loadModels(refresh) {
   }
 }
 
+let POINTS_ACC = localStorage.getItem('loomy2api_points_acc') || '';
+
+function fillAccountPicker(state) {
+  const sel = $('pointsAccount');
+  const accounts = (state && state.accounts) || [];
+  if (sel.options.length !== accounts.length
+      || sel.dataset.sig !== accounts.map(a => a.name).join(',')) {
+    sel.dataset.sig = accounts.map(a => a.name).join(',');
+    sel.innerHTML = accounts.map(a =>
+      '<option value="' + a.name + '">' + a.name
+      + '（' + num(a.available) + '）</option>').join('');
+    if (POINTS_ACC && accounts.some(a => a.name === POINTS_ACC)) sel.value = POINTS_ACC;
+  }
+}
+
+function pickedAccount() {
+  const v = $('pointsAccount').value || '';
+  POINTS_ACC = v;
+  localStorage.setItem('loomy2api_points_acc', v);
+  return v;
+}
+
 function renderPoints(data) {
   const o = data.overview || {};
   $('pointsFor').textContent = 'points · ' + data.account;
+  const sel = $('pointsAccount');
+  if ([...sel.options].some(op => op.value === data.account)) sel.value = data.account;
+  POINTS_ACC = data.account; localStorage.setItem('loomy2api_points_acc', data.account);
   const quota = o.daily_quota, used = o.daily_consumed;
   const left = (quota != null && used != null) ? (quota - used) : null;
   $('pointCards').innerHTML = [
@@ -507,7 +669,8 @@ function renderPoints(data) {
 
 async function loadPoints() {
   try {
-    const data = await api('/api/panel/points');
+    const acc = pickedAccount();
+    const data = await api('/api/panel/points' + (acc ? '?name=' + encodeURIComponent(acc) : ''));
     renderPoints(data);
   } catch (e) {
     $('pointCards').innerHTML = '<div class="card"><div class="k">读取失败</div><div class="v">' + e.message + '</div></div>';
@@ -523,7 +686,7 @@ async function applyInvite() {
   $('pointsMsg').textContent = '提交中…';
   try {
     const res = await api('/api/panel/points/activate', {
-      method: 'POST', body: JSON.stringify({code})
+      method: 'POST', body: JSON.stringify({code, name: pickedAccount()})
     });
     const r = res.result || {};
     if (r.alreadyActivated) {
@@ -547,7 +710,7 @@ async function doOnboarding() {
   box.style.display = ''; rows.innerHTML = '<tr><td colspan="5" class="muted">提交中…</td></tr>';
   try {
     const res = await api('/api/panel/points/onboarding', {
-      method: 'POST', body: JSON.stringify({})
+      method: 'POST', body: JSON.stringify({name: pickedAccount()})
     });
     rows.innerHTML = (res.tasks || []).map(t => {
       const status = t.ok ? (t.already ? '已完成（重复）' : '✓ 成功')
@@ -570,7 +733,7 @@ async function doCheckin() {
   $('pointsMsg').textContent = '签到中…';
   try {
     const res = await api('/api/panel/points/checkin', {
-      method: 'POST', body: JSON.stringify({})
+      method: 'POST', body: JSON.stringify({name: pickedAccount()})
     });
     if (res.already) {
       $('pointsMsg').textContent = '今日已签到（当前余额 ' + (res.current_balance ?? '—') + '）';
@@ -597,25 +760,14 @@ async function loadLog() {
 }
 
 $('refresh').onclick = () => load(true).then(loadLog);
-$('add').onclick = addAccount;
 $('loadLog').onclick = loadLog;
 $('loadModels').onclick = () => loadModels(true);
 $('loadPoints').onclick = loadPoints;
+$('pointsAccount').onchange = loadPoints;
 $('applyInvite').onclick = applyInvite;
 $('doOnboarding').onclick = doOnboarding;
 $('doCheckin').onclick = doCheckin;
-$('showAdd').onclick = () => {
-  const el = $('addPanel');
-  const open = el.style.display !== 'none';
-  el.style.display = open ? 'none' : '';
-  $('showAdd').textContent = open ? '＋ 添加账号' : '收起';
-};
-$('tabPwd').onclick = () => showTab('pwd');
-$('tabSms').onclick = () => showTab('sms');
-$('tabImport').onclick = () => showTab('import');
-$('doImport').onclick = doImport;
-$('smsSend').onclick = sendSms;
-$('smsLogin').onclick = smsLogin;
+$('showAdd').onclick = () => openAddModal('pwd');
 $('saveKey').onclick = () => {
   KEY = $('apiKey').value.trim();
   localStorage.setItem('loomy2api_key', KEY);
