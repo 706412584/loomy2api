@@ -102,7 +102,10 @@
 
   <section>
     <h2>账号 <small>accounts</small>
-      <button class="primary" id="showAdd" style="float:right">＋ 添加账号</button>
+      <span style="float:right">
+        <button id="showImport">导入账号</button>
+        <button class="primary" id="showAdd">＋ 添加账号</button>
+      </span>
     </h2>
     <table>
       <thead>
@@ -768,6 +771,7 @@ $('applyInvite').onclick = applyInvite;
 $('doOnboarding').onclick = doOnboarding;
 $('doCheckin').onclick = doCheckin;
 $('showAdd').onclick = () => openAddModal('pwd');
+$('showImport').onclick = () => openAddModal('import');
 $('saveKey').onclick = () => {
   KEY = $('apiKey').value.trim();
   localStorage.setItem('loomy2api_key', KEY);
