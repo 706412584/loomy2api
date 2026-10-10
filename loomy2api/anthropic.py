@@ -366,6 +366,7 @@ class StreamTranslator:
                     "index": self._next_index,
                     "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
                     "name": fn.get("name") or "",
+                    "args_text": "",
                 }
                 self._next_index += 1
                 self._tools[tidx] = block
@@ -381,12 +382,33 @@ class StreamTranslator:
             args = fn.get("arguments")
             if args:
                 block["args_seen"] = True
+                block["args_text"] += args
                 yield self._ev("content_block_delta", {
                     "type": "content_block_delta", "index": block["index"],
                     "delta": {"type": "input_json_delta",
                               "partial_json": args}})
 
         self.finish_reason = choice.get("finish_reason") or self.finish_reason
+
+    def truncated_tool(self) -> bool:
+        """True when a tool call's accumulated arguments are not valid JSON.
+
+        An upstream stream that dies mid tool-call leaves a half-written
+        ``partial_json`` — delivering it as a normal ``tool_use`` block makes
+        the client attempt to parse garbage (seen as "could not be parsed as
+        JSON" errors).  The stream handler calls this on abnormal termination
+        and reports an error instead of pretending the message completed.
+        """
+        for block in self._tools.values():
+            text = block.get("args_text") or ""
+            if text:
+                try:
+                    json.loads(text)
+                except Exception:                       # noqa: BLE001
+                    return True
+            # a clean no-argument tool (id+name present, no args fragments):
+            # finish() patches in "{}" as usual, nothing broken
+        return False
 
     def finish(self) -> Iterable:
         yield from self._close_think()

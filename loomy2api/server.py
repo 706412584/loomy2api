@@ -702,12 +702,14 @@ class Handler(BaseHTTPRequestHandler):
                             saw_output = True
                         if self._block_is_final(out):
                             finished = True
+                        self._track_tool_args(out)
                         self.wfile.write(out + b"\n\n")
                         self.wfile.flush()
                         sse_usage(out.split(b"\n", 1)[0].strip(), usage)
                 if buffer.strip():
                     out = self._clean_sse_block(buffer)
                     if out is not None:
+                        self._track_tool_args(out)
                         self.wfile.write(out + b"\n\n")
                         self.wfile.flush()
                         sse_usage(out.split(b"\n", 1)[0].strip(), usage)
@@ -752,6 +754,15 @@ class Handler(BaseHTTPRequestHandler):
             if not finished:
                 reason = (f"流中断（{stalled.kind}）" if stalled
                           else "上游未发送结束事件")
+                args_text = self._open_tool_args()
+                broken_tool = False
+                if args_text:
+                    try:
+                        json.loads(args_text)
+                    except Exception:                   # noqa: BLE001
+                        broken_tool = True
+                if broken_tool:
+                    reason += "，tool 参数截断"
                 gw.log(f"[call] {acc.name} {model} {reason}"
                        f"{'，已输出部分内容' if saw_content else ''} → 补发终止事件")
                 self._terminate_sse(reason)
@@ -761,6 +772,39 @@ class Handler(BaseHTTPRequestHandler):
                    + (f" attempt={attempt + 1}" if attempt else "")
                    + (f" dropped={dropped}" if dropped else ""))
             return
+
+    def _open_tool_args(self) -> str:
+        """Concatenated arguments text of the currently open tool call, or "".
+
+        The OpenAI path forwards upstream chunks verbatim; on abnormal stream
+        end we need to know whether the last tool call's ``arguments`` were
+        fully streamed (valid JSON) or cut mid-write.
+        """
+        return getattr(self, "_tool_args_buffer", "")
+
+    def _track_tool_args(self, block: bytes) -> None:
+        """Accumulate tool-call argument fragments from a forwarded SSE block.
+
+        Remembers the text of the *latest* tool index so a stream cut can be
+        judged: valid JSON → clean truncation after a tool; invalid → broken
+        tool call.
+        """
+        for line in block.split(b"\n"):
+            if not line.strip().startswith(b"data:"):
+                continue
+            try:
+                obj = json.loads(line.strip()[5:].strip())
+            except Exception:                           # noqa: BLE001
+                continue
+            for call in ((obj.get("choices") or [{}])[0].get("delta") or {}
+                         ).get("tool_calls") or []:
+                fn = call.get("function") or {}
+                args = fn.get("arguments")
+                if args is not None:
+                    prev = getattr(self, "_tool_args_buffer", "")
+                    self._tool_args_buffer = (args if call.get("id")
+                                              else prev + args)
+                # a new tool call (with id) resets the buffer
 
     def _block_is_final(self, block: bytes) -> bool:
         """True when an SSE block carries a non-null ``finish_reason``."""
@@ -799,12 +843,18 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def _terminate_sse(self, reason: str) -> None:
-        """Emit a terminal event so the client does not see a silent truncation."""
+        """Emit a terminal event so the client does not see a silent truncation.
+
+        ``finish_reason="error"`` (not "stop"): if the stream died mid tool
+        call the client already received half-written tool arguments — a
+        "stop" would make it parse that garbage; "error" tells it the
+        response is broken and worth retrying.
+        """
         try:
             self.wfile.write(
                 b"data: " + json.dumps({
                     "choices": [{"index": 0, "delta": {},
-                                 "finish_reason": "stop"}],
+                                 "finish_reason": "error"}],
                     "loomy2api_warning": reason,
                 }, ensure_ascii=False).encode("utf-8") + b"\n\n")
             self.wfile.write(b"data: [DONE]\n\n")
@@ -972,24 +1022,37 @@ class Handler(BaseHTTPRequestHandler):
                 continue
 
             if stalled is not None:
-                # content already reached the client: end the stream properly
+                # content already reached the client: end the stream properly.
+                # A half-written tool_use block must not be reported as a
+                # clean end_turn — the client would try to execute a tool
+                # call whose arguments are truncated JSON.
+                broken = translator.truncated_tool()
                 gw.log(f"[messages] {acc.name} {model} 流中断（{stalled.kind} "
-                       f"{stalled.seconds:.0f}s）→ 补发终止事件")
-                self._terminate_anthropic("upstream stream interrupted")
+                       f"{stalled.seconds:.0f}s）"
+                       f"{'，tool 参数截断' if broken else ''} → 补发终止事件")
+                self._terminate_anthropic("upstream stream interrupted",
+                                          broken_tool=broken)
             gw.pool.report_success(acc, translator.usage)
             gw.log(f"[messages] {acc.name} {model} {time.time() - started:.1f}s "
                    f"http=200 {human_usage(translator.usage)} stream"
                    + (f" attempt={attempt + 1}" if attempt else ""))
             return
 
-    def _terminate_anthropic(self, reason: str) -> None:
-        """Close an Anthropic SSE stream cleanly after a mid-stream failure."""
+    def _terminate_anthropic(self, reason: str, *,
+                             broken_tool: bool = False) -> None:
+        """Close an Anthropic SSE stream after a mid-stream failure.
+
+        When ``broken_tool`` is set the last tool_use block holds truncated
+        arguments — emit ``error`` as stop_reason so the client treats the
+        turn as failed (and may retry) instead of parsing the garbage.
+        """
+        stop = "error" if broken_tool else "end_turn"
         try:
             self.wfile.write(
                 f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': reason}}, ensure_ascii=False)}\n\n"
                 .encode("utf-8"))
             self.wfile.write(
-                f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': 0}}, ensure_ascii=False)}\n\n"
+                f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop, 'stop_sequence': None}, 'usage': {'output_tokens': 0}}, ensure_ascii=False)}\n\n"
                 .encode("utf-8"))
             self.wfile.write(b"event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n")
             self.wfile.flush()
