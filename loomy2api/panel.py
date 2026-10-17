@@ -351,6 +351,9 @@ class Panel:
 
         mode = str(payload.get("mode") or "skip")     # skip | update
         added, updated, skipped = [], [], []
+        #: name → why it was skipped, so the UI can explain instead of
+        #: silently reporting "0 added, 0 updated".
+        reasons: Dict[str, str] = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -365,7 +368,11 @@ class Panel:
             name = str(raw.get("name") or raw.get("loginid") or "").strip()
             session = str(raw.get("session") or "").strip()
             if not name or not session:
-                skipped.append(name or "<unnamed>")
+                label = name or "<unnamed>"
+                skipped.append(label)
+                reasons[label] = ("缺少 session（该条目无法用于登录；"
+                                  "请在原项目重新导出含 session 的 accounts.json）"
+                                  if name else "缺少 name 和 session")
                 continue
             existing = self.pool.get(name)
             if existing is not None:
@@ -379,6 +386,7 @@ class Panel:
                     updated.append(name)
                 else:
                     skipped.append(name)
+                    reasons[name] = "账号已存在（mode=skip）"
                 continue
             self.pool.add_account(
                 name, loginid=str(raw.get("loginid") or ""),
@@ -391,11 +399,23 @@ class Panel:
                 acc.obtained_at = int(raw["obtainedAt"])
             added.append(name)
 
-        self.pool.save(force=True)
+        # Never let a fully-rejected import rewrite the pool file: if nothing
+        # was added or updated, the in-memory pool is unchanged anyway, and a
+        # save here would only risk clobbering a file the user just edited.
+        if added or updated:
+            self.pool.save(force=True)
+        else:
+            self.log("[panel] 导入未产生任何变更，跳过写盘")
         self.log(f"[panel] 批量导入：新增 {len(added)} 更新 {len(updated)} "
                  f"跳过 {len(skipped)}")
+        if skipped and not added and not updated:
+            detail = next(iter(reasons.values()), "")
+            return {"ok": True, "added": added, "updated": updated,
+                    "skipped": skipped, "reasons": reasons,
+                    "message": f"{len(skipped)} 条被跳过：{detail}",
+                    "state": self.state()}
         return {"ok": True, "added": added, "updated": updated,
-                "skipped": skipped, "state": self.state()}
+                "skipped": skipped, "reasons": reasons, "state": self.state()}
 
     def sms_send(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Step 1 of SMS login: send the code, hand back the ``msgid``."""
