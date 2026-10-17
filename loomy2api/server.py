@@ -228,6 +228,16 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         self._body_read = False
 
+    def handle_one_request(self):                  # noqa: D102
+        # ``setup()`` runs once per *connection*, not per request, and HTTP/1.1
+        # keep-alive reuses the connection.  Without this reset the second
+        # request on a reused socket saw ``_body_read`` still True, read an
+        # empty body, and answered "no such account: (empty)" — the classic
+        # "first click fails, second one works" (the error closes the socket,
+        # so the retry lands on a fresh connection).
+        self._body_read = False
+        super().handle_one_request()
+
     # ------------------------------------------------------------- basics
 
     def log_message(self, fmt, *args):             # silence default access log

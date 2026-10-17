@@ -296,6 +296,28 @@ class TestPanelWrites(PanelHarness, unittest.TestCase):
             self.post("/api/panel/accounts/passwords", {"password": "short"})
         self.assertEqual(ctx.exception.code, 400)
 
+    def test_keepalive_reuses_connection_with_body(self):
+        """Two POSTs on one keep-alive socket must both carry their body.
+
+        ``setup()`` runs per connection; before the per-request reset the
+        second request saw the first one's ``_body_read`` flag and was handled
+        with an empty body ("no such account: (empty)").
+        """
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        try:
+            for name in ("a", "a"):
+                conn.request("POST", "/api/panel/accounts/password/show",
+                             body=json.dumps({"name": name}),
+                             headers={"Content-Type": "application/json"})
+                resp = conn.getresponse()
+                payload = json.loads(resp.read())
+                self.assertEqual(resp.status, 200)
+                self.assertTrue(payload["ok"])
+                self.assertEqual(payload["password"], "pw")
+        finally:
+            conn.close()
+
     def test_show_password(self):
         _s, payload = self.post("/api/panel/accounts/password/show", {"name": "a"})
         self.assertTrue(payload["ok"])
