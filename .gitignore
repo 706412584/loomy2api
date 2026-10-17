@@ -48,3 +48,7 @@ loomy2api-pkg/
 
 # local debug screenshots
 _shots/
+_bulk_reg.log
+_bulk_tasks.log
+_bulk_new.jsonl
+_new_accounts.txt

@@ -838,14 +838,24 @@ class Panel:
         payload = payload or {}
         acc = self._pick_account(payload.get("name"))
         gw = self.gw.models_client
-        overview = self._with_session(acc, lambda s: gw.points_overview(s))
         ledger = {"total": 0, "rows": []}
-        if payload.get("ledger", True):
-            try:
-                ledger = gw.points_ledger(acc.session,
-                                          page_size=int(payload.get("size") or 50))
-            except Exception as exc:                     # noqa: BLE001
-                self.log(f"[panel] 读取积分流水失败：{exc}")
+        want_ledger = bool(payload.get("ledger", True))
+        # The overview and the ledger are independent round-trips; running
+        # them concurrently halves the panel's load time on a slow upstream.
+        if want_ledger:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_overview = pool.submit(
+                    self._with_session, acc, lambda s: gw.points_overview(s))
+                f_ledger = pool.submit(
+                    gw.points_ledger, acc.session,
+                    page_size=int(payload.get("size") or 50))
+                overview = f_overview.result()
+                try:
+                    ledger = f_ledger.result()
+                except Exception as exc:                 # noqa: BLE001
+                    self.log(f"[panel] 读取积分流水失败：{exc}")
+        else:
+            overview = self._with_session(acc, lambda s: gw.points_overview(s))
         return {"ok": True, "account": acc.name, "overview": overview,
                 "ledger": ledger}
 

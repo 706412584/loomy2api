@@ -127,17 +127,49 @@ class ModelGateway:
         cycle and reward state and is idempotent (``alreadyProcessed``), which
         is how the official client reads this panel.  We never submit an
         invitation code, so nothing is mutated.
+
+        The two reads are independent and each is a slow round-trip, so they
+        run concurrently; serially this alone took several seconds.
         """
-        out: Dict[str, Any] = {}
-        try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def first_login() -> Dict[str, Any]:
             status, _h, data = http_request(
                 self._url("points/first-login"), method="POST",
                 headers=self._headers(session), body=b"{}",
                 timeout=30, proxy=str(self.cfg.get("proxy") or ""))
-            if status == 200:
-                payload = json.loads(data.decode("utf-8"))
-                _check_payload(status, payload, data, "/points/first-login")
-                node = payload.get("data") or {}
+            if status != 200:
+                return {}
+            payload = json.loads(data.decode("utf-8"))
+            _check_payload(status, payload, data, "/points/first-login")
+            return payload.get("data") or {}
+
+        def activation() -> Dict[str, Any]:
+            status, _h, data = http_request(
+                self._url("points/activation"), method="GET",
+                headers=self._headers(session), timeout=20,
+                proxy=str(self.cfg.get("proxy") or ""))
+            if status != 200:
+                return {}
+            payload = json.loads(data.decode("utf-8"))
+            _check_payload(status, payload, data, "/points/activation")
+            return payload.get("data") or {}
+
+        out: Dict[str, Any] = {}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_first = pool.submit(first_login)
+            f_act = pool.submit(activation)
+            # An expired session must reach the caller so it can re-login;
+            # everything else degrades to a partial overview.
+            try:
+                node = f_first.result()
+            except UpstreamError as exc:
+                if exc.status == 401:
+                    raise
+                out["error"] = str(exc)
+            except Exception as exc:                    # noqa: BLE001
+                out["error"] = str(exc)
+            else:
                 out.update({
                     "daily_quota": node.get("dailyQuota"),
                     "daily_consumed": node.get("dailyConsumed"),
@@ -149,31 +181,17 @@ class ModelGateway:
                     "inviter_reward": node.get("inviterReward"),
                     "invitation_codes": node.get("invitationCodes") or [],
                 })
-        except UpstreamError as exc:
-            # An expired session must reach the caller so it can re-login;
-            # everything else degrades to a partial overview.
-            if exc.status == 401:
-                raise
-            out["error"] = str(exc)
-        except Exception as exc:                        # noqa: BLE001
-            out["error"] = str(exc)
-        try:
-            status, _h, data = http_request(
-                self._url("points/activation"), method="GET",
-                headers=self._headers(session), timeout=20,
-                proxy=str(self.cfg.get("proxy") or ""))
-            if status == 200:
-                payload = json.loads(data.decode("utf-8"))
-                _check_payload(status, payload, data, "/points/activation")
-                node = payload.get("data") or {}
+            try:
+                node = f_act.result()
+            except UpstreamError as exc:
+                if exc.status == 401:
+                    raise
+                out.setdefault("error", str(exc))
+            except Exception as exc:                    # noqa: BLE001
+                out.setdefault("error", str(exc))
+            else:
                 out["activated"] = node.get("activated")
                 out["applied_invitation_code"] = node.get("appliedInvitationCode")
-        except UpstreamError as exc:
-            if exc.status == 401:
-                raise
-            out.setdefault("error", str(exc))
-        except Exception as exc:                        # noqa: BLE001
-            out.setdefault("error", str(exc))
         return out
 
     def points_first_login(self, session: str, device_id: str) -> Dict[str, Any]:

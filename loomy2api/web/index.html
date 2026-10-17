@@ -1003,8 +1003,22 @@ $('pointsToggle').onclick = () => {
   const body = $('pointsBody');
   const open = body.classList.toggle('collapsed') === false;
   $('pointsToggle').textContent = open ? '收起' : '展开';
-  if (open) loadPoints();
+  if (open) { loadPoints(); startPointsPolling(); } else { stopPointsPolling(); }
 };
+// Keep the points block live while it is open: the main table refreshes on a
+// timer but this section used to show whatever it loaded once.
+let POINTS_TIMER = null;
+function startPointsPolling() {
+  stopPointsPolling();
+  POINTS_TIMER = setInterval(() => {
+    if (!document.hidden && !$('pointsBody').classList.contains('collapsed')) {
+      loadPoints();
+    }
+  }, 30000);
+}
+function stopPointsPolling() {
+  if (POINTS_TIMER) { clearInterval(POINTS_TIMER); POINTS_TIMER = null; }
+}
 $('pointsAccount').onchange = loadPoints;
 $('applyInvite').onclick = applyInvite;
 $('doOnboarding').onclick = doOnboarding;
@@ -1196,6 +1210,8 @@ if (window.matchMedia && window.matchMedia('(max-width:760px)').matches) {
 }
 
 load(); loadLog(); loadModels(false); loadPoints();
+// only poll while the block is actually visible
+if (!$('pointsBody').classList.contains('collapsed')) startPointsPolling();
 setInterval(() => { if ($('auto').checked) load(); }, 10000);
 setInterval(() => { if ($('auto').checked) loadLog(); }, 30000);
 </script>
