@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from . import constants as C
-from .account import Account, AccountClient, AccountError
+from .account import (Account, AccountClient, AccountError, generate_password)
 from .upstream import ModelGateway, UpstreamError
 
 __all__ = ["AccountPool", "PoolError"]
@@ -47,6 +47,7 @@ class AccountPool:
         self.client = AccountClient(cfg)
         self.gateway = ModelGateway(cfg)
         self._lock = threading.RLock()
+        self._save_lock = threading.Lock()
         self._accounts: List[Account] = []
         self._rr_index = 0
         self._rr_lock = threading.Lock()
@@ -148,11 +149,14 @@ class AccountPool:
             self._dirty = False
             self._last_save = now
             payload = {"accounts": [a.to_dict() for a in self._accounts if a.persist]}
-        self._file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._file.with_suffix(self._file.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, self._file)
+        # Batch actions (e.g. setting passwords concurrently) save from several
+        # threads at once; they must not race on the same temp file.
+        with self._save_lock:
+            self._file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._file.with_suffix(self._file.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, self._file)
 
     def flush(self) -> None:
         """Force a write if a throttled save is pending."""
@@ -191,7 +195,11 @@ class AccountPool:
         return acc
 
     def update_account(self, name: str, **fields) -> Account:
-        """Patch an existing account (loginid / password / enabled)."""
+        """Patch an existing account (loginid / password / enabled).
+
+        ``password_set_at`` is cleared when the password changes so the
+        "permanent" badge reflects the new credential's status.
+        """
         acc = self.get(name)
         if acc is None:
             raise PoolError(f"没有名为 {name} 的账号 / no such account: {name}")
@@ -202,6 +210,7 @@ class AccountPool:
                     # a new credential means the old session belongs to the old
                     # login: force a fresh login on next use
                     acc.session, acc.expire_at = "", 0
+                    acc.password_set_at = 0
         if "enabled" in fields and fields["enabled"] is not None:
             acc.enabled = bool(fields["enabled"])
         self.save(force=True)
@@ -229,15 +238,100 @@ class AccountPool:
 
     # ------------------------------------------------------ session keep
 
+    def set_account_password(self, acc: Account,
+                             password: str = "") -> str:
+        """Set (or generate) the account's login password upstream.
+
+        The account service only needs a valid session for this, so an account
+        that was added via SMS can be upgraded to a password account at any
+        time.  The password is persisted in ``accounts.json`` and therefore
+        travels with exports.  Returns the password that was set.
+        """
+        if not acc.session or not acc.session_valid:
+            raise PoolError(
+                f"账号 {acc.name} 没有有效 session，无法设置密码"
+                f"（请先续期或用验证码重新登录）")
+        if not acc.persist:
+            raise PoolError(
+                f"账号 {acc.name} 来自桌面客户端，密码无法保存到本机账号文件；"
+                f"请在面板里用「导入账号」把它复制为独立账号后再设置密码")
+        if not acc.loginid:
+            raise PoolError(
+                f"账号 {acc.name} 没有手机号，密码登录无从使用；请先补充 loginid")
+        new_password = password or generate_password()
+        self.client.set_password(acc.session, new_password, acc.identity or None)
+        acc.password = new_password
+        acc.password_set_at = int(time.time())
+        self.save(force=True)
+        self.log(f"账号 {acc.name} 已设置登录密码（升级为可自动续期账号）")
+        return new_password
+
+    def ensure_password(self, acc: Account, *, force: bool = False) -> bool:
+        """Give a password-less account one while its session still works.
+
+        Called by the keeper shortly before a session expires: without a
+        password the account would need an SMS code to come back, which the
+        gateway cannot do unattended.  Returns True when a password was set.
+        """
+        if acc.has_password and not force:
+            return False
+        if not acc.session_valid:
+            return False
+        # Derived accounts (imported from the desktop client) are never written
+        # back to accounts.json, so a password set here would be forgotten on
+        # restart and rotated again — leave the client's account untouched.
+        if not acc.persist:
+            return False
+        # Never overwrite a password the user set elsewhere: if the account
+        # already has one upstream but we don't know it, rotating would break
+        # their other login.  The explicit "set password" action can still do
+        # it on purpose.
+        status = getattr(self.client, "password_status", None)
+        if status is not None:
+            try:
+                if status(acc.session, acc.identity or None):
+                    self.log(f"账号 {acc.name} 上游已有密码但本地未保存，"
+                             f"跳过自动设置（可在面板手动设置）")
+                    return False
+            except Exception:                            # noqa: BLE001
+                pass                                     # offline: try anyway
+        try:
+            self.set_account_password(acc)
+            return True
+        except (AccountError, PoolError) as exc:
+            self.log(f"账号 {acc.name} 自动设置密码失败：{exc}")
+            return False
+
     def ensure_session(self, acc: Account, *, force: bool = False) -> Account:
-        """Log in / refresh the account session when needed."""
+        """Log in / refresh the account session when needed.
+
+        A password-less account cannot renew itself, so before its session
+        expires the keeper upgrades it: ``password_set_before_days`` (default
+        1) controls how close to expiry that happens.  Once the password is
+        stored the account behaves like a permanent one — every later expiry
+        is handled by a password login.
+        """
         renew_days = float(self.cfg.get("session_renew_before_days") or 3)
+        # 0 disables the automatic upgrade (the account then needs an SMS login)
+        upgrade_days = float(self.cfg.get("password_set_before_days")
+                             if self.cfg.get("password_set_before_days") is not None
+                             else 1)
         needs = force or not acc.session_valid
         if not needs and acc.days_left is not None and acc.days_left < renew_days:
+            if not acc.has_password and (
+                    upgrade_days <= 0 or acc.days_left > upgrade_days):
+                # Still too early to burn the upgrade (or it is disabled);
+                # wait until the account is within the configured window.
+                return acc
             needs = True
             self.log(f"账号 {acc.name} session 剩余 {acc.days_left:.1f} 天，提前续期")
         if not needs:
             return acc
+        if not acc.has_password:
+            # last chance: the session still works, so we can set a password
+            # now and make every future expiry automatic
+            if acc.session_valid:
+                self.ensure_password(acc)
         if not (acc.loginid and acc.password):
             raise PoolError(
                 f"账号 {acc.name} 的 session 不可用且没有账号密码，无法自动重登"
@@ -385,11 +479,23 @@ class AccountPool:
                 self.log(f"账号守护线程异常：{exc}")
 
     def tick(self) -> None:
-        """One maintenance pass: renew sessions, refresh quota."""
+        """One maintenance pass: renew sessions, refresh quota.
+
+        Password-less accounts are upgraded shortly before their session
+        expires (``password_set_before_days``) so they never fall back to
+        needing a human-read SMS code.
+        """
+        upgrade_days = float(self.cfg.get("password_set_before_days")
+                             if self.cfg.get("password_set_before_days") is not None
+                             else 1)
         for acc in self.accounts:
             if not acc.enabled:
                 continue
             try:
+                if (upgrade_days > 0 and not acc.has_password and acc.session_valid
+                        and acc.days_left is not None
+                        and acc.days_left <= upgrade_days):
+                    self.ensure_password(acc)
                 self.ensure_session(acc)
                 self.refresh_quota(acc)
             except (AccountError, PoolError) as exc:

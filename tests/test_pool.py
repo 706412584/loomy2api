@@ -190,6 +190,109 @@ class TestSessionLifecycle(unittest.TestCase):
         acc = pool.get("a")
         self.assertEqual((acc.balance, acc.daily_balance, acc.available), (5, 6, 11))
 
+    def test_expiring_account_without_password_gets_one(self):
+        """A session close to expiry is upgraded before it can die."""
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            # 0.5 days left, no password, no loginid -> cannot renew
+            {"name": "a", "loginid": "13800000001", "session": "s",
+             "expireAt": int(time.time()) + 12 * 3600},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        self.assertFalse(acc.has_password)
+
+        class FakeClient:
+            def __init__(self):
+                self.passwords = []
+
+            def set_password(self, session, new_password, identity=None):
+                self.passwords.append((session, new_password))
+
+            def fill(self, account):
+                account.session = "renewed"
+                account.expire_at = int(time.time()) + 14 * 86400
+                return account
+
+        client = FakeClient()
+        pool.client = client
+        pool.tick()
+
+        self.assertEqual(len(client.passwords), 1)
+        self.assertEqual(client.passwords[0][0], "s")
+        self.assertTrue(acc.has_password)
+        self.assertEqual(acc.session, "renewed")
+        # persisted, so it survives a restart / travels with an export
+        saved = json.loads((self.dir / "accounts.json").read_text(encoding="utf-8"))
+        row = next(a for a in saved["accounts"] if a["name"] == "a")
+        self.assertEqual(row["password"], acc.password)
+        self.assertTrue(row.get("passwordSetAt"))
+
+    def test_upgrade_skips_account_with_upstream_password(self):
+        """Never rotate a password the user set but we don't know."""
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "session": "s",
+             "expireAt": int(time.time()) + 12 * 3600},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+
+        class FakeClient:
+            def password_status(self, session, identity=None):
+                return True                     # upstream already has one
+
+            def set_password(self, session, new_password, identity=None):
+                raise AssertionError("must not overwrite")
+
+        pool.client = FakeClient()
+        self.assertFalse(pool.ensure_password(acc))
+        self.assertFalse(acc.has_password)
+
+    def test_upgrade_skips_client_derived_accounts(self):
+        from loomy2api.account import Account
+
+        pool = AccountPool(self.cfg)
+        acc = Account(name="desktop", loginid="13800000001",
+                      session="s", expire_at=int(time.time()) + 3600)
+        acc.persist = False                     # imported from the desktop app
+        self.assertFalse(pool.ensure_password(acc))
+        self.assertFalse(acc.has_password)
+
+    def test_password_upgrade_waits_until_within_threshold(self):
+        """3 days left is too early when the threshold is 1 day."""
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "session": "s",
+             "expireAt": int(time.time()) + 3 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+
+        class FakeClient:
+            def set_password(self, session, new_password, identity=None):
+                raise AssertionError("should not upgrade yet")
+
+        pool.client = FakeClient()
+        pool.ensure_session(acc)          # within renew window, outside upgrade window
+        self.assertFalse(acc.has_password)
+
+    def test_permanent_account_flag_in_public_view(self):
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "pw",
+             "session": "s1", "expireAt": int(time.time()) + 3600},
+            {"name": "b", "session": "s2", "expireAt": int(time.time()) + 3600},
+        ])
+        pool = AccountPool(self.cfg)
+        self.assertTrue(pool.get("a").permanent)
+        self.assertFalse(pool.get("b").permanent)
+        self.assertTrue(pool.get("a").public_dict()["permanent"])
+
     def test_tick_clears_session_on_401(self):
         from loomy2api.upstream import UpstreamError
         from tests.support import write_accounts

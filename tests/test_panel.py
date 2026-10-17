@@ -205,6 +205,84 @@ class TestPanelWrites(PanelHarness, unittest.TestCase):
         self.assertTrue(acc.session_valid)
         self.assertEqual(self.gateway.pool.client.fills, ["a"])
 
+    def test_set_password_upgrades_account(self):
+        # account "a" already has a password; add one without
+        self.gateway.pool.add_account("b", loginid="13900000009", session="s2")
+        _s, payload = self.post("/api/panel/accounts/password", {"name": "b"})
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["generated"])
+        self.assertGreaterEqual(len(payload["password"]), 8)
+        acc = self.gateway.pool.get("b")
+        self.assertEqual(acc.password, payload["password"])
+        self.assertTrue(acc.permanent)
+        self.assertTrue(acc.password_set_at)
+        self.assertTrue(acc.session_valid)          # password set via live session
+        self.assertEqual(self.gateway.pool.client.passwords[-1][0], "s2")
+
+        # the generated password is persisted and exported
+        saved = json.loads((self.dir / "accounts.json").read_text(encoding="utf-8"))
+        row = next(a for a in saved["accounts"] if a["name"] == "b")
+        self.assertEqual(row["password"], payload["password"])
+        _s, export = self.get_json("/api/panel/export")
+        row = next(a for a in export["accounts"] if a["name"] == "b")
+        self.assertEqual(row["password"], payload["password"])
+        self.assertTrue(row.get("passwordSetAt"))
+
+    def test_set_password_with_explicit_value(self):
+        self.gateway.pool.add_account("b", loginid="13900000009", session="s2")
+        _s, payload = self.post("/api/panel/accounts/password",
+                                {"name": "b", "password": "MyPass1234"})
+        self.assertEqual(payload["password"], "MyPass1234")
+        self.assertFalse(payload["generated"])
+        self.assertEqual(self.gateway.pool.get("b").password, "MyPass1234")
+
+    def test_set_password_rejects_weak_value(self):
+        self.gateway.pool.add_account("b", loginid="13900000009", session="s2")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/panel/accounts/password", {"name": "b", "password": "short"})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_set_password_requires_a_session(self):
+        self.gateway.pool.add_account("b", loginid="13900000009")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/panel/accounts/password", {"name": "b"})
+        self.assertEqual(ctx.exception.code, 400)
+        body = json.loads(ctx.exception.read().decode("utf-8"))
+        self.assertIn("session", json.dumps(body, ensure_ascii=False))
+
+    def test_batch_set_passwords(self):
+        self.gateway.pool.add_account("b", loginid="13900000009", session="s2")
+        self.gateway.pool.add_account("c", loginid="13900000010", session="s3")
+        _s, payload = self.post("/api/panel/accounts/passwords", {})
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["done"], 2)       # "a" already had a password
+        self.assertEqual(payload["total"], 2)
+        self.assertTrue(self.gateway.pool.get("b").permanent)
+        self.assertTrue(self.gateway.pool.get("c").permanent)
+        self.assertEqual(len(self.gateway.pool.client.passwords), 2)
+
+    def test_batch_set_passwords_skips_known_upstream_password(self):
+        """Never rotate a password the user set but the pool doesn't store."""
+        self.gateway.pool.add_account("b", loginid="13900000009", session="s2")
+
+        class Client(FakeAccountClient):
+            def password_status(self, session, identity=None):
+                return session == "s2"          # only "b" already has one
+
+        self.gateway.pool.client = Client()
+        _s, payload = self.post("/api/panel/accounts/passwords", {})
+        self.assertEqual(payload["done"], 0)
+        row = next(r for r in payload["results"] if r["name"] == "b")
+        self.assertFalse(row["ok"])
+        self.assertTrue(row.get("skipped"))
+        self.assertFalse(self.gateway.pool.get("b").has_password)
+
+    def test_state_exposes_permanent_flag(self):
+        _s, payload = self.get_json("/api/panel/state")
+        account = next(a for a in payload["accounts"] if a["name"] == "a")
+        self.assertTrue(account["permanent"])
+        self.assertTrue(account["has_password"])
+
     def test_remove_account(self):
         _s, payload = self.post("/api/panel/accounts/remove", {"name": "a"})
         self.assertTrue(payload["ok"])

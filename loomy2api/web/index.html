@@ -158,6 +158,7 @@
       <label class="row" style="margin:0;color:var(--muted)">
         <input id="auto" type="checkbox" checked style="min-width:auto"> 自动刷新
       </label>
+      <button id="setAllPasswords">一键设置密码</button>
       <button class="primary" id="refresh">刷新额度</button>
     </div>
   </header>
@@ -251,7 +252,7 @@
     <div class="hint mono" style="line-height:1.9;margin-top:8px">
       OpenAI: POST /v1/chat/completions · GET /v1/models · POST /v1/embeddings · POST /v1/images/generations<br>
       Anthropic: POST /v1/messages<br>
-      控制面板 API: GET /api/panel/state · POST /api/panel/accounts · /accounts/update · /accounts/remove · /accounts/renew · /accounts/identity · /refresh
+      控制面板 API: GET /api/panel/state · POST /api/panel/accounts · /accounts/update · /accounts/remove · /accounts/renew · /accounts/identity · /accounts/password · /accounts/passwords · /refresh
     </div>
   </details>
 </div>
@@ -294,10 +295,20 @@ function badge(a) {
   if (!a.enabled) return '<span class="badge b-off">已禁用</span>';
   if (a.in_cooldown) return '<span class="badge b-warn">冷却 ' + Math.round(a.cooldown_seconds_left) + 's</span>';
   if (!a.session) return '<span class="badge b-bad">无登录态</span>';
-  if (a.session_days_left !== null && a.session_days_left < 3)
+  // a password account is permanent: expiry is handled by an automatic re-login
+  if (a.permanent) {
+    if (a.session_days_left !== null && a.session_days_left < 3)
+      return '<span class="badge b-ok">永久</span>';
+  } else if (a.session_days_left !== null && a.session_days_left < 3) {
     return '<span class="badge b-warn">即将到期</span>';
+  }
   if (a.available === 0) return '<span class="badge b-warn">额度用尽</span>';
   return '<span class="badge b-ok">正常</span>';
+}
+
+function remainingText(a) {
+  if (a.permanent) return '<span class="badge b-ok">永久</span>';
+  return a.session_days_left === null ? '—' : a.session_days_left.toFixed(1) + ' 天';
 }
 
 function num(v) { return (v === null || v === undefined) ? '—' : v; }
@@ -327,10 +338,12 @@ function render(state) {
     const id = a.identity || {};
     // data-label feeds the card layout on phones; the desktop table ignores it
     return '<tr onclick="openAccountModal(\'' + a.name + '\')" style="cursor:pointer">'
-      + '<td data-label="账号"><b>' + a.name + '</b><div class="mono">' + (a.source === 'client' ? 'client 导入' : (a.mode === 'session' ? '仅 session' : '手机号+密码')) + '</div></td>'
+      + '<td data-label="账号"><b>' + a.name + '</b><div class="mono">'
+        + (a.source === 'client' ? 'client 导入' : (a.mode === 'session' ? '仅 session' : '密码账号'))
+        + (a.permanent ? ' · <span style="color:var(--ok)">永久</span>' : '') + '</div></td>'
       + '<td data-label="手机号" class="mono">' + (a.loginid_masked || '—') + '</td>'
       + '<td data-label="状态">' + badge(a) + '</td>'
-      + '<td data-label="剩余">' + (a.session_days_left === null ? '—' : a.session_days_left.toFixed(1) + ' 天') + '</td>'
+      + '<td data-label="剩余">' + remainingText(a) + '</td>'
       + '<td data-label="可用积分"><span><b>' + num(a.available) + '</b><div class="mono">余额 ' + num(a.balance) + ' + 每日 ' + num(a.daily_balance) + '</div></span></td>'
       + '<td data-label="请求">' + a.requests + '</td><td data-label="扣分">' + a.points_used + '</td>'
       + '<td data-label="设备" class="mono" title="' + (id.campus_device_id || '') + '">' + (id.devid || '—') + '</td>'
@@ -364,15 +377,21 @@ function openAccountModal(name) {
     + '<div class="card"><div class="k">可用积分</div><div class="v">' + num(a.available)
     + '<small>余额 ' + num(a.balance) + ' + 每日 ' + num(a.daily_balance) + '</small></div></div>'
     + '<div class="card"><div class="k">session 剩余</div><div class="v">'
-    + (a.session_days_left === null ? '—' : a.session_days_left.toFixed(1) + ' 天') + '</div></div>'
+    + remainingText(a) + '</div></div>'
     + '<div class="card"><div class="k">设备标识</div><div class="v"><small class="mono" style="white-space:normal">'
     + (id.devid || '—') + '</small></div></div>'
     + '</div>'
+    + (a.permanent
+        ? '<div class="hint" style="color:var(--ok)">该账号已设置登录密码，session 到期会自动续期（永久可用）。</div>'
+        : '<div class="hint" style="color:var(--warn)">该账号还没有登录密码：session 到期后需要重新短信登录。'
+          + '现在设置密码即可升级为永久账号。</div>')
     + '<div class="ops">'
     + '<button class="primary" onclick="modalAct(\'points\')">查积分</button>'
     + '<button onclick="modalAct(\'checkin\')">每日签到</button>'
     + '<button onclick="modalAct(\'onboarding\')">新手任务</button>'
     + '<button onclick="modalAct(\'renew\')">续期重登</button>'
+    + '<button onclick="modalAct(\'password\')">'
+    + (a.permanent ? '重设密码' : '设置密码') + '</button>'
     + '<button onclick="modalAct(\'identity\')">换设备标识</button>'
     + '<button onclick="modalAct(\'toggle\')">' + (a.enabled ? '禁用' : '启用') + '</button>'
     + '<button class="danger" onclick="modalAct(\'remove\')">删除</button>'
@@ -412,6 +431,21 @@ async function modalAct(kind) {
       const okN = (res.tasks || []).filter(t => t.ok).length;
       modalMsg('新手任务 ' + okN + '/8 ok，合计到账 ' + (res.gained ?? 0) + ' 积分');
       if (res.points) renderPoints(res.points);
+    } else if (kind === 'password') {
+      const pwd = prompt(
+        '给 ' + name + ' 设置登录密码。\n\n'
+        + '留空 = 自动生成一个随机强密码（推荐）。\n'
+        + '设置后账号升级为永久：session 到期会自动用密码重登。',
+        '');
+      if (pwd === null) { modalMsg(''); return; }
+      modalMsg('正在设置密码…');
+      const res = await api('/api/panel/accounts/password', {
+        method: 'POST', body: JSON.stringify({name, password: pwd.trim()})});
+      modalMsg('✓ 密码已设置：' + res.password
+        + (res.generated ? '（自动生成，请保存）' : '')
+        + '。账号已升级为永久，session 到期会自动续期。');
+      toast(name + ' 已升级为永久账号', 'ok');
+      if (res.state) { LAST_STATE = res.state; render(res.state); }
     } else if (kind === 'remove') {
       if (!confirm('确认删除账号 ' + name + '？')) { modalMsg(''); return; }
       await api('/api/panel/accounts/remove', {
@@ -479,7 +513,7 @@ function openAddModal(tab) {
     + '<button id="tabPwd">密码登录</button><button id="tabSms">验证码登录</button>'
     + '<button id="tabImport">批量导入</button></div>'
     + '<div id="modalPane"></div>'
-    + '<div class="hint">密码登录：需先在讯飞账号中心设置密码，可自动续期。验证码登录：无需密码，但 session 14 天后过期需重新登录。添加成功后会为账号随机生成设备标识（devid / 校园设备号）并绑定。</div>'
+    + '<div class="hint">验证码登录：无需密码即可添加；添加后可在账号管理里「设置密码」，升级为永久账号（session 到期自动续期）。密码登录：直接使用已设置的密码。添加成功后会为账号随机生成设备标识（devid / 校园设备号）并绑定。</div>'
     + '<div id="modalMsg" class="hint"></div>';
   $('modalPane').innerHTML =
     ADD_TAB === 'pwd' ? pwdPane : ADD_TAB === 'sms' ? smsPane : importPane;
@@ -858,6 +892,37 @@ $('doOnboarding').onclick = doOnboarding;
 $('doCheckin').onclick = doCheckin;
 $('showAdd').onclick = () => openAddModal('pwd');
 $('showImport').onclick = () => openAddModal('import');
+$('setAllPasswords').onclick = setAllPasswords;
+
+async function setAllPasswords() {
+  if (!LAST_STATE) { toast('账号状态未加载', 'err'); return; }
+  const targets = LAST_STATE.accounts.filter(a => a.enabled && !a.permanent);
+  if (!targets.length) { toast('所有启用账号都已有密码（永久账号）', 'ok'); return; }
+  if (!confirm('给 ' + targets.length + ' 个无密码账号设置随机强密码？\n\n'
+      + '设置后这些账号将升级为永久：session 到期会自动用密码重登，'
+      + '不再需要短信验证码。\n\n密码会保存到账号文件并随导出一起导出。')) return;
+  const btn = $('setAllPasswords');
+  btn.disabled = true; btn.textContent = '设置中…';
+  try {
+    const res = await api('/api/panel/accounts/passwords', {
+      method: 'POST', body: JSON.stringify({})});
+    const ok = (res.results || []).filter(r => r.ok);
+    const bad = (res.results || []).filter(r => !r.ok);
+    let msg = '完成：' + ok.length + '/' + res.total + ' 个账号已升级为永久';
+    if (bad.length) msg += '；失败 ' + bad.length + '（' + bad[0].error + '）';
+    toast(msg, bad.length ? 'err' : 'ok');
+    if (ok.length) {
+      const lines = ok.map(r => r.name + '  ' + r.password).join('\n');
+      alert('已设置密码的账号（请妥善保存）：\n\n' + lines
+        + '\n\n这些密码已写入账号文件，导出账号时会一并导出。');
+    }
+    if (res.state) { LAST_STATE = res.state; render(res.state); }
+  } catch (e) {
+    toast('设置失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = '一键设置密码';
+  }
+}
 $('saveKey').onclick = () => {
   KEY = $('apiKey').value.trim();
   localStorage.setItem('loomy2api_key', KEY);

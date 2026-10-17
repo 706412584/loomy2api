@@ -14,8 +14,8 @@ android {
         applicationId = "com.loomy.gw"
         minSdk = 26
         targetSdk = 34
-        versionCode = 24
-        versionName = "2.5.0"
+        versionCode = 25
+        versionName = "2.6.0"
 
         ndk {
             // Chaquopy needs abiFilters; arm64 covers modern phones

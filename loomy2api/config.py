@@ -50,6 +50,10 @@ DEFAULTS: Dict[str, Any] = {
     "thinking_stall_seconds": 240,  # abort/retry a reasoning loop with no output
     "cooldown_seconds": 300,
     "session_renew_before_days": 3,
+    #: Upgrade a password-less account this many days before its session
+    #: expires: set a password through the still-valid session, so it can
+    #: re-login on its own from then on ("permanent").
+    "password_set_before_days": 1,
     "quota_refresh_minutes": 30,
     "sessions_from_client": True, # also honour the desktop client's session
     "client_root": "",            # override the client's data dir (tests)

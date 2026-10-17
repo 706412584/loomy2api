@@ -102,7 +102,12 @@ export ANTHROPIC_API_KEY=not-needed
   `quota_refresh_minutes` and re-logs in whenever a session has less than
   `session_renew_before_days` (default 3) left — a pool runs unattended.
 * **Session-only accounts** work too (handy for sharing accounts with someone
-  else), but they expire after 14 days and need `loomy2api login` again.
+  else). `password_set_before_days` (default 1) before expiry the gateway sets
+  a generated password through the still-valid session and stores it in
+  `accounts.json`, turning the account **permanent** — every later expiry is
+  handled by a password login, no SMS code needed. The panel and the Android
+  app can also upgrade accounts immediately ("set password" / "set all
+  passwords").
 * **Client import** — if the Loomy desktop app is installed and logged in, its
   session is picked up automatically as an extra account
   (`sessions_from_client: true`).

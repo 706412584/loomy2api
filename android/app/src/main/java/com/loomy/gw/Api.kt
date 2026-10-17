@@ -118,12 +118,16 @@ data class AccountView(
     val mode: String,
     val lastError: String,
     val source: String,
+    val permanent: Boolean,
+    val passwordSetAt: Long,
 ) {
     val statusLabel: String
         get() = when {
             !enabled -> "已禁用"
             inCooldown -> "冷却中"
             !hasSession -> "无登录态"
+            // a stored password means expiry is handled by an automatic login
+            permanent -> if (sessionDaysLeft != null && sessionDaysLeft < 3) "永久" else "正常"
             sessionDaysLeft != null && sessionDaysLeft < 3 -> "即将到期"
             available == 0 -> "额度用尽"
             else -> "正常"
@@ -156,6 +160,7 @@ data class ConfigView(
     val sessionRenewBeforeDays: Int,
     val quotaRefreshMinutes: Int,
     val sessionsFromClient: Boolean,
+    val passwordSetBeforeDays: Int,
 )
 
 data class StateView(
@@ -205,6 +210,8 @@ fun parseState(o: JSONObject): StateView {
             mode = a.optString("mode"),
             lastError = a.optString("last_error"),
             source = a.optString("source"),
+            permanent = a.optBoolean("permanent"),
+            passwordSetAt = a.optLong("password_set_at"),
         )
     }
     val keys = c.optJSONArray("api_keys") ?: JSONArray()
@@ -238,6 +245,7 @@ fun parseState(o: JSONObject): StateView {
             sessionRenewBeforeDays = c.optInt("session_renew_before_days", 3),
             quotaRefreshMinutes = c.optInt("quota_refresh_minutes", 30),
             sessionsFromClient = c.optBoolean("sessions_from_client", true),
+            passwordSetBeforeDays = c.optInt("password_set_before_days", 1),
         ),
     )
 }

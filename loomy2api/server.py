@@ -560,6 +560,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/accounts/sms": panel.sms_send,
             "/api/panel/accounts/sms-login": panel.sms_login,
             "/api/panel/accounts/update": panel.update_account,
+            "/api/panel/accounts/password": panel.set_password,
+            "/api/panel/accounts/passwords": panel.set_passwords,
             "/api/panel/accounts/remove": panel.remove_account,
             "/api/panel/accounts/renew": panel.renew_account,
             "/api/panel/accounts/identity": panel.identity,

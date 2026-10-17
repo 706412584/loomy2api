@@ -319,6 +319,15 @@ class FakeAccountClient:
     def get_public_key(self, identity=None):
         return "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDN", "rcode-test"
 
+    # password upgrade (POST /userinfo/update/pwd)
+    def set_password(self, session, new_password, identity=None):
+        if not hasattr(self, "passwords"):
+            self.passwords = []
+        self.passwords.append((session, new_password))
+
+    def password_status(self, session, identity=None):
+        return False
+
 
 def write_accounts(path: Path, accounts: List[Dict[str, Any]]) -> None:
     path.write_text(json.dumps({"accounts": accounts}, ensure_ascii=False),

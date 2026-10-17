@@ -94,8 +94,10 @@ export ANTHROPIC_API_KEY=随便填
 
 * **有密码的账号**会自己续期：后台线程按 `quota_refresh_minutes` 巡检，
   剩余天数低于 `session_renew_before_days`（默认 3 天）就自动重登——整池可以无人值守。
-* **只有 session 的账号**也能用（适合别人给你的号），但 14 天到期后要重新
-  `loomy2api login` 或短信登录。
+* **只有 session 的账号**也能用（适合别人给你的号）。到期前 `password_set_before_days`
+  （默认 1 天）会自动给账号设置一个随机密码并写回 `accounts.json`，之后它就变成
+  **永久账号**：每次到期都能用密码自动重登，不再需要短信验证码。也可以在面板/App
+  里手动「设置密码」或「一键设置密码」立即升级。
 * **客户端导入**：本机装有 Loomy 桌面端且已登录时，它的登录态会被自动当作一个额外账号
   （`sessions_from_client: true`）。
 

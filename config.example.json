@@ -37,6 +37,8 @@
   "max_retries": 2,
   "cooldown_seconds": 300,
   "session_renew_before_days": 3,
+  "_password_upgrade": "Password-less accounts get a generated password this many days before the session expires, so they can re-login forever.",
+  "password_set_before_days": 1,
   "quota_refresh_minutes": 30,
   "sessions_from_client": true
 }

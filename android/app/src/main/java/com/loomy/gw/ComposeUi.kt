@@ -279,6 +279,69 @@ class GatewayViewModel : ViewModel() {
         "$ok/${tasks.length()}，+${r.optInt("gained")} 分"
     }
 
+    /**
+     * Give one account a login password (empty = generate one upstream).
+     *
+     * Setting a password upgrades the account: its session can be renewed
+     * automatically forever, so it no longer depends on an SMS code.
+     */
+    suspend fun setPassword(acc: AccountView, password: String): String = try {
+        val body = JSONObject().put("name", acc.name)
+        if (password.isNotBlank()) body.put("password", password)
+        val r = Api.post("/api/panel/accounts/password", body, timeoutSec = 60)
+        if (!r.optBoolean("ok", true)) {
+            throw IllegalStateException(r.optString("error").ifBlank { "设置失败" })
+        }
+        loadState()
+        "✓ 密码已设置：${r.optString("password")}" +
+            (if (r.optBoolean("generated")) "（自动生成，请保存）" else "") +
+            "\n账号已升级为永久，session 到期会自动续期。"
+    } catch (e: Exception) {
+        "失败：${e.message ?: e.javaClass.simpleName}"
+    }
+
+    /**
+     * Upgrade every enabled account that has no password yet.
+     *
+     * Uses the batch endpoint: it skips accounts that already have a password
+     * upstream (rotating an unknown password would break the user's own
+     * login), and it runs the upstream calls concurrently.
+     */
+    fun batchSetPasswords() = viewModelScope.launch(crashGuard) {
+        _ui.update { it.copy(batchRunning = true, batchMsg = "一键设置密码：提交中…") }
+        try {
+            val r = Api.post("/api/panel/accounts/passwords",
+                JSONObject(), timeoutSec = 300)
+            val results = r.optJSONArray("results") ?: JSONArray()
+            val ok = mutableListOf<String>()
+            val bad = mutableListOf<String>()
+            for (i in 0 until results.length()) {
+                val row = results.getJSONObject(i)
+                val name = row.optString("name")
+                if (row.optBoolean("ok")) {
+                    ok += "$name  ${row.optString("password")}"
+                } else {
+                    bad += "$name: ${row.optString("error")}"
+                }
+            }
+            loadState()
+            _ui.update {
+                it.copy(
+                    batchRunning = false,
+                    batchMsg = "一键设置密码：${ok.size}/${results.length()} 成功"
+                        + (if (bad.isNotEmpty()) "\n" + bad.take(3).joinToString("\n") else "")
+                        + (if (ok.isNotEmpty())
+                            "\n新密码：\n" + ok.take(10).joinToString("\n") else ""),
+                )
+            }
+        } catch (e: Exception) {
+            _ui.update {
+                it.copy(batchRunning = false,
+                    batchMsg = "一键设置密码失败：${e.message ?: e.javaClass.simpleName}")
+            }
+        }
+    }
+
     fun refreshRecords() = viewModelScope.launch(crashGuard) {
         runCatching { loadRecords() }.onFailure { toast("读取失败：${it.message}") }
     }
@@ -927,6 +990,13 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
                             shape = RoundedCornerShape(10.dp),
                         ) { Text("刷新模型") }
                     }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { vm.batchSetPasswords() },
+                        enabled = !ui.batchRunning,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                    ) { Text("一键设置密码（升级为永久账号）") }
                     if (ui.batchRunning || ui.batchMsg.isNotBlank()) {
                         Spacer(Modifier.height(10.dp))
                         if (ui.batchRunning) {
@@ -1002,8 +1072,9 @@ private fun AccountCard(acc: AccountView, onClick: () -> Unit,
             Spacer(Modifier.height(4.dp))
             Text(
                 "请求 ${acc.requests} · 失败 ${acc.failures}"
-                    + (acc.sessionDaysLeft?.let { " · 剩余 ${"%.1f".format(it)} 天" } ?: ""),
-                color = Muted, fontSize = 12.sp,
+                    + if (acc.permanent) " · 永久（可自动续期）"
+                      else (acc.sessionDaysLeft?.let { " · 剩余 ${"%.1f".format(it)} 天" } ?: ""),
+                color = if (acc.permanent) Green else Muted, fontSize = 12.sp,
             )
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
@@ -1021,6 +1092,8 @@ private fun StatusChip(acc: AccountView) {
         !acc.enabled -> Line to Muted
         acc.inCooldown -> AmberSoft to Amber
         !acc.hasSession -> RedSoft to Red
+        // a password account renews itself — an imminent expiry is not a risk
+        acc.permanent -> GreenSoft to Green
         acc.sessionDaysLeft != null && acc.sessionDaysLeft < 3 -> AmberSoft to Amber
         else -> GreenSoft to Green
     }
@@ -1061,11 +1134,46 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     MiniStat("session 剩余",
-                        acc.sessionDaysLeft?.let { "%.1f 天".format(it) } ?: "—",
+                        if (acc.permanent) "永久"
+                        else acc.sessionDaysLeft?.let { "%.1f 天".format(it) } ?: "—",
                         Modifier.weight(1f))
                     MiniStat("设备", acc.devid.ifBlank { "—" }, Modifier.weight(1f))
                 }
                 Spacer(Modifier.height(14.dp))
+
+                // password state: an account without one cannot renew itself
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            if (acc.permanent) "永久账号（已设密码）" else "未设密码：到期后需短信重新登录",
+                            fontSize = 13.sp,
+                            color = if (acc.permanent) Green else Amber,
+                        )
+                        if (!acc.permanent) {
+                            Text("设置密码后 session 到期会自动续期",
+                                fontSize = 11.sp, color = Muted)
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            if (busy) return@OutlinedButton
+                            busy = true
+                            msg = "正在设置密码…"
+                            scope.launch {
+                                try {
+                                    msg = vm.setPassword(acc, "")
+                                } finally {
+                                    busy = false
+                                }
+                            }
+                        },
+                        enabled = !busy && acc.hasSession,
+                        shape = RoundedCornerShape(10.dp),
+                    ) { Text(if (acc.permanent) "重设密码" else "设置密码", fontSize = 13.sp) }
+                }
 
                 val actions = listOf(
                     "查积分" to "quota", "每日签到" to "checkin",
@@ -1685,6 +1793,12 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
     var logRequests by remember(cfg) { mutableStateOf(cfg?.logRequests ?: true) }
     var timeout by remember(cfg) { mutableStateOf("${cfg?.timeout ?: 1200}") }
     var cooldown by remember(cfg) { mutableStateOf("${cfg?.cooldownSeconds ?: 300}") }
+    var renewDays by remember(cfg) {
+        mutableStateOf("${cfg?.sessionRenewBeforeDays ?: 3}")
+    }
+    var pwdDays by remember(cfg) {
+        mutableStateOf("${cfg?.passwordSetBeforeDays ?: 1}")
+    }
     var msg by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
@@ -1717,6 +1831,19 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             NumberField("上游超时（秒）", timeout) { timeout = it }
             Spacer(Modifier.height(8.dp))
             NumberField("冷却时间（秒）", cooldown) { cooldown = it }
+        }
+
+        SectionTitle("会话续期")
+        SectionCard {
+            NumberField("提前续期（天）", renewDays) { renewDays = it }
+            Spacer(Modifier.height(8.dp))
+            NumberField("到期前设置密码（天）", pwdDays) { pwdDays = it }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "无密码账号会在 session 到期前这么多天自动设置一个随机密码，" +
+                    "之后每次到期都能用密码自动重登（永久账号）。",
+                color = Muted, fontSize = 12.sp,
+            )
         }
 
         SectionTitle("网络与安全")
@@ -1764,6 +1891,8 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
                         "log_requests" to logRequests,
                         "timeout" to (timeout.toIntOrNull() ?: 1200),
                         "cooldown_seconds" to (cooldown.toIntOrNull() ?: 300),
+                        "session_renew_before_days" to (renewDays.toIntOrNull() ?: 3),
+                        "password_set_before_days" to (pwdDays.toIntOrNull() ?: 1),
                     )) { msg = it }
                 }
             },

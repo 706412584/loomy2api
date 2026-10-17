@@ -25,6 +25,7 @@ network origin, which is what most risk control looks at.
 from __future__ import annotations
 
 import json
+import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -36,7 +37,7 @@ from .httpc import request as http_request
 from .signer import build_headers
 
 __all__ = ["Account", "AccountClient", "AccountError", "new_identity",
-           "IDENTITY_FIELDS"]
+           "IDENTITY_FIELDS", "generate_password"]
 
 
 class AccountError(RuntimeError):
@@ -97,6 +98,9 @@ class Account:
     userid: str = ""
     expire_at: int = 0           # unix seconds
     obtained_at: int = 0
+    #: unix seconds when :meth:`AccountClient.set_password` last succeeded.
+    #: A stored password makes the account renewable forever ("permanent").
+    password_set_at: int = 0
 
     #: per-account device identity (devid / ua / campus device id / …)
     identity: Dict[str, Any] = field(default_factory=dict)
@@ -129,6 +133,16 @@ class Account:
         return (self.expire_at - time.time()) / 86400
 
     @property
+    def has_password(self) -> bool:
+        """A stored password means the session can always be renewed."""
+        return bool(self.loginid and self.password)
+
+    @property
+    def permanent(self) -> bool:
+        """Upgraded account: it survives session expiry via password login."""
+        return self.has_password
+
+    @property
     def in_cooldown(self) -> bool:
         return self.cooldown_until > time.time()
 
@@ -152,6 +166,8 @@ class Account:
             userid=str(raw.get("userid") or ""),
             expire_at=int(raw.get("expireAt") or raw.get("expire_at") or 0),
             obtained_at=int(raw.get("obtainedAt") or raw.get("obtained_at") or 0),
+            password_set_at=int(raw.get("passwordSetAt")
+                                or raw.get("password_set_at") or 0),
             identity=dict(identity) if isinstance(identity, dict) else {},
             available=(int(raw["available"]) if raw.get("available") is not None else None),
             balance=(int(raw["balance"]) if raw.get("balance") is not None else None),
@@ -169,6 +185,8 @@ class Account:
             out["loginid"] = self.loginid
         if self.password:
             out["password"] = self.password
+        if self.password_set_at:
+            out["passwordSetAt"] = self.password_set_at
         if self.session:
             out["session"] = self.session
         if self.userid:
@@ -214,7 +232,9 @@ class Account:
             "loginid": self.loginid,
             "userid": self.userid,
             "enabled": self.enabled,
-            "has_password": bool(self.password),
+            "has_password": self.has_password,
+            "permanent": self.permanent,
+            "password_set_at": self.password_set_at,
             "session": (self.session[:8] + "…") if self.session else "",
             "session_days_left": (round(self.days_left, 2) if self.days_left is not None else None),
             "expire_at": self.expire_at,
@@ -308,6 +328,46 @@ class AccountClient:
 
     # -- login ----------------------------------------------------------
 
+    def password_status(self, session: str,
+                        identity: Optional[Dict[str, Any]] = None) -> bool:
+        """True when the account already has a login password upstream.
+
+        The account service exposes this as ``pwdstatus`` (1 = set).  A
+        password is what makes unattended re-login possible, so the pool uses
+        this to decide whether an account still needs one.
+        """
+        payload = self.call("/userinfo/query/getStatus",
+                            {"base": self._base(identity),
+                             "param": {"session": session}},
+                            identity=identity)
+        data = payload.get("data") or {}
+        return bool(int(data.get("pwdstatus") or 0))
+
+    def set_password(self, session: str, new_password: str,
+                     identity: Optional[Dict[str, Any]] = None) -> None:
+        """Set the account's login password using a valid session.
+
+        ``POST /userinfo/update/pwd`` only needs the session — no SMS, no old
+        password.  The password is RSA/PKCS#1 v1.5 encrypted and sent as
+        ``npwd`` (the field name matters: anything else is rejected as an
+        invalid parameter).  There is no endpoint to clear it again.
+        """
+        if not session:
+            raise AccountError("设置密码需要有效 session", code="NO_SESSION")
+        pukey, rcode = self.get_public_key(identity)
+        payload = self.call("/userinfo/update/pwd", {
+            "base": self._base(identity),
+            "param": {
+                "session": session,
+                "npwd": rsa_encrypt(pukey, new_password),
+                "rcode": rcode,
+            },
+        }, identity=identity)
+        if str(payload.get("code") or "") != "000000":
+            raise AccountError(
+                f"set password failed: {payload.get('desc') or payload}",
+                code=str(payload.get("code") or "SET_PASSWORD"))
+
     def get_public_key(self, identity: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
         """→ ``(pukey_b64, rcode)``.  Zero side effects: a good first probe."""
         payload = self.call("/login/account/getPuKey", {"base": self._base(identity)})
@@ -380,6 +440,26 @@ class AccountClient:
         account.obtained_at = int(time.time())
         account.expire_at = account.obtained_at + C.SESSION_EXPIRE_SECONDS
         return account
+
+
+#: Password alphabet for auto-generated credentials.  The account service
+#: rejects "too simple" values (20012), so every generated password mixes
+#: upper/lower case and digits and is 16 characters long.
+_PWD_LOWER = "abcdefghijkmnpqrstuvwxyz"
+_PWD_UPPER = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+_PWD_DIGITS = "23456789"
+
+
+def generate_password(length: int = 16) -> str:
+    """Random password that passes the account service's complexity check."""
+    if length < 8:
+        length = 8
+    chars = [secrets.choice(_PWD_DIGITS), secrets.choice(_PWD_UPPER),
+             secrets.choice(_PWD_LOWER)]
+    pool = _PWD_LOWER + _PWD_UPPER + _PWD_DIGITS
+    chars += [secrets.choice(pool) for _ in range(length - len(chars))]
+    secrets.SystemRandom().shuffle(chars)
+    return "".join(chars)
 
 
 def _extract_session(payload: Dict[str, Any]) -> Dict[str, str]:

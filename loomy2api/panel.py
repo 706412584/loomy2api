@@ -104,7 +104,7 @@ class Panel:
         view = acc.public_dict()
         view["loginid_masked"] = mask_phone(acc.loginid)
         view["points_used"] = acc.points_used
-        view["mode"] = "password" if (acc.loginid and acc.password) else (
+        view["mode"] = "password" if acc.has_password else (
             "session" if acc.session else "empty")
         return view
 
@@ -180,6 +180,7 @@ class Panel:
                 "max_retries": self.gw.cfg.get("max_retries"),
                 "cooldown_seconds": self.gw.cfg.get("cooldown_seconds"),
                 "session_renew_before_days": self.gw.cfg.get("session_renew_before_days"),
+                "password_set_before_days": self.gw.cfg.get("password_set_before_days"),
                 "sessions_from_client": bool(self.gw.cfg.get("sessions_from_client", True)),
             },
             "accounts": accounts,
@@ -196,8 +197,8 @@ class Panel:
         editable = {
             "strategy", "default_model", "api_keys", "proxy", "log_requests",
             "timeout", "max_retries", "cooldown_seconds",
-            "session_renew_before_days", "quota_refresh_minutes",
-            "sessions_from_client", "identity_mode",
+            "session_renew_before_days", "password_set_before_days",
+            "quota_refresh_minutes", "sessions_from_client", "identity_mode",
         }
         changes = {k: v for k, v in payload.items() if k in editable}
 
@@ -224,7 +225,8 @@ class Panel:
             if flag in changes:
                 changes[flag] = bool(changes[flag])
         for num_key in ("timeout", "max_retries", "cooldown_seconds",
-                        "session_renew_before_days", "quota_refresh_minutes"):
+                        "session_renew_before_days", "password_set_before_days",
+                        "quota_refresh_minutes"):
             if num_key in changes:
                 try:
                     changes[num_key] = int(changes[num_key])
@@ -280,6 +282,8 @@ class Panel:
             }
             if acc.password:
                 out["password"] = acc.password
+            if acc.password_set_at:
+                out["passwordSetAt"] = acc.password_set_at
             items.append(out)
         return {"ok": True, "version": 1, "exported_at": int(time.time()),
                 "accounts": items}
@@ -383,6 +387,10 @@ class Panel:
                     existing.obtained_at = int(raw.get("obtainedAt") or 0)
                     if raw.get("identity"):
                         existing.identity = dict(raw["identity"])
+                    if raw.get("password"):
+                        existing.password = str(raw["password"])
+                        existing.password_set_at = int(
+                            raw.get("passwordSetAt") or raw.get("password_set_at") or 0)
                     updated.append(name)
                 else:
                     skipped.append(name)
@@ -390,6 +398,7 @@ class Panel:
                 continue
             self.pool.add_account(
                 name, loginid=str(raw.get("loginid") or ""),
+                password=str(raw.get("password") or ""),
                 session=session, userid=str(raw.get("userid") or ""),
                 identity=dict(raw["identity"]) if raw.get("identity") else None)
             acc = self.pool.get(name)
@@ -397,6 +406,9 @@ class Panel:
                 acc.expire_at = int(raw["expireAt"])
             if acc is not None and raw.get("obtainedAt"):
                 acc.obtained_at = int(raw["obtainedAt"])
+            if acc is not None and raw.get("password"):
+                acc.password_set_at = int(
+                    raw.get("passwordSetAt") or raw.get("password_set_at") or 0)
             added.append(name)
 
         # Never let a fully-rejected import rewrite the pool file: if nothing
@@ -456,6 +468,77 @@ class Panel:
         self.pool.save(force=True)
         self.log(f"[panel] {name} 验证码登录成功 userid={acc.userid}")
         return {"ok": True, "name": acc.name, "userid": acc.userid,
+                "state": self.state()}
+
+    def set_password(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Set one account's upstream login password via its live session.
+
+        This is the "upgrade to permanent" action: the account service accepts
+        ``/userinfo/update/pwd`` with nothing but a valid session, so an
+        account added through SMS can become self-renewing.  An empty
+        ``password`` means "generate a strong one"; the chosen value is
+        returned so the user can write it down.
+        """
+        name = str(payload.get("name") or "").strip()
+        acc = self.pool.get(name)
+        if acc is None:
+            raise PoolError(f"没有名为 {name} 的账号 / no such account: {name}")
+        password = str(payload.get("password") or "").strip()
+        if password:
+            has_letter = any(ch.isalpha() for ch in password)
+            has_digit = any(ch.isdigit() for ch in password)
+            if len(password) < 8 or not (has_letter and has_digit):
+                raise PoolError("密码至少 8 位且需同时包含字母和数字 / "
+                                "password needs 8+ chars with letters and digits")
+        pwd = self.pool.set_account_password(acc, password)
+        self.log(f"[panel] {acc.name} 已设置登录密码（账号升级为可自动续期）")
+        return {"ok": True, "name": acc.name, "password": pwd,
+                "generated": not bool(password), "state": self.state()}
+
+    def set_passwords(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """One-click: give every password-less account a generated password.
+
+        Accounts are independent, so the upstream calls run concurrently.  An
+        account without a usable session is reported as skipped — it cannot be
+        upgraded until it logs in again.
+        """
+        payload = payload or {}
+        only = {str(n) for n in (payload.get("names") or [])}
+        skipped = [a.name for a in self.pool.accounts if a.enabled and a.has_password]
+        targets = [a for a in self.pool.accounts
+                   if a.enabled and not a.has_password
+                   and (not only or a.name in only)]
+        results: list = []
+        if targets:
+            def upgrade(acc: Account) -> Dict[str, Any]:
+                if not acc.session_valid:
+                    return {"name": acc.name, "ok": False,
+                            "error": "没有有效 session，请先续期或验证码登录"}
+                # Do not rotate a password the user already knows: the batch
+                # action is for accounts that have none at all.  The per-account
+                # action can still reset one deliberately.
+                try:
+                    if self.pool.client.password_status(
+                            acc.session, acc.identity or None):
+                        return {"name": acc.name, "ok": False,
+                                "skipped": True,
+                                "error": "上游已有密码，跳过（如需更换请单个重设）"}
+                except Exception:                        # noqa: BLE001
+                    pass                                 # offline: proceed
+                try:
+                    pwd = self.pool.set_account_password(acc)
+                    return {"name": acc.name, "ok": True, "password": pwd}
+                except Exception as exc:                 # noqa: BLE001
+                    return {"name": acc.name, "ok": False, "error": str(exc)[:200]}
+
+            with ThreadPoolExecutor(max_workers=min(4, len(targets))) as pool:
+                results = list(pool.map(upgrade, targets))
+            self.pool.save(force=True)
+        ok = sum(1 for r in results if r.get("ok"))
+        self.log(f"[panel] 一键设置密码：成功 {ok}/{len(results)}"
+                 f"（跳过 {len(skipped)} 个已有密码）")
+        return {"ok": True, "results": results, "done": ok,
+                "total": len(results), "skipped": skipped,
                 "state": self.state()}
 
     def update_account(self, payload: Dict[str, Any]) -> Dict[str, Any]:
