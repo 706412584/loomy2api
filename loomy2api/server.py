@@ -573,6 +573,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/accounts/password": panel.set_password,
             "/api/panel/accounts/password/show": panel.show_password,
             "/api/panel/accounts/passwords": panel.set_passwords,
+            "/api/panel/accounts/register-sms": panel.register_sms,
+            "/api/panel/fysms/balance": panel.fysms_balance,
             "/api/panel/accounts/remove": panel.remove_account,
             "/api/panel/accounts/renew": panel.renew_account,
             "/api/panel/accounts/identity": panel.identity,

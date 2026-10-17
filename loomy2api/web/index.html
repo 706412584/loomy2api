@@ -73,10 +73,19 @@
     display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:40px 14px}
   #modalMask.open{display:flex}
   /* password dialog (same overlay mechanics as the account modal) */
-  #pwdMask{position:fixed;top:0;right:0;bottom:0;left:0;
+  #pwdMask,#regMask{position:fixed;top:0;right:0;bottom:0;left:0;
     background:rgba(4,8,16,.62);z-index:10;
     display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:40px 14px}
-  #pwdMask.open{display:flex}
+  #pwdMask.open,#regMask.open{display:flex}
+  #regDialog{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    width:100%;max-width:480px;box-shadow:0 18px 60px rgba(0,0,0,.5)}
+  #regDialog header{display:flex;align-items:center;justify-content:space-between;
+    padding:14px 16px;border-bottom:1px solid var(--line)}
+  #regDialog header h3{margin:0;font-size:15px}
+  #regDialog header small{color:var(--muted);font-weight:400;margin-left:6px}
+  #regBody{padding:14px 16px}
+  #regBody .ops{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+  #regBody .ops button{height:36px}
   #pwdDialog{background:var(--panel);border:1px solid var(--line);border-radius:12px;
     width:100%;max-width:440px;box-shadow:0 18px 60px rgba(0,0,0,.5)}
   #pwdDialog header{display:flex;align-items:center;justify-content:space-between;
@@ -89,6 +98,13 @@
   .pwd-reveal{display:inline-block;margin-top:8px;padding:8px 10px;border-radius:8px;
     background:#0b0d11;border:1px solid var(--line);font-family:ui-monospace,Consolas,monospace;
     font-size:13px;color:var(--ok);word-break:break-all}
+  /* paid-operation warning + progress rows */
+  .paywarn{margin:12px 0;padding:10px 12px;border-radius:8px;
+    background:rgba(255,176,0,.08);border:1px solid rgba(255,176,0,.35);
+    color:var(--warn);font-size:12px;line-height:1.6}
+  #regLog{max-height:220px;overflow:auto;margin-top:10px;padding:8px 10px;
+    border-radius:8px;background:#0b0d11;border:1px solid var(--line);
+    font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap}
   #modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;
     width:100%;max-width:520px;box-shadow:0 18px 60px rgba(0,0,0,.5)}
   #modal header{display:flex;align-items:center;justify-content:space-between;
@@ -176,6 +192,7 @@
         <input id="auto" type="checkbox" checked style="min-width:auto"> 自动刷新
       </label>
       <button id="setAllPasswords">一键设置密码</button>
+      <button id="showSmsReg">接码注册</button>
       <button class="primary" id="refresh">刷新额度</button>
     </div>
   </header>
@@ -286,6 +303,15 @@
   <div id="pwdDialog">
     <header><h3 id="pwdTitle">设置密码</h3><button onclick="closePwdDialog(true)">关闭</button></header>
     <div id="pwdBody"></div>
+  </div>
+</div>
+
+<!-- fysms 接码注册（收费操作） -->
+<div id="regMask" onclick="if(event.target===this)closeSmsReg()">
+  <div id="regDialog">
+    <header><h3>接码注册 <small>fysms</small></h3>
+      <button onclick="closeSmsReg()">关闭</button></header>
+    <div id="regBody"></div>
   </div>
 </div>
 
@@ -563,6 +589,7 @@ async function modalAct(kind) {
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if ($('pwdMask').classList.contains('open')) { closePwdDialog(true); return; }
+  if ($('regMask').classList.contains('open')) { closeSmsReg(); return; }
   closeAccountModal();
 });
 
@@ -1022,6 +1049,135 @@ async function setAllPasswords() {
     btn.disabled = false; btn.textContent = '一键设置密码';
   }
 }
+// ------------------------------------------------------- SMS registration
+
+let REG_BUSY = false;
+
+function closeSmsReg() {
+  // Closing while a batch runs would leave the server spending money with no
+  // visible progress, so only allow it once the request has returned.
+  if (REG_BUSY) { toast('注册进行中，请等待当前号码完成', 'err'); return; }
+  $('regMask').classList.remove('open');
+}
+
+async function openSmsReg() {
+  if (!LAST_STATE) { toast('账号状态未加载', 'err'); return; }
+  const c = LAST_STATE.config || {};
+  $('regBody').innerHTML =
+    '<div class="grid">'
+    + '<div><label>fysms 账号</label><input id="r-user" placeholder="接码平台账号" value="'
+    + (c.fysms_username || '').replace(/"/g, '&quot;') + '"></div>'
+    + '<div><label>fysms 密码</label><input id="r-pass" type="password" '
+    + 'placeholder="' + (c.fysms_password_set ? '已保存，留空使用已保存密码' : '接码平台密码') + '"></div>'
+    + '<div><label>注册数量</label><input id="r-count" type="number" min="1" max="20" value="1"></div>'
+    + '<div><label>短信标题（匹配关键词）</label><input id="r-keyword" value="'
+    + (c.fysms_keyword || '讯飞').replace(/"/g, '&quot;') + '"></div>'
+    + '<div><label>统一登录密码（留空=每个号随机生成）</label>'
+    + '<input id="r-account-pass" placeholder="至少 8 位，含字母和数字"></div>'
+    + '<div><label>注册后</label>'
+    + '<label class="row" style="margin:0"><input type="checkbox" id="r-checkin"> 顺手签到</label>'
+    + '<label class="row" style="margin:0"><input type="checkbox" id="r-onboarding"> 跑新手任务</label></div>'
+    + '</div>'
+    + '<div class="row" style="gap:8px;align-items:center;margin-top:4px">'
+    + '<button id="r-balance">查询余额（免费）</button>'
+    + '<span id="r-balance-msg" class="muted" style="font-size:12px"></span></div>'
+    + '<div class="paywarn">⚠ 接码注册会<b>按号码收费</b>（约 1.6 元/个，由接码平台扣款）。'
+    + '每取一个号码就会扣费，即使最终没收到短信。请确认数量和余额后再开始。</div>'
+    + '<div class="hint">接码平台需<b>直连</b>访问，请关闭 VPN / 全局代理。'
+    + '每个号码会依次：取号 → 讯飞发码 → 等待短信 → 验证码登录 → 自动设置登录密码并验证，'
+    + '成功即为永久账号。</div>'
+    + '<div id="regLog" style="display:none"></div>'
+    + '<div class="ops">'
+    + '<button onclick="closeSmsReg()">取消</button>'
+    + '<button class="primary" id="r-start">开始注册（收费）</button></div>';
+  $('regMask').classList.add('open');
+  $('r-balance').onclick = queryFysmsBalance;
+  $('r-start').onclick = startSmsReg;
+}
+
+function regCredentials() {
+  return {
+    fysms_username: $('r-user').value.trim(),
+    fysms_password: $('r-pass').value,
+  };
+}
+
+async function queryFysmsBalance() {
+  const msg = $('r-balance-msg');
+  msg.textContent = '查询中…';
+  try {
+    const res = await api('/api/panel/fysms/balance', {
+      method: 'POST', body: JSON.stringify(regCredentials())});
+    msg.textContent = '余额 ' + res.balance + ' 元 · 约可注册 '
+      + (res.affordable ?? '?') + ' 个（' + res.price + ' 元/个）';
+    toast('fysms 余额：' + res.balance + ' 元', 'ok');
+  } catch (e) {
+    msg.textContent = '查询失败';
+    toast('余额查询失败：' + e.message, 'err');
+  }
+}
+
+function regLine(text) {
+  const box = $('regLog');
+  if (!box) return;
+  box.style.display = 'block';
+  box.textContent += text + '\n';
+  box.scrollTop = box.scrollHeight;
+}
+
+async function startSmsReg() {
+  if (REG_BUSY) return;
+  const count = parseInt($('r-count').value || '1', 10);
+  if (!(count >= 1 && count <= 20)) { toast('数量需在 1-20 之间', 'err'); return; }
+  const creds = regCredentials();
+  if (!creds.fysms_username) { toast('请填写 fysms 账号', 'err'); return; }
+  if (!creds.fysms_password && !(LAST_STATE.config || {}).fysms_password_set) {
+    toast('请填写 fysms 密码', 'err'); return;
+  }
+  if (!confirm('接码注册会按号码收费（约 1.6 元/个）。\n本次 ' + count
+      + ' 个号码，预计扣费 ' + (count * 1.6).toFixed(2)
+      + ' 元，且每个号码取号后即扣费（无论是否收到短信）。\n\n确认开始？')) return;
+
+  REG_BUSY = true;
+  const btn = $('r-start');
+  btn.disabled = true; btn.textContent = '注册中…';
+  $('regLog').textContent = '';
+  regLine('开始注册 ' + count + ' 个号码…');
+  try {
+    const body = Object.assign({}, creds, {
+      count,
+      confirm: true,
+      keyword: $('r-keyword').value.trim() || '讯飞',
+      password: $('r-account-pass').value.trim(),
+      checkin: $('r-checkin').checked,
+      onboarding: $('r-onboarding').checked,
+    });
+    // N numbers × (send + up to max_wait); fetch has no timeout, which is
+    // what we want here — the progress log appears only when it returns.
+    const res = await api('/api/panel/accounts/register-sms', {
+      method: 'POST', body: JSON.stringify(body)});
+    (res.results || []).forEach(r => {
+      regLine('[' + r.index + '/' + r.total + '] ' + (r.phone || '—') + '  '
+        + (r.ok ? '✓ 成功' + (r.permanent ? '（永久）' : '（未设密码）')
+                + (r.password ? '  密码 ' + r.password : '')
+                : '✗ ' + (r.error || '失败')));
+    });
+    regLine('完成：成功 ' + res.done + '/' + res.requested
+      + '，余额 ' + res.balance_before + ' → ' + res.balance_after);
+    toast('接码注册完成：成功 ' + res.done + '/' + res.requested,
+      res.done ? 'ok' : 'err');
+    if (res.state) { LAST_STATE = res.state; render(res.state); }
+  } catch (e) {
+    regLine('失败：' + e.message);
+    toast('接码注册失败：' + e.message, 'err');
+  } finally {
+    REG_BUSY = false;
+    btn.disabled = false; btn.textContent = '开始注册（收费）';
+  }
+}
+
+$('showSmsReg').onclick = openSmsReg;
+
 $('saveKey').onclick = () => {
   KEY = $('apiKey').value.trim();
   localStorage.setItem('loomy2api_key', KEY);

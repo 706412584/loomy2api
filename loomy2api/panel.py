@@ -87,6 +87,8 @@ class Panel:
     def __init__(self, gateway):
         self.gw = gateway
         self.log = gateway.log
+        # Serialize paid SMS-registration batches (see register_sms).
+        self._sms_lock = threading.Lock()
 
     # ------------------------------------------------------------ helpers
 
@@ -203,6 +205,12 @@ class Panel:
                 "session_renew_before_days": self.gw.cfg.get("session_renew_before_days"),
                 "password_set_before_days": self.gw.cfg.get("password_set_before_days"),
                 "sessions_from_client": bool(self.gw.cfg.get("sessions_from_client", True)),
+                # fysms 接码: expose the username and whether a password is
+                # stored — never the password itself.
+                "fysms_username": self.gw.cfg.get("fysms_username") or "",
+                "fysms_password_set": bool(self.gw.cfg.get("fysms_password")),
+                "fysms_keyword": self.gw.cfg.get("fysms_keyword") or "讯飞",
+                "fysms_max_wait": self.gw.cfg.get("fysms_max_wait") or 120,
             },
             "accounts": accounts,
         }
@@ -220,6 +228,8 @@ class Panel:
             "timeout", "max_retries", "cooldown_seconds",
             "session_renew_before_days", "password_set_before_days",
             "quota_refresh_minutes", "sessions_from_client", "identity_mode",
+            "fysms_username", "fysms_password", "fysms_keyword",
+            "fysms_max_wait",
         }
         changes = {k: v for k, v in payload.items() if k in editable}
 
@@ -247,7 +257,7 @@ class Panel:
                 changes[flag] = bool(changes[flag])
         for num_key in ("timeout", "max_retries", "cooldown_seconds",
                         "session_renew_before_days", "password_set_before_days",
-                        "quota_refresh_minutes"):
+                        "quota_refresh_minutes", "fysms_max_wait"):
             if num_key in changes:
                 try:
                     changes[num_key] = int(changes[num_key])
@@ -616,6 +626,115 @@ class Panel:
         return {"ok": True, "results": results, "done": ok,
                 "failed": failed, "total": len(results), "skipped": skipped,
                 "state": self.state()}
+
+    # ------------------------------------------------------ SMS registration
+
+    def _fysms_credentials(self, payload: Dict[str, Any]) -> tuple:
+        """Use the submitted credentials, else the stored ones.
+
+        A successful login with newly entered credentials persists them to
+        config.json (the reference script did the same), so the user only has
+        to type them once.
+        """
+        username = str(payload.get("fysms_username") or "").strip()
+        password = str(payload.get("fysms_password") or "")
+        if not username or not password:
+            username = str(self.gw.cfg.get("fysms_username") or "").strip()
+            password = str(self.gw.cfg.get("fysms_password") or "")
+        if not username or not password:
+            raise PoolError("需要 fysms 账号和密码 / fysms username and password required")
+        return username, password
+
+    def _remember_fysms(self, username: str, password: str) -> None:
+        changes = {}
+        if self.gw.cfg.get("fysms_username") != username:
+            changes["fysms_username"] = username
+        if self.gw.cfg.get("fysms_password") != password:
+            changes["fysms_password"] = password
+        if changes:
+            self.gw.cfg.update(changes)
+            self._write_config(changes)
+
+    def fysms_balance(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Read-only: login + balance. Takes no number, spends no money."""
+        username, password = self._fysms_credentials(payload or {})
+        from .fysms import CODE_PRICE
+        from .smsreg import fysms_status
+
+        status = fysms_status(username, password,
+                              str(self.gw.cfg.get("fysms_base") or ""))
+        self._remember_fysms(username, password)
+        balance = status.get("balance")
+        result = {
+            "ok": True,
+            "username": username,
+            "userid": status.get("userid"),
+            "balance": balance,
+            "price": CODE_PRICE,
+            "affordable": (int(balance // CODE_PRICE) if isinstance(balance, (int, float))
+                           else None),
+            "password_saved": bool(self.gw.cfg.get("fysms_password")),
+        }
+        self.log(f"[panel] fysms 余额：{balance} 元（{username}）")
+        return result
+
+    def register_sms(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Take a number, log in by SMS and upgrade it to a permanent account.
+
+        This **spends money** (one code per number), so it refuses to run
+        without an explicit ``confirm: true``.  Requests are serialized with a
+        lock: two concurrent batches would both take numbers and could trip
+        the platform's anti-abuse rules.
+        """
+        if not payload.get("confirm"):
+            raise PoolError(
+                "接码注册会按号码收费，需要 confirm=true 确认 / "
+                "this spends money; pass confirm=true to proceed")
+        username, password = self._fysms_credentials(payload)
+        try:
+            count = int(payload.get("count") or 1)
+        except (TypeError, ValueError):
+            raise PoolError("数量必须是整数") from None
+        if count < 1 or count > 20:
+            raise PoolError("一次最多注册 20 个 / count must be between 1 and 20")
+
+        manual = str(payload.get("password") or "").strip()
+        if manual:
+            self._validate_password(manual)
+        keyword = str(payload.get("keyword") or
+                      self.gw.cfg.get("fysms_keyword") or "讯飞").strip()
+        try:
+            max_wait = int(payload.get("max_wait") or
+                           self.gw.cfg.get("fysms_max_wait") or 120)
+        except (TypeError, ValueError):
+            max_wait = 120
+        max_wait = max(30, min(max_wait, 300))
+
+        from .smsreg import register_batch
+
+        if not self._sms_lock.acquire(blocking=False):
+            raise PoolError("已有接码注册任务在进行 / another SMS batch is running")
+        try:
+            self.log(f"[panel] 接码注册开始：{count} 个（标题 {keyword}，"
+                     f"每号约 1.6 元）")
+            summary = register_batch(
+                self.gw, count,
+                username=username, password=password,
+                keyword=keyword, max_wait=max_wait,
+                account_password=manual,
+                checkin=bool(payload.get("checkin")),
+                onboarding=bool(payload.get("onboarding")),
+            )
+            self._remember_fysms(username, password)
+        finally:
+            self._sms_lock.release()
+
+        # Never leak the fysms password back to the client.
+        summary["username"] = username
+        summary["state"] = self.state()
+        self.log(f"[panel] 接码注册完成：成功 {summary['done']}/{summary['requested']}，"
+                 f"余额 {summary.get('balance_before')} → {summary.get('balance_after')}")
+        return summary
 
     def update_account(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         name = str(payload.get("name") or "").strip()

@@ -347,6 +347,79 @@ class GatewayViewModel : ViewModel() {
         }
     }
 
+    // -- fysms SMS registration ------------------------------------------
+
+    /** Login + balance only — takes no number, spends no money. */
+    suspend fun fysmsBalance(username: String, password: String): String = try {
+        val body = JSONObject().put("fysms_username", username)
+        if (password.isNotBlank()) body.put("fysms_password", password)
+        val r = Api.post("/api/panel/fysms/balance", body, timeoutSec = 60)
+        loadState()
+        val balance = r.optDouble("balance", Double.NaN)
+        if (balance.isNaN()) "余额解析失败"
+        else "余额 ${"%.2f".format(balance)} 元 · 约可注册 " +
+            "${r.optInt("affordable")} 个（${r.optDouble("price", 1.6)} 元/个）"
+    } catch (e: Exception) {
+        "失败：${e.message ?: e.javaClass.simpleName}"
+    }
+
+    /**
+     * Register accounts through the fysms SMS platform.
+     *
+     * Spends real money (one code per number) and can run for minutes, so it
+     * always sends ``confirm: true`` and keeps the button disabled until the
+     * server answers.  Progress is reported per number in [UiState.batchMsg].
+     */
+    fun registerSms(username: String, password: String, count: Int,
+                    keyword: String, accountPassword: String,
+                    checkin: Boolean, onboarding: Boolean) =
+        viewModelScope.launch(crashGuard) {
+            _ui.update { it.copy(batchRunning = true,
+                batchMsg = "接码注册：正在登录接码平台…") }
+            try {
+                val body = JSONObject()
+                    .put("fysms_username", username)
+                    .put("count", count)
+                    .put("keyword", keyword)
+                    .put("confirm", true)
+                    .put("checkin", checkin)
+                    .put("onboarding", onboarding)
+                if (password.isNotBlank()) body.put("fysms_password", password)
+                if (accountPassword.isNotBlank()) body.put("password", accountPassword)
+                // count × (send + max_wait) can exceed any fixed timeout
+                val r = Api.post("/api/panel/accounts/register-sms", body,
+                    timeoutSec = 60L * 10L * count.coerceAtLeast(1))
+                val results = r.optJSONArray("results") ?: JSONArray()
+                val lines = mutableListOf<String>()
+                for (i in 0 until results.length()) {
+                    val row = results.getJSONObject(i)
+                    val phone = row.optString("phone").ifBlank { "—" }
+                    lines += if (row.optBoolean("ok")) {
+                        val pwd = row.optString("password")
+                        "✓ $phone" + (if (pwd.isNotBlank()) "  密码 $pwd" else "")
+                    } else {
+                        "✗ $phone  ${row.optString("error")}"
+                    }
+                }
+                loadState()
+                _ui.update {
+                    it.copy(
+                        batchRunning = false,
+                        batchMsg = "接码注册完成：成功 ${r.optInt("done")}/" +
+                            "${r.optInt("requested")}，余额 " +
+                            "${r.optDouble("balance_before", Double.NaN)} → " +
+                            "${r.optDouble("balance_after", Double.NaN)}\n" +
+                            lines.joinToString("\n"),
+                    )
+                }
+            } catch (e: Exception) {
+                _ui.update {
+                    it.copy(batchRunning = false,
+                        batchMsg = "接码注册失败：${e.message ?: e.javaClass.simpleName}")
+                }
+            }
+        }
+
     /** Read the stored login password of one account (for the show button). */
     suspend fun showPassword(acc: AccountView): String = try {
         val r = Api.post("/api/panel/accounts/password/show",
@@ -934,6 +1007,7 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
     var showAdd by remember { mutableStateOf(false) }
     var showImport by remember { mutableStateOf(false) }
     var showBatchPwd by remember { mutableStateOf(false) }
+    var showSmsReg by remember { mutableStateOf(false) }
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     val accounts = ui.state?.accounts.orEmpty()
@@ -1022,6 +1096,13 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
                     ) { Text("一键设置密码（升级为永久账号）") }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { showSmsReg = true },
+                        enabled = !ui.batchRunning,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                    ) { Text("接码注册（fysms · 收费）") }
                     if (ui.batchRunning || ui.batchMsg.isNotBlank()) {
                         Spacer(Modifier.height(10.dp))
                         if (ui.batchRunning) {
@@ -1076,6 +1157,151 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
             },
         )
     }
+    if (showSmsReg) {
+        SmsRegisterDialog(
+            vm = vm,
+            cfg = ui.state?.config,
+            onDismiss = { showSmsReg = false },
+            onConfirm = { user, pass, count, keyword, accountPwd, checkin, onboarding ->
+                showSmsReg = false
+                vm.registerSms(user, pass, count, keyword, accountPwd, checkin, onboarding)
+            },
+        )
+    }
+}
+
+/**
+ * fysms 接码注册 dialog: credentials, count, SMS keyword and the account
+ * password to set.  Registration costs real money per number, so the confirm
+ * button spells out the estimated charge and asks once more before starting.
+ */
+@Composable
+private fun SmsRegisterDialog(
+    vm: GatewayViewModel,
+    cfg: ConfigView?,
+    onDismiss: () -> Unit,
+    onConfirm: (String, String, Int, String, String, Boolean, Boolean) -> Unit,
+) {
+    var user by remember { mutableStateOf(cfg?.fysmsUsername ?: "") }
+    var pass by remember { mutableStateOf("") }
+    var count by remember { mutableStateOf("1") }
+    var keyword by remember { mutableStateOf(cfg?.fysmsKeyword ?: "讯飞") }
+    var accountPwd by remember { mutableStateOf("") }
+    var checkin by remember { mutableStateOf(false) }
+    var onboarding by remember { mutableStateOf(false) }
+    var balanceMsg by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var askCharge by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    // Second, explicit confirmation: taking a number costs money even when no
+    // SMS ever arrives, so never start on a single tap.
+    if (askCharge) {
+        val n = (count.toIntOrNull() ?: 1).coerceIn(1, 20)
+        AlertDialog(
+            onDismissRequest = { askCharge = false },
+            containerColor = CardBg,
+            shape = RoundedCornerShape(18.dp),
+            title = { Text("确认扣费", fontSize = 18.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "将取 $n 个号码（老版虚卡），每个约 1.6 元，预计扣费 " +
+                        "%.2f 元。取号后即扣费，无论是否收到短信。".format(n * 1.6),
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    askCharge = false
+                    onConfirm(user.trim(), pass, n, keyword.trim(),
+                        accountPwd.trim(), checkin, onboarding)
+                }) { Text("确认开始") }
+            },
+            dismissButton = {
+                TextButton(onClick = { askCharge = false }) { Text("取消") }
+            },
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        containerColor = CardBg,
+        shape = RoundedCornerShape(18.dp),
+        title = { Text("接码注册（fysms）", fontSize = 19.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                OutlinedTextField(user, { user = it },
+                    label = { Text("fysms 账号") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(pass, { pass = it },
+                    label = { Text("fysms 密码") },
+                    placeholder = {
+                        Text(if (cfg?.fysmsPasswordSet == true)
+                            "已保存，留空使用已保存密码" else "接码平台密码")
+                    },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(count, { count = it },
+                        label = { Text("数量 (1-20)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.weight(1f))
+                    OutlinedTextField(keyword, { keyword = it },
+                        label = { Text("短信标题") },
+                        singleLine = true, modifier = Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(accountPwd, { accountPwd = it },
+                    label = { Text("统一登录密码（留空=随机生成）") },
+                    placeholder = { Text("至少 8 位，含字母和数字") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checkin, { checkin = it })
+                    Text("注册后签到", fontSize = 13.sp)
+                    Spacer(Modifier.width(8.dp))
+                    Checkbox(onboarding, { onboarding = it })
+                    Text("新手任务", fontSize = 13.sp)
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = {
+                        if (busy) return@OutlinedButton
+                        busy = true
+                        balanceMsg = "查询中…"
+                        scope.launch {
+                            balanceMsg = vm.fysmsBalance(user.trim(), pass)
+                            busy = false
+                        }
+                    },
+                    enabled = !busy && user.isNotBlank(),
+                    shape = RoundedCornerShape(10.dp),
+                ) { Text("查询余额（免费）", fontSize = 13.sp) }
+                if (balanceMsg.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(balanceMsg, fontSize = 12.sp,
+                        color = if (balanceMsg.startsWith("失败")) Red else Muted)
+                }
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "⚠ 每取一个号码都会扣费（约 1.6 元/个），即使最终没收到短信。" +
+                        "接码平台需直连，请关闭 VPN / 全局代理。",
+                    fontSize = 12.sp, color = Amber,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { askCharge = true },
+                enabled = !busy && user.isNotBlank() &&
+                    (pass.isNotBlank() || cfg?.fysmsPasswordSet == true),
+            ) { Text("开始（收费）") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("取消") } },
+    )
 }
 
 @Composable

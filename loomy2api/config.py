@@ -57,6 +57,15 @@ DEFAULTS: Dict[str, Any] = {
     "quota_refresh_minutes": 30,
     "sessions_from_client": True, # also honour the desktop client's session
     "client_root": "",            # override the client's data dir (tests)
+
+    # SMS registration (fysms 接码平台) -------------------------------------
+    # Credentials are written here only when the user enters them in the
+    # panel / CLI; the API never returns the password.
+    "fysms_username": "",
+    "fysms_password": "",
+    "fysms_keyword": "讯飞",      # SMS title/keyword used to match the code
+    "fysms_max_wait": 120,        # seconds to wait for one SMS
+
     # identity_mode: per_account → each account gets its own devid / campus id;
     #                client       → mirror the shipped client exactly.
     "identity_mode": "per_account",

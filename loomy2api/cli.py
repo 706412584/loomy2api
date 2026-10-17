@@ -160,6 +160,65 @@ def cmd_verify(cfg, args) -> int:
     return 0
 
 
+def cmd_fysms_balance(cfg, args) -> int:
+    """Login to fysms and print the balance. Spends no money."""
+    from .fysms import CODE_PRICE
+    from .smsreg import fysms_status
+
+    username = args.username or cfg.get("fysms_username") or ""
+    password = args.password or cfg.get("fysms_password") or ""
+    if not username or not password:
+        print("请先用 --username/--password 或在 config.json 里配置 fysms 账号")
+        return 1
+    try:
+        status = fysms_status(username, password)
+    except Exception as exc:                         # noqa: BLE001
+        print(f"查询失败：{exc}")
+        return 1
+    balance = status.get("balance")
+    print(f"fysms 账号 {username}（users_id {status.get('userid')}）")
+    if balance is None:
+        print("余额解析失败")
+        return 0
+    print(f"余额 {balance:.2f} 元 · 单价 {CODE_PRICE} 元/码 · "
+          f"可注册约 {int(balance // CODE_PRICE)} 个")
+    return 0
+
+
+def cmd_register_sms(cfg, args) -> int:
+    """fysms 接码注册（收费操作，必须 --yes 确认）。"""
+    from .server import Gateway
+    from .smsreg import register_batch
+
+    if not args.yes:
+        print(f"接码注册会按号码收费（约 1.6 元/个），共 {args.count} 个。"
+              f"确认请加 --yes")
+        return 1
+    username = args.username or cfg.get("fysms_username") or ""
+    password = args.password or cfg.get("fysms_password") or ""
+    if not username or not password:
+        print("请先用 --username/--password 或在 config.json 里配置 fysms 账号")
+        return 1
+    gw = Gateway(cfg)
+    try:
+        summary = register_batch(
+            gw, args.count, username=username, password=password,
+            keyword=args.keyword, max_wait=args.wait,
+            account_password=args.account_password,
+            checkin=args.checkin, onboarding=args.onboarding,
+            on_progress=lambda row: print(
+                f"[{row['index']}/{row['total']}] {row.get('phone') or '—'} "
+                f"{'✓ ' + str(row.get('name')) if row.get('ok') else '✗ ' + str(row.get('error'))}"
+                + (f"  密码 {row['password']}" if row.get("password") else "")),
+        )
+    except Exception as exc:                         # noqa: BLE001
+        print(f"接码注册失败：{exc}")
+        return 1
+    print(f"\n完成：成功 {summary['done']}/{summary['requested']}，"
+          f"余额 {summary.get('balance_before')} → {summary.get('balance_after')}")
+    return 0 if summary["done"] else 1
+
+
 def cmd_identity(cfg, args) -> int:
     pool = _pool(cfg)
     acc = pool.get(args.name)
@@ -284,6 +343,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("code")
     p.add_argument("msgid")
     p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("fysms-balance", help="查询接码平台余额（不扣费）")
+    p.add_argument("--username", default="", help="fysms 账号（默认读 config.json）")
+    p.add_argument("--password", default="", help="fysms 密码（默认读 config.json）")
+    p.set_defaults(func=cmd_fysms_balance)
+
+    p = sub.add_parser("register-sms", help="接码注册（按号码收费，需 --yes）")
+    p.add_argument("count", nargs="?", type=int, default=1, help="注册数量（最多 20）")
+    p.add_argument("--username", default="", help="fysms 账号（默认读 config.json）")
+    p.add_argument("--password", default="", help="fysms 密码（默认读 config.json）")
+    p.add_argument("--keyword", default="讯飞", help="短信标题关键词")
+    p.add_argument("--wait", type=int, default=120, help="每个号码等待短信的秒数")
+    p.add_argument("--account-password", default="", help="统一登录密码（留空=随机生成）")
+    p.add_argument("--checkin", action="store_true", help="注册后顺手签到")
+    p.add_argument("--onboarding", action="store_true", help="注册后跑新手任务")
+    p.add_argument("-y", "--yes", action="store_true", help="确认会产生费用")
+    p.set_defaults(func=cmd_register_sms)
 
     p = sub.add_parser("identity", help="查看/重绑账号的设备标识")
     p.add_argument("name")

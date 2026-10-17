@@ -162,6 +162,10 @@ data class ConfigView(
     val quotaRefreshMinutes: Int,
     val sessionsFromClient: Boolean,
     val passwordSetBeforeDays: Int,
+    // fysms 接码平台: the username is shown, the password never travels here
+    val fysmsUsername: String = "",
+    val fysmsPasswordSet: Boolean = false,
+    val fysmsKeyword: String = "讯飞",
 )
 
 data class StateView(
@@ -248,6 +252,9 @@ fun parseState(o: JSONObject): StateView {
             quotaRefreshMinutes = c.optInt("quota_refresh_minutes", 30),
             sessionsFromClient = c.optBoolean("sessions_from_client", true),
             passwordSetBeforeDays = c.optInt("password_set_before_days", 1),
+            fysmsUsername = c.optString("fysms_username"),
+            fysmsPasswordSet = c.optBoolean("fysms_password_set"),
+            fysmsKeyword = c.optString("fysms_keyword", "讯飞"),
         ),
     )
 }
