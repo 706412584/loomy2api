@@ -194,6 +194,13 @@ def start_gateway(files_dir: str, port: int = 17991) -> None:
     cfg = load_config(cfg_path)
     cfg["port"] = port
     cfg["host"] = listen_on
+    # The lite build ships without the SMS-registration modules, so the panel
+    # endpoint and button must disappear with them.  Detect the module rather
+    # than trusting a build flag: an upgraded full APK over a lite install (or
+    # vice versa) then self-corrects.
+    cfg["sms_registration"] = os.path.exists(
+        os.path.join(pkg_dir, "fysms.py")) and os.path.exists(
+        os.path.join(pkg_dir, "smsreg.py"))
     # let the panel persist settings back to the same file it read
     cfg["_config_file"] = cfg_path
 

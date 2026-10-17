@@ -45,6 +45,7 @@ android/*.keystore
 
 # generated at build time from ../loomy2api (see android/app/build.gradle.kts)
 loomy2api-pkg/
+loomy2api-pkg-lite/
 
 # local debug screenshots
 _shots/

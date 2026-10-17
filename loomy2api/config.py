@@ -65,6 +65,9 @@ DEFAULTS: Dict[str, Any] = {
     "fysms_password": "",
     "fysms_keyword": "讯飞",      # SMS title/keyword used to match the code
     "fysms_max_wait": 120,        # seconds to wait for one SMS
+    #: The "lite" Android build ships without SMS registration; it sets this
+    #: to false so the endpoint and the panel button disappear together.
+    "sms_registration": True,
 
     # identity_mode: per_account → each account gets its own devid / campus id;
     #                client       → mirror the shipped client exactly.

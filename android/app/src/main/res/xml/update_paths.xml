@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The updater downloads into cacheDir/updates; only that directory is shared
+     with the system installer (never the whole files dir). -->
+<paths>
+    <cache-path name="updates" path="updates/" />
+</paths>

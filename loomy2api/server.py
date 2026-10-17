@@ -1257,6 +1257,44 @@ class Server(ThreadingHTTPServer):
     # silently sends requests to an old instance.  Only enable it elsewhere.
     allow_reuse_address = (os.name != "nt")
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        #: Live client sockets.  ``server_close()`` only closes the listening
+        #: socket; an HTTP/1.1 keep-alive connection would keep being served
+        #: by the *old* handler thread (and its old Gateway), so a rebind left
+        #: clients reading stale state over a socket that never reconnected.
+        self._active = set()
+        self._active_lock = threading.Lock()
+
+    def process_request(self, request, client_address):
+        with self._active_lock:
+            self._active.add(request)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            with self._active_lock:
+                self._active.discard(request)
+            raise
+
+    def shutdown_request(self, request):
+        with self._active_lock:
+            self._active.discard(request)
+        super().shutdown_request(request)
+
+    def server_close(self):
+        super().server_close()
+        with self._active_lock:
+            active, self._active = list(self._active), set()
+        for conn in active:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except Exception:                        # noqa: BLE001
+                pass
+            try:
+                conn.close()
+            except Exception:                        # noqa: BLE001
+                pass
+
 
 def serve(cfg, *, gateway: Optional[Gateway] = None,
           on_server=None) -> Gateway:

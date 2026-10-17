@@ -454,6 +454,19 @@ class AccountPool:
                 self._rr_index = (self._rr_index + 1) % max(1, len(candidates))
         elif strategy == "lru":
             acc = min(candidates, key=lambda a: a.last_used or 0)
+        elif strategy in ("daily", "activity"):
+            # Spend the expiring daily grant first: an unused daily balance is
+            # lost at the cycle reset, while the permanent balance carries over.
+            acc = max(candidates, key=lambda a: (
+                a.daily_balance if a.daily_balance is not None else -1,
+                a.available if a.available is not None else 0,
+                -a.last_used))
+        elif strategy == "permanent":
+            # The opposite: drain permanent points first and keep the daily
+            # grant for accounts that are about to reset.
+            acc = max(candidates, key=lambda a: (
+                a.balance if a.balance is not None else -1,
+                -a.last_used))
         else:  # balance
             acc = max(candidates, key=lambda a: (a.available if a.available is not None else 10**9,
                                                  -a.last_used))

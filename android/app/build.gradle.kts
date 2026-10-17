@@ -14,13 +14,38 @@ android {
         applicationId = "com.loomy.gw"
         minSdk = 26
         targetSdk = 34
-        versionCode = 25
-        versionName = "2.6.0"
+        versionCode = 26
+        versionName = "2.7.0"
 
         ndk {
             // Chaquopy needs abiFilters; arm64 covers modern phones
             abiFilters += listOf("arm64-v8a", "x86_64")
         }
+    }
+
+    // Two APKs from the same code: `full` includes SMS registration (fysms),
+    // `lite` ships without it.  Lite gets its own application id so both can
+    // be installed side by side.
+    flavorDimensions += "sms"
+    productFlavors {
+        create("full") {
+            dimension = "sms"
+            buildConfigField("boolean", "ENABLE_SMS_REGISTRATION", "true")
+        }
+        create("lite") {
+            dimension = "sms"
+            applicationIdSuffix = ".lite"
+            versionNameSuffix = "-lite"
+            buildConfigField("boolean", "ENABLE_SMS_REGISTRATION", "false")
+        }
+    }
+
+    // Each flavor ships its own copy of the Python package: `lite` is built
+    // from a tree that omits the SMS-registration modules entirely, so the
+    // feature is absent from the APK rather than merely disabled.
+    sourceSets {
+        getByName("full") { assets.srcDir(rootProject.file("../loomy2api-pkg")) }
+        getByName("lite") { assets.srcDir(rootProject.file("../loomy2api-pkg-lite")) }
     }
 
     // The keystore is deliberately NOT in git (it would let anyone sign
@@ -58,7 +83,8 @@ android {
     // control — no hand-maintained copy to drift out of sync.
     sourceSets {
         getByName("main") {
-            assets.srcDir(rootProject.file("../loomy2api-pkg"))
+            // flavor-specific trees are added below; the shared Python package
+            // lives in the flavor source sets so `lite` can omit modules.
         }
     }
 
@@ -71,6 +97,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     packaging {
         resources.excludes += setOf("META-INF/*.kotlin_module")
@@ -86,10 +113,15 @@ android {
 // re-extracts the package after an upgrade (see mobile_main.start_gateway).
 // ---------------------------------------------------------------------------
 val pkgRoot = rootProject.file("../loomy2api-pkg")
+val pkgRootLite = rootProject.file("../loomy2api-pkg-lite")
 val pySource = rootProject.file("../loomy2api")
 
+//: Modules that only exist for the paid SMS-registration flow.  The lite
+//: package omits them, and `panel.register_sms` is gated by the config flag
+//: that the lite asset sets to false.
+val smsOnlyModules = listOf("fysms.py", "smsreg.py")
+
 val syncPythonPackage = tasks.register<Sync>("syncPythonPackage") {
-    // the package directory already contains web/index.html
     from(pySource) {
         exclude("__pycache__/**", "**/*.pyc")
     }
@@ -97,16 +129,29 @@ val syncPythonPackage = tasks.register<Sync>("syncPythonPackage") {
     outputs.upToDateWhen { false }          // sources are small; always refresh
 }
 
+val syncPythonPackageLite = tasks.register<Sync>("syncPythonPackageLite") {
+    from(pySource) {
+        exclude("__pycache__/**", "**/*.pyc")
+        smsOnlyModules.forEach { exclude(it) }
+    }
+    into(pkgRootLite.resolve("loomy2api"))
+    outputs.upToDateWhen { false }
+}
+
 val stampAssetVersion = tasks.register("stampAssetVersion") {
     val out = pkgRoot.resolve("loomy2api/unpacked.version")
+    val outLite = pkgRootLite.resolve("loomy2api/unpacked.version")
     outputs.upToDateWhen { false }
-    outputs.file(out)
+    outputs.files(out, outLite)
     doLast {
-        out.parentFile.mkdirs()
-        out.writeText(System.currentTimeMillis().toString())
+        val stamp = System.currentTimeMillis().toString()
+        for (f in listOf(out, outLite)) {
+            f.parentFile.mkdirs()
+            f.writeText(stamp)
+        }
     }
 }
-stampAssetVersion.configure { dependsOn(syncPythonPackage) }
+stampAssetVersion.configure { dependsOn(syncPythonPackage, syncPythonPackageLite) }
 
 tasks.matching {
     it.name.matches(Regex("(merge.*Assets|lintVitalAnalyze.*|preBuild.*)"))
@@ -135,6 +180,7 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")

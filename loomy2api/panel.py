@@ -211,6 +211,7 @@ class Panel:
                 "fysms_password_set": bool(self.gw.cfg.get("fysms_password")),
                 "fysms_keyword": self.gw.cfg.get("fysms_keyword") or "讯飞",
                 "fysms_max_wait": self.gw.cfg.get("fysms_max_wait") or 120,
+                "sms_registration": bool(self.gw.cfg.get("sms_registration", True)),
             },
             "accounts": accounts,
         }
@@ -235,7 +236,8 @@ class Panel:
 
         if "strategy" in changes:
             strategy = str(changes["strategy"])
-            if strategy not in ("balance", "round_robin", "lru", "weighted"):
+            if strategy not in ("balance", "round_robin", "lru", "weighted",
+                                "daily", "permanent"):
                 raise PoolError(f"未知调度策略 / unknown strategy: {strategy}")
         if "api_keys" in changes:
             raw = changes["api_keys"]
@@ -657,6 +659,9 @@ class Panel:
 
     def fysms_balance(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Read-only: login + balance. Takes no number, spends no money."""
+        if not self.gw.cfg.get("sms_registration", True):
+            raise PoolError("此版本未包含接码注册 / SMS registration is disabled "
+                            "in this build")
         username, password = self._fysms_credentials(payload or {})
         from .fysms import CODE_PRICE
         from .smsreg import fysms_status
@@ -679,6 +684,9 @@ class Panel:
         return result
 
     def register_sms(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.gw.cfg.get("sms_registration", True):
+            raise PoolError("此版本未包含接码注册 / SMS registration is disabled "
+                            "in this build")
         """Take a number, log in by SMS and upgrade it to a permanent account.
 
         This **spends money** (one code per number), so it refuses to run
@@ -856,6 +864,11 @@ class Panel:
                     self.log(f"[panel] 读取积分流水失败：{exc}")
         else:
             overview = self._with_session(acc, lambda s: gw.points_overview(s))
+        # Cache the invitation state on the account so the list can render it.
+        if "activated" in overview:
+            acc.activated = bool(overview.get("activated"))
+        if overview.get("applied_invitation_code"):
+            acc.applied_invitation_code = str(overview["applied_invitation_code"])
         return {"ok": True, "account": acc.name, "overview": overview,
                 "ledger": ledger}
 
@@ -896,6 +909,11 @@ class Panel:
         dev = (acc.identity or {}).get("campus_device_id") or ""
         data = self._with_session(
             acc, lambda s: self.gw.models_client.points_activate(s, dev, code))
+        # Remember the outcome so the account list can show "已激活 / 已用码"
+        # without another upstream round-trip.
+        acc.activated = bool(data.get("activated", True))
+        acc.applied_invitation_code = str(data.get("appliedInvitationCode") or code)
+        self.pool.save(force=True)
         self.log(f"[panel] {acc.name} 提交邀请码 {code}："
                  f"activated={data.get('activated')} "
                  f"already={data.get('alreadyActivated')}")

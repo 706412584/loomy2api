@@ -67,6 +67,9 @@ class GatewayViewModel : ViewModel() {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
+    /** Release found by the last update check, ready to download. */
+    @Volatile private var pendingRelease: Updater.Release? = null
+
     /**
      * Last line of defence.  A gateway that answers an unexpected status (e.g.
      * HTTP 501 from a half-dead server) used to surface as an uncaught
@@ -345,6 +348,21 @@ class GatewayViewModel : ViewModel() {
                     batchMsg = "一键设置密码失败：${e.message ?: e.javaClass.simpleName}")
             }
         }
+    }
+
+    /** Submit an invitation code for one account (one-shot, irreversible). */
+    suspend fun applyInvite(acc: AccountView, code: String): String = try {
+        val r = Api.post("/api/panel/points/activate",
+            JSONObject().put("name", acc.name).put("code", code), timeoutSec = 90)
+        val res = r.optJSONObject("result") ?: JSONObject()
+        loadState()
+        if (res.optBoolean("alreadyActivated")) {
+            "该账号已激活过（已用 ${res.optString("appliedInvitationCode").ifBlank { "—" }}）"
+        } else {
+            "✓ 邀请码已提交，永久余额 ${res.opt("permanentBalance") ?: "—"}"
+        }
+    } catch (e: Exception) {
+        "失败：${e.message ?: e.javaClass.simpleName}"
     }
 
     // -- fysms SMS registration ------------------------------------------
@@ -659,6 +677,35 @@ class GatewayViewModel : ViewModel() {
                     onDone("保存失败：${it.message}")
                 }
         }
+
+    // -- in-app update (GitHub releases) ---------------------------------
+
+    /** Check the latest release; returns a human-readable status line. */
+    suspend fun checkUpdate(): String {
+        val ctx = AssetBridge.appContext ?: return "应用上下文不可用"
+        val (release, message) = Updater.check(ctx)
+        if (release != null) {
+            pendingRelease = release
+            return "$message（${release.tag}）"
+        }
+        return message
+    }
+
+    /** Download and open the installer for the release found by [checkUpdate]. */
+    suspend fun installUpdate(onProgress: (Int) -> Unit): String {
+        val ctx = AssetBridge.appContext ?: return "应用上下文不可用"
+        val release = pendingRelease ?: return "请先检查更新"
+        val (file, message) = Updater.download(ctx, release, onProgress)
+        if (file == null) return message
+        return Updater.install(ctx, file)
+    }
+
+    fun updateToken(): String =
+        AssetBridge.appContext?.let { Updater.token(it) } ?: ""
+
+    fun saveUpdateToken(token: String) {
+        AssetBridge.appContext?.let { Updater.saveToken(it, token) }
+    }
 
     fun toast(msg: String) {
         _ui.update { it.copy(toast = msg) }
@@ -1099,13 +1146,16 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
                     ) { Text("一键设置密码（升级为永久账号）") }
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedButton(
-                        onClick = { showSmsReg = true },
-                        enabled = !ui.batchRunning,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(10.dp),
-                    ) { Text("接码注册（fysms · 收费）") }
+                    // The lite build ships without SMS registration.
+                    if (BuildConfig.ENABLE_SMS_REGISTRATION) {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = { showSmsReg = true },
+                            enabled = !ui.batchRunning,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                        ) { Text("接码注册（fysms · 收费）") }
+                    }
                     if (ui.batchRunning || ui.batchMsg.isNotBlank()) {
                         Spacer(Modifier.height(10.dp))
                         if (ui.batchRunning) {
@@ -1331,14 +1381,19 @@ private fun AccountCard(acc: AccountView, onClick: () -> Unit,
             }
             Spacer(Modifier.height(10.dp))
             Text(
-                "可用 ${acc.available ?: "—"} · 余额 ${acc.balance ?: "—"} · 累计耗 ${acc.pointsUsed}",
+                "可用 ${acc.available ?: "—"} · 永久 ${acc.balance ?: "—"} · 活动 ${acc.dailyBalance ?: "—"}",
                 color = Muted, fontSize = 13.sp,
             )
             Spacer(Modifier.height(4.dp))
             Text(
                 "请求 ${acc.requests} · 失败 ${acc.failures}"
                     + if (acc.permanent) " · 永久（可自动续期）"
-                      else (acc.sessionDaysLeft?.let { " · 剩余 ${"%.1f".format(it)} 天" } ?: ""),
+                      else (acc.sessionDaysLeft?.let { " · 剩余 ${"%.1f".format(it)} 天" } ?: "")
+                    + when (acc.activated) {
+                        true -> " · 已激活"
+                        false -> " · 未激活"
+                        null -> ""
+                    },
                 color = if (acc.permanent) Green else Muted, fontSize = 12.sp,
             )
             Spacer(Modifier.height(12.dp))
@@ -1431,7 +1486,27 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
     var msg by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
     var showPwdDialog by remember { mutableStateOf(false) }
+    var showInviteDialog by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+
+    if (showInviteDialog) {
+        InviteDialog(
+            acc = acc,
+            onDismiss = { showInviteDialog = false },
+            onConfirm = { code ->
+                showInviteDialog = false
+                busy = true
+                msg = "正在提交邀请码…"
+                scope.launch {
+                    try {
+                        msg = vm.applyInvite(acc, code)
+                    } finally {
+                        busy = false
+                    }
+                }
+            },
+        )
+    }
 
     if (showPwdDialog) {
         BatchPasswordDialog(
@@ -1478,6 +1553,22 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                         else acc.sessionDaysLeft?.let { "%.1f 天".format(it) } ?: "—",
                         Modifier.weight(1f))
                     MiniStat("设备", acc.devid.ifBlank { "—" }, Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MiniStat("永久余额", "${acc.balance ?: "—"}", Modifier.weight(1f))
+                    MiniStat("活动余额", "${acc.dailyBalance ?: "—"}", Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MiniStat("激活状态",
+                        when (acc.activated) {
+                            true -> "已激活"
+                            false -> "未激活"
+                            null -> "未知"
+                        }, Modifier.weight(1f))
+                    MiniStat("已绑定邀请码",
+                        acc.appliedInvitationCode.ifBlank { "未绑定" }, Modifier.weight(1f))
                 }
                 Spacer(Modifier.height(14.dp))
 
@@ -1544,7 +1635,7 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                 val actions = listOf(
                     "查积分" to "quota", "每日签到" to "checkin",
                     "新手任务" to "onboarding", "续期重登" to "renew",
-                    "换设备标识" to "identity",
+                    "填写邀请码" to "invite", "换设备标识" to "identity",
                     if (acc.enabled) "禁用" to "toggle" else "启用" to "toggle",
                 )
                 actions.chunked(2).forEach { pair ->
@@ -1554,6 +1645,10 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                             OutlinedButton(
                                 onClick = {
                                     if (busy) return@OutlinedButton
+                                    if (kind == "invite") {
+                                        showInviteDialog = true
+                                        return@OutlinedButton
+                                    }
                                     busy = true
                                     msg = "正在执行：$label…"
                                     scope.launch {
@@ -1611,6 +1706,49 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
         confirmButton = {
             TextButton(onClick = onDismiss) { Text("关闭") }
         },
+    )
+}
+
+/** Enter an invitation code for one account. Irreversible, so confirm first. */
+@Composable
+private fun InviteDialog(
+    acc: AccountView,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+) {
+    var code by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = CardBg,
+        shape = RoundedCornerShape(18.dp),
+        title = { Text("填写邀请码", fontSize = 19.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text("账号 ${acc.name}", fontSize = 13.sp, color = Muted)
+                if (acc.appliedInvitationCode.isNotBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text("当前已绑定 ${acc.appliedInvitationCode}",
+                        fontSize = 12.sp, color = Amber)
+                }
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    code, { code = it },
+                    label = { Text("邀请码") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                Text("每个账号只能填写一次，提交后不可撤销。",
+                    fontSize = 12.sp, color = Muted)
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(code.trim()) },
+                enabled = code.isNotBlank(),
+            ) { Text("提交") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
 }
 
@@ -2169,6 +2307,9 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
     var lanBusy by remember { mutableStateOf(false) }
     var lanMsg by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
+    var updateToken by remember { mutableStateOf(vm.updateToken()) }
+    var updateMsg by remember { mutableStateOf("") }
+    var updateBusy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     Column(
@@ -2183,7 +2324,8 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             Text("选号策略", color = Muted, fontSize = 13.sp)
             Spacer(Modifier.height(10.dp))
             val options = listOf(
-                "balance" to "余额均衡", "round_robin" to "顺序轮询",
+                "balance" to "余额均衡", "daily" to "先用活动余额",
+                "permanent" to "先用永久余额", "round_robin" to "顺序轮询",
                 "lru" to "最久未用", "weighted" to "加权随机",
             )
             options.chunked(2).forEach { row ->
@@ -2240,9 +2382,9 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
                         lanBusy = true
                         lanMsg = "正在切换监听地址…"
                         scope.launch {
+                            val target = if (on) "0.0.0.0" else "127.0.0.1"
                             val ok = withContext(Dispatchers.IO) {
-                                GatewayService.instance?.rebind(
-                                    if (on) "0.0.0.0" else "127.0.0.1") ?: false
+                                GatewayService.instance?.rebind(target) ?: false
                             }
                             if (!ok) {
                                 lanEnabled = !on
@@ -2250,13 +2392,34 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
                                 lanBusy = false
                                 return@launch
                             }
-                            // the server rebinds in a background thread; wait for it
+                            // The rebind replaces the Python server object, so
+                            // pooled keep-alive sockets still belong to the old
+                            // one and would answer with the previous host —
+                            // which made the switch flip back.  Drop them, then
+                            // wait until the *new* state reports the target.
+                            Api.resetConnections()
                             val ready = Api.waitUntilReady(30_000)
-                            if (ready) vm.refreshAll()
-                            lanMsg = if (ready)
-                                (if (on) "已开放局域网：http://${localIp() ?: "?"}:${GatewayService.PORT}"
-                                 else "已改为仅本机访问")
-                            else "切换超时，请查看运行日志"
+                            var confirmed = false
+                            if (ready) {
+                                repeat(10) {
+                                    confirmed = runCatching {
+                                        val s = parseState(Api.get("/api/panel/state"))
+                                        s.config.host == target
+                                    }.getOrDefault(false)
+                                    if (!confirmed) {
+                                        Api.resetConnections()
+                                        kotlinx.coroutines.delay(500)
+                                    }
+                                }
+                            }
+                            vm.refreshAll()
+                            lanEnabled = confirmed
+                            lanMsg = when {
+                                !ready -> "切换超时，请查看运行日志"
+                                !confirmed -> "切换未生效（状态未同步），请重试"
+                                on -> "已开放局域网：http://${localIp() ?: "?"}:${GatewayService.PORT}"
+                                else -> "已改为仅本机访问"
+                            }
                             lanBusy = false
                         }
                     },
@@ -2286,6 +2449,81 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
                     Text("写入用量台账与运行日志", color = Muted, fontSize = 12.sp)
                 }
                 Switch(logRequests, { logRequests = it })
+            }
+        }
+
+        SectionTitle("更新")
+        SectionCard {
+            Text("当前版本 ${BuildConfig.VERSION_NAME}（${if (BuildConfig.ENABLE_SMS_REGISTRATION) "接码版" else "精简版"}）",
+                fontSize = 13.sp)
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                updateToken, { updateToken = it },
+                label = { Text("GitHub Token（私有仓库需只读 token）") },
+                placeholder = { Text("github_pat_… 仅用于检查/下载更新") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        vm.saveUpdateToken(updateToken)
+                        updateMsg = "Token 已保存"
+                    },
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(10.dp),
+                ) { Text("保存 Token", fontSize = 13.sp) }
+                Button(
+                    onClick = {
+                        if (updateBusy) return@Button
+                        updateBusy = true
+                        updateMsg = "正在检查…"
+                        scope.launch {
+                            try {
+                                updateMsg = vm.checkUpdate()
+                            } finally {
+                                updateBusy = false
+                            }
+                        }
+                    },
+                    enabled = !updateBusy,
+                    modifier = Modifier.weight(1f),
+                    shape = RoundedCornerShape(10.dp),
+                ) { Text("检查更新", fontSize = 13.sp) }
+            }
+            if (updateMsg.contains("发现新版本")) {
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        if (updateBusy) return@Button
+                        updateBusy = true
+                        updateMsg = "正在下载…"
+                        scope.launch {
+                            try {
+                                updateMsg = vm.installUpdate { pct ->
+                                    updateMsg = "正在下载… $pct%"
+                                }
+                            } finally {
+                                updateBusy = false
+                            }
+                        }
+                    },
+                    enabled = !updateBusy,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                ) { Text("下载并安装") }
+            }
+            if (updateBusy) {
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+            }
+            if (updateMsg.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Text(updateMsg, fontSize = 12.sp,
+                    color = if (updateMsg.contains("失败") || updateMsg.contains("无法"))
+                        Red else Muted)
             }
         }
 

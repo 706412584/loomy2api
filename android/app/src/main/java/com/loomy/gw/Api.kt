@@ -26,6 +26,23 @@ object Api {
     private val JSON = "application/json; charset=utf-8".toMediaType()
 
     /**
+     * Drop pooled connections.
+     *
+     * The gateway runs in this process, so a rebind replaces the Python HTTP
+     * server but leaves OkHttp's keep-alive sockets attached to the *old*
+     * server object.  Requests then kept being answered with stale state
+     * (e.g. the LAN toggle flipping back) until the pool expired.  The caller
+     * invokes this after a rebind and before the next state read.
+     */
+    fun resetConnections() {
+        try {
+            client.connectionPool.evictAll()
+        } catch (_: Throwable) {
+            // best effort: a failed eviction only costs one stale response
+        }
+    }
+
+    /**
      * API key for the gateway's own gate.  The panel HTML is exempt from the
      * key check, but the panel JSON endpoints are not, so once the user
      * configures `api_keys` every request must carry it or the UI locks
@@ -121,6 +138,9 @@ data class AccountView(
     val permanent: Boolean,
     val passwordSetAt: Long,
     val passwordVerifiedAt: Long,
+    /** null = not queried yet (show 未知, not 未激活). */
+    val activated: Boolean? = null,
+    val appliedInvitationCode: String = "",
 ) {
     val statusLabel: String
         get() = when {
@@ -166,6 +186,7 @@ data class ConfigView(
     val fysmsUsername: String = "",
     val fysmsPasswordSet: Boolean = false,
     val fysmsKeyword: String = "讯飞",
+    val smsRegistration: Boolean = true,
 )
 
 data class StateView(
@@ -218,6 +239,8 @@ fun parseState(o: JSONObject): StateView {
             permanent = a.optBoolean("permanent"),
             passwordSetAt = a.optLong("password_set_at"),
             passwordVerifiedAt = a.optLong("password_verified_at"),
+            activated = if (a.isNull("activated")) null else a.optBoolean("activated"),
+            appliedInvitationCode = a.optString("applied_invitation_code"),
         )
     }
     val keys = c.optJSONArray("api_keys") ?: JSONArray()
@@ -255,6 +278,7 @@ fun parseState(o: JSONObject): StateView {
             fysmsUsername = c.optString("fysms_username"),
             fysmsPasswordSet = c.optBoolean("fysms_password_set"),
             fysmsKeyword = c.optString("fysms_keyword", "讯飞"),
+            smsRegistration = c.optBoolean("sms_registration", true),
         ),
     )
 }

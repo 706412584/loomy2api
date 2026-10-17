@@ -109,6 +109,12 @@ class Account:
     #: per-account device identity (devid / ua / campus device id / …)
     identity: Dict[str, Any] = field(default_factory=dict)
 
+    #: Invitation state, cached from ``points/first-login`` / activation.
+    #: ``None`` means "not known yet" (never queried) — the UI shows "未知"
+    #: rather than claiming the account is unactivated.
+    activated: Optional[bool] = None
+    applied_invitation_code: str = ""
+
     # quota cache (filled from /points/records)
     balance: Optional[int] = None
     daily_balance: Optional[int] = None
@@ -180,6 +186,10 @@ class Account:
             password_verified_at=int(raw.get("passwordVerifiedAt")
                                      or raw.get("password_verified_at") or 0),
             identity=dict(identity) if isinstance(identity, dict) else {},
+            activated=(raw.get("activated") if isinstance(raw.get("activated"), bool)
+                       else None),
+            applied_invitation_code=str(raw.get("appliedInvitationCode")
+                                        or raw.get("applied_invitation_code") or ""),
             available=(int(raw["available"]) if raw.get("available") is not None else None),
             balance=(int(raw["balance"]) if raw.get("balance") is not None else None),
             daily_balance=(int(raw["dailyBalance"])
@@ -221,6 +231,12 @@ class Account:
             out["dailyBalance"] = self.daily_balance
         if self.quota_updated_at:
             out["quotaUpdatedAt"] = self.quota_updated_at
+        # Invitation state is cached so the account list can show it without
+        # spending a round-trip per account.
+        if self.activated is not None:
+            out["activated"] = bool(self.activated)
+        if self.applied_invitation_code:
+            out["appliedInvitationCode"] = self.applied_invitation_code
         return out
 
     def identity_view(self) -> Dict[str, Any]:
@@ -265,6 +281,8 @@ class Account:
                                       if self.in_cooldown else 0),
             "source": self.source,
             "last_error": self.last_error,
+            "activated": self.activated,
+            "applied_invitation_code": self.applied_invitation_code,
             "identity": self.identity_view(),
         }
         return out
