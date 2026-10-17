@@ -168,6 +168,26 @@ class GatewayService : Service() {
         }, "gateway-boot").start()
     }
 
+    /**
+     * Rebind the gateway on another interface (127.0.0.1 <-> 0.0.0.0).
+     *
+     * Python persists the choice to config.json and restarts its HTTP server;
+     * the caller waits for /health to come back before refreshing the UI.
+     */
+    fun rebind(host: String): Boolean {
+        return try {
+            if (!Python.isStarted()) {
+                Python.start(AndroidPlatform(applicationContext))
+            }
+            Python.getInstance().getModule("mobile_main")
+                .callAttr("bind_host", host, PORT)
+            true
+        } catch (t: Throwable) {
+            android.util.Log.e("GatewayService", "rebind to $host failed", t)
+            false
+        }
+    }
+
     /** Probe /health; restart the gateway after repeated failures. */
     private fun startWatchdog() {
         watchdog.scheduleWithFixedDelay({

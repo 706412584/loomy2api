@@ -785,7 +785,14 @@ private fun HomeScreen(vm: GatewayViewModel, ui: UiState) {
                 Divider(Modifier.padding(vertical = 10.dp), color = Line)
                 CopyRow("Anthropic Base URL", "http://127.0.0.1:${GatewayService.PORT}")
                 Divider(Modifier.padding(vertical = 10.dp), color = Line)
-                CopyRow("局域网地址", "http://${localIp() ?: "127.0.0.1"}:${GatewayService.PORT}")
+                if (s?.config?.host == "0.0.0.0") {
+                    CopyRow("局域网地址", "http://${localIp() ?: "127.0.0.1"}:${GatewayService.PORT}")
+                } else {
+                    Text("局域网地址", color = Muted, fontSize = 13.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text("未开启（设置 → 网络与安全 → 允许局域网访问）",
+                        color = Muted, fontSize = 13.sp)
+                }
                 Divider(Modifier.padding(vertical = 10.dp), color = Line)
                 Text("API Key", color = Muted, fontSize = 13.sp)
                 Spacer(Modifier.height(4.dp))
@@ -1921,6 +1928,9 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
     var pwdDays by remember(cfg) {
         mutableStateOf("${cfg?.passwordSetBeforeDays ?: 1}")
     }
+    var lanEnabled by remember(cfg) { mutableStateOf(cfg?.host == "0.0.0.0") }
+    var lanBusy by remember { mutableStateOf(false) }
+    var lanMsg by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
@@ -1974,12 +1984,51 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             Spacer(Modifier.height(8.dp))
             Text("当前：${cfg?.host ?: "127.0.0.1"}:${GatewayService.PORT}",
                 fontSize = 13.sp, fontFamily = FontFamily.Monospace)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                if (cfg?.host == "0.0.0.0") "同一 Wi-Fi 下的电脑/其他设备可直连网关"
-                else "仅本机可访问（在 config.json 把 host 改为 0.0.0.0 可开放局域网）",
-                color = Muted, fontSize = 12.sp,
-            )
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("允许局域网访问", fontSize = 15.sp)
+                    Text(
+                        if (cfg?.host == "0.0.0.0")
+                            "同一 Wi-Fi 下的电脑/其他设备可直连网关"
+                        else "仅本机可访问；开启后需重启网关生效",
+                        color = Muted, fontSize = 12.sp,
+                    )
+                }
+                Switch(
+                    checked = lanEnabled,
+                    enabled = !lanBusy,
+                    onCheckedChange = { on ->
+                        lanEnabled = on
+                        lanBusy = true
+                        lanMsg = "正在切换监听地址…"
+                        scope.launch {
+                            val ok = withContext(Dispatchers.IO) {
+                                GatewayService.instance?.rebind(
+                                    if (on) "0.0.0.0" else "127.0.0.1") ?: false
+                            }
+                            if (!ok) {
+                                lanEnabled = !on
+                                lanMsg = "切换失败（网关未运行？）"
+                                lanBusy = false
+                                return@launch
+                            }
+                            // the server rebinds in a background thread; wait for it
+                            val ready = Api.waitUntilReady(30_000)
+                            if (ready) vm.refreshAll()
+                            lanMsg = if (ready)
+                                (if (on) "已开放局域网：http://${localIp() ?: "?"}:${GatewayService.PORT}"
+                                 else "已改为仅本机访问")
+                            else "切换超时，请查看运行日志"
+                            lanBusy = false
+                        }
+                    },
+                )
+            }
+            if (lanMsg.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Text(lanMsg, color = if (lanBusy) Muted else Green, fontSize = 12.sp)
+            }
             Spacer(Modifier.height(14.dp))
             OutlinedTextField(proxy, { proxy = it },
                 label = { Text("全局代理（留空直连）") },

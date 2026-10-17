@@ -288,6 +288,37 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertNotIn('"password":', json.dumps(payload))
 
 
+class ServeCallbackTestCase(unittest.TestCase):
+    """``serve(on_server=...)`` hands the bound server to the embedder.
+
+    The Android app uses it to close the old listener before rebinding on
+    another interface (loopback <-> LAN); without the callback it cannot tell
+    when the socket is actually bound.
+    """
+
+    def test_on_server_receives_bound_server(self):
+        from loomy2api.server import serve
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        upstream = FakeUpstream()
+        base = upstream.start()
+        self.addCleanup(upstream.stop)
+        cfg = make_config(Path(tmp.name), base)
+        cfg["port"] = 0
+        seen = {}
+
+        def on_server(httpd):
+            seen["server"] = httpd
+            # serve_forever() starts right after the callback returns, so stop
+            # the loop from a separate thread instead of blocking here.
+            threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+        serve(cfg, on_server=on_server)
+        self.assertIsNotNone(seen.get("server"))
+        self.assertGreater(seen["server"].server_address[1], 0)
+
+
 class AuthTestCase(_Harness, unittest.TestCase):
     """Same gateway, but with a gateway-side API key configured."""
     def setUp(self):

@@ -1256,12 +1256,21 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = (os.name != "nt")
 
 
-def serve(cfg, *, gateway: Optional[Gateway] = None) -> Gateway:
+def serve(cfg, *, gateway: Optional[Gateway] = None,
+          on_server=None) -> Gateway:
+    """Run the HTTP server until interrupted.
+
+    ``on_server`` receives the bound server before it starts serving, so an
+    embedder (the Android app) can shut it down to rebind on a different
+    interface without leaving the old socket in place.
+    """
     gw = gateway or Gateway(cfg)
     gw.start()
 
     handler = type("BoundHandler", (Handler,), {"gateway": gw})
     httpd = Server((str(cfg["host"]), int(cfg["port"])), handler)
+    if on_server is not None:
+        on_server(httpd)
     gw.log(f"loomy2api 已启动 / listening → http://{cfg['host']}:{cfg['port']}"
            f"  (OpenAI: /v1/chat/completions · Anthropic: /v1/messages)"
            f"  账号 {len(gw.pool.accounts)} 个，可用 {len(gw.pool.usable())} 个")

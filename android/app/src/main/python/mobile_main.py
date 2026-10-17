@@ -44,8 +44,12 @@ def _copy_asset_dir(mgr, asset_path: str, dest: str) -> None:
 #: Set once the HTTP server thread has been started.  Chaquopy keeps the
 #: interpreter alive across service restarts in the same process, so a second
 #: start_gateway() would otherwise try to bind the port twice and crash.
-_started = {"port": 0, "thread": None}
+#: ``server`` is the bound HTTPServer so a host change can close it cleanly.
+_started = {"port": 0, "thread": None, "server": None, "host": ""}
 _start_lock = threading.Lock()
+#: Serialises whole start/rebind operations: the watchdog, the service start
+#: and the UI's LAN toggle can otherwise race and bind the port twice.
+_op_lock = threading.Lock()
 
 
 def _is_serving(port: int, timeout: float = 2.0) -> bool:
@@ -69,10 +73,43 @@ def restart_gateway(port: int = 17991) -> None:
     continued unhealthy state and retries.
     """
     global _started
-    with _start_lock:
-        _started = {"port": 0, "thread": None}
-    print("[mobile_main] restart requested", flush=True)
-    start_gateway(os.getcwd(), port)
+    with _op_lock:
+        with _start_lock:
+            old = _started
+            _started = {"port": 0, "thread": None, "server": None, "host": ""}
+        # Close the old listener when it is still healthy — otherwise rebinding
+        # on a different interface (127.0.0.1 <-> 0.0.0.0) fails with
+        # EADDRINUSE.
+        srv = old.get("server")
+        if srv is not None:
+            try:
+                srv.shutdown()
+                srv.server_close()
+            except Exception as exc:
+                print(f"[mobile_main] old server close failed: {exc}", flush=True)
+        print("[mobile_main] restart requested", flush=True)
+        start_gateway(os.getcwd(), port)
+
+
+def bind_host(host: str, port: int = 17991) -> None:
+    """Rebind the gateway on another interface (LAN toggle) and restart it.
+
+    Persists ``host`` to config.json first so the change survives a process
+    restart, then restarts the server on the new address.
+    """
+    import json
+    cfg_path = os.path.join(os.getcwd(), "config.json")
+    try:
+        stored = {}
+        if os.path.exists(cfg_path):
+            with open(cfg_path, encoding="utf-8") as f:
+                stored = json.load(f)
+        stored["host"] = "0.0.0.0" if str(host).strip() == "0.0.0.0" else "127.0.0.1"
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(stored, f)
+    except Exception as exc:
+        print(f"[mobile_main] config write failed: {exc}", flush=True)
+    restart_gateway(port)
 
 
 def start_gateway(files_dir: str, port: int = 17991) -> None:
@@ -136,9 +173,16 @@ def start_gateway(files_dir: str, port: int = 17991) -> None:
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(stored, f)
     else:
+        stored = {}
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump({"host": "127.0.0.1", "port": port, "proxy": "",
                        "sessions_from_client": False}, f)
+
+    # Bind 0.0.0.0 when the user enabled LAN access in the app's settings.
+    # This used to be forced to loopback here, which silently ignored the
+    # setting: the phone displayed a LAN URL that nothing was listening on.
+    stored_host = str(stored.get("host") or "127.0.0.1").strip()
+    listen_on = stored_host if stored_host in ("127.0.0.1", "0.0.0.0") else "127.0.0.1"
 
     # 3. import & run
     if files_dir not in sys.path:
@@ -149,13 +193,35 @@ def start_gateway(files_dir: str, port: int = 17991) -> None:
 
     cfg = load_config(cfg_path)
     cfg["port"] = port
-    cfg["host"] = "127.0.0.1"
+    cfg["host"] = listen_on
     # let the panel persist settings back to the same file it read
     cfg["_config_file"] = cfg_path
 
-    t = threading.Thread(target=serve_mod.serve, args=(cfg,), daemon=True,
-                         name="gateway-http")
+    bound = {}
+    bound_event = threading.Event()
+    boot_error = {}
+
+    def on_server(httpd):
+        bound["server"] = httpd
+        bound_event.set()
+
+    def run():
+        try:
+            serve_mod.serve(cfg, on_server=on_server)
+        except Exception as exc:                     # noqa: BLE001
+            boot_error["error"] = str(exc)
+            print(f"[mobile_main] gateway serve failed: {exc}", flush=True)
+            bound_event.set()                        # do not block the caller
+
+    t = threading.Thread(target=run, daemon=True, name="gateway-http")
     t.start()
+    # Wait for the bind so a caller that immediately toggles the host sees a
+    # real server to close (and a bind failure is reported, not hidden).
+    bound_event.wait(timeout=15)
+    if boot_error:
+        raise RuntimeError(f"gateway bind failed: {boot_error['error']}")
     with _start_lock:
         _started["port"] = port
         _started["thread"] = t
+        _started["host"] = listen_on
+        _started["server"] = bound.get("server")
