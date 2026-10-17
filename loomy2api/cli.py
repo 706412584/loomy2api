@@ -191,8 +191,8 @@ def cmd_register_sms(cfg, args) -> int:
     from .smsreg import register_batch
 
     if not args.yes:
-        print(f"接码注册会按号码收费（约 1.6 元/个），共 {args.count} 个。"
-              f"确认请加 --yes")
+        print(f"接码注册在成功取到验证码时扣费（1.6 元/个，首次 65%），"
+              f"本次最多 {args.count} 个；没收到短信不扣费。确认请加 --yes")
         return 1
     username = args.username or cfg.get("fysms_username") or ""
     password = args.password or cfg.get("fysms_password") or ""
@@ -214,8 +214,10 @@ def cmd_register_sms(cfg, args) -> int:
     except Exception as exc:                         # noqa: BLE001
         print(f"接码注册失败：{exc}")
         return 1
+    charged = summary.get("charged")
     print(f"\n完成：成功 {summary['done']}/{summary['requested']}，"
-          f"余额 {summary.get('balance_before')} → {summary.get('balance_after')}")
+          f"余额 {summary.get('balance_before')} → {summary.get('balance_after')}"
+          + (f"（实际扣费 {charged:.2f} 元）" if charged is not None else ""))
     return 0 if summary["done"] else 1
 
 

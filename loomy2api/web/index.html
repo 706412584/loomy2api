@@ -1081,8 +1081,9 @@ async function openSmsReg() {
     + '<div class="row" style="gap:8px;align-items:center;margin-top:4px">'
     + '<button id="r-balance">查询余额（免费）</button>'
     + '<span id="r-balance-msg" class="muted" style="font-size:12px"></span></div>'
-    + '<div class="paywarn">⚠ 接码注册会<b>按号码收费</b>（约 1.6 元/个，由接码平台扣款）。'
-    + '每取一个号码就会扣费，即使最终没收到短信。请确认数量和余额后再开始。</div>'
+    + '<div class="paywarn">⚠ 接码平台<b>成功取到验证码时扣费</b>（1.6 元/个，首次 65%），'
+    + '取号后没来短信不扣费，平台会在 18 次轮询后自动释放号码。'
+    + '请确认数量和余额后再开始。</div>'
     + '<div class="hint">接码平台需<b>直连</b>访问，请关闭 VPN / 全局代理。'
     + '每个号码会依次：取号 → 讯飞发码 → 等待短信 → 验证码登录 → 自动设置登录密码并验证，'
     + '成功即为永久账号。</div>'
@@ -1134,9 +1135,9 @@ async function startSmsReg() {
   if (!creds.fysms_password && !(LAST_STATE.config || {}).fysms_password_set) {
     toast('请填写 fysms 密码', 'err'); return;
   }
-  if (!confirm('接码注册会按号码收费（约 1.6 元/个）。\n本次 ' + count
-      + ' 个号码，预计扣费 ' + (count * 1.6).toFixed(2)
-      + ' 元，且每个号码取号后即扣费（无论是否收到短信）。\n\n确认开始？')) return;
+  if (!confirm('接码平台在成功取到验证码时扣费（1.6 元/个，首次 65%）。\n'
+      + '本次最多 ' + count + ' 个号码，最高约 ' + (count * 1.6).toFixed(2)
+      + ' 元；没收到短信的号码不扣费。\n\n确认开始？')) return;
 
   REG_BUSY = true;
   const btn = $('r-start');
@@ -1163,7 +1164,9 @@ async function startSmsReg() {
                 : '✗ ' + (r.error || '失败')));
     });
     regLine('完成：成功 ' + res.done + '/' + res.requested
-      + '，余额 ' + res.balance_before + ' → ' + res.balance_after);
+      + '，余额 ' + res.balance_before + ' → ' + res.balance_after
+      + (res.charged !== null && res.charged !== undefined
+          ? '（实际扣费 ' + res.charged.toFixed(2) + ' 元）' : ''));
     toast('接码注册完成：成功 ' + res.done + '/' + res.requested,
       res.done ? 'ok' : 'err');
     if (res.state) { LAST_STATE = res.state; render(res.state); }

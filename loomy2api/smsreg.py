@@ -74,9 +74,12 @@ def register_one(gw, client: FysmsClient, *,
         row["sms_error"] = str(exc)[:200]
     if not sms:
         row["stage"] = "timeout"
+        # The fee is charged when a code is actually returned, so a timeout
+        # costs nothing.  The platform auto-releases the number after 18
+        # polls; blacklisting is optional housekeeping on top of that.
         row["blacklisted"] = client.blacklist(phone)
-        row.update(error="超时未收到短信" +
-                         ("（号码已拉黑）" if row["blacklisted"] else ""))
+        row.update(error="超时未收到短信（未扣码费）" +
+                         ("，号码已拉黑" if row["blacklisted"] else "，号码已自动释放"))
         return row
     row["sms"] = sms[:120]
     code = extract_code(sms)
@@ -192,6 +195,9 @@ def register_batch(gw, count: int, *, username: str, password: str,
         balance_after = client.balance()
     except Exception:                                # noqa: BLE001
         balance_after = None
+    charged = (round(balance - balance_after, 2)
+               if isinstance(balance, (int, float))
+               and isinstance(balance_after, (int, float)) else None)
     return {
         "ok": True,
         "requested": count,
@@ -199,5 +205,8 @@ def register_batch(gw, count: int, *, username: str, password: str,
         "failed": len(results) - len(ok),
         "balance_before": balance,
         "balance_after": balance_after,
+        # The platform only charges when a code is returned, so this is the
+        # real cost of the batch (not count × price).
+        "charged": charged,
         "results": results,
     }

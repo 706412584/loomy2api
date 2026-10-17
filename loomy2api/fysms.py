@@ -194,17 +194,28 @@ class FysmsClient:
             raise FysmsError(f"fysms 取号失败：{raw[:80]}")
         return phone
 
+    #: The platform auto-releases an old virtual-card number after 18 polls
+    #: ("在此等待18次取码后会自动释放").  Polling past that is pointless and
+    #: only wastes time; a timeout never costs money — the fee is charged when
+    #: a code is actually returned.
+    MAX_POLLS = 18
+
     def get_code(self, phone: str, keyword: str = DEFAULT_KEYWORD,
-                 *, max_wait: int = 150, interval: int = 5) -> Optional[str]:
+                 *, max_wait: int = 150, interval: int = 5,
+                 max_polls: int = MAX_POLLS) -> Optional[str]:
         """轮询短信，返回短信原文；超时返回 ``None``。"""
         yzuid = str(int(self.userid) * 2 - 5)
+        polls = 0
         waited = 0
-        while waited < max_wait:
+        while waited < max_wait and polls < max_polls:
             text = self._get_text(FYSMS_INDEX, {
                 "a": "selectrmb", "userid": self.userid, "gjz": keyword,
                 "phone": phone, "zuoyong": "11", "yzuid": yzuid,
             })
+            polls += 1
             text = text.strip().strip('"')
+            if text == "buzu":
+                raise FysmsError("fysms 余额不足，无法查询验证码")
             # ``1`` (quoted or not) is the platform's "no SMS yet" marker.
             if text and text != "1":
                 return text

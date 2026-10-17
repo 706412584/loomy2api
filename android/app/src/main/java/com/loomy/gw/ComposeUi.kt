@@ -408,7 +408,10 @@ class GatewayViewModel : ViewModel() {
                         batchMsg = "接码注册完成：成功 ${r.optInt("done")}/" +
                             "${r.optInt("requested")}，余额 " +
                             "${r.optDouble("balance_before", Double.NaN)} → " +
-                            "${r.optDouble("balance_after", Double.NaN)}\n" +
+                            "${r.optDouble("balance_after", Double.NaN)}" +
+                            (if (r.has("charged") && !r.isNull("charged"))
+                                "（扣费 ${"%.2f".format(r.optDouble("charged"))} 元）"
+                            else "") + "\n" +
                             lines.joinToString("\n"),
                     )
                 }
@@ -1205,8 +1208,9 @@ private fun SmsRegisterDialog(
             title = { Text("确认扣费", fontSize = 18.sp, fontWeight = FontWeight.Bold) },
             text = {
                 Text(
-                    "将取 $n 个号码（老版虚卡），每个约 1.6 元，预计扣费 " +
-                        "%.2f 元。取号后即扣费，无论是否收到短信。".format(n * 1.6),
+                    "将取 $n 个号码（老版虚卡）。接码平台在成功取到验证码时扣费：" +
+                        "1.6 元/个，首次 65%；没收到短信不扣费，最高约 " +
+                        "%.2f 元。".format(n * 1.6),
                     fontSize = 13.sp,
                 )
             },
@@ -1287,8 +1291,8 @@ private fun SmsRegisterDialog(
                 }
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    "⚠ 每取一个号码都会扣费（约 1.6 元/个），即使最终没收到短信。" +
-                        "接码平台需直连，请关闭 VPN / 全局代理。",
+                    "⚠ 接码平台在成功取到验证码时扣费（1.6 元/个，首次 65%）；" +
+                        "没收到短信不扣费。平台需直连，请关闭 VPN / 全局代理。",
                     fontSize = 12.sp, color = Amber,
                 )
             }

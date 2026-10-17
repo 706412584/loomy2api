@@ -83,10 +83,11 @@ class FakeFysms:
                            else fake.balance))
                     return
                 if action == "selectrmb_21":
+                    # Taking a number is free; the platform charges when a
+                    # code is actually returned (verified live 2026-10-17).
                     if fake.balance < 1.6:
                         self._send("buzu")
                     else:
-                        fake.balance -= 1.6
                         self._send("1")
                     return
                 if action == "getxksjh":
@@ -99,6 +100,9 @@ class FakeFysms:
                     return
                 if action == "selectrmb":
                     fake.code_polls += 1
+                    if fake.sms != "1" and fake.sms != '"1"':
+                        # charging happens here, once a code is delivered
+                        fake.balance = round(fake.balance - 1.6, 2)
                     self._send('"%s"' % fake.sms)
                     return
                 if action == "releasephone":
@@ -155,8 +159,9 @@ class TestFysmsClient(unittest.TestCase):
         client.login()
         phone = client.get_phone()
         self.assertEqual(phone, "13800000111")
-        self.assertAlmostEqual(self.fake.balance, 38.0 - 1.6)
+        self.assertAlmostEqual(self.fake.balance, 38.0)     # taking is free
         self.assertEqual(client.get_code(phone), self.fake.sms)
+        self.assertAlmostEqual(self.fake.balance, 38.0 - 1.6)  # charged on code
 
     def test_balance_exhausted(self):
         self.fake.balance = 1.0
@@ -235,9 +240,21 @@ class TestRegisterBatch(unittest.TestCase):
         self.assertEqual(summary["done"], 0)
         self.assertTrue(summary["results"][0]["blacklisted"])
         self.assertEqual(self.fake.blacklisted, ["13800000111"])
+        # a timeout never charges: the fee is taken when a code is returned
+        self.assertEqual(summary["charged"], 0.0)
+
+    def test_polling_stops_at_platform_release_limit(self):
+        """18 polls is the platform's auto-release point — do not keep polling."""
+        self.fake.sms = "1"
+        client = FysmsClient(self.fake.username, self.fake.password,
+                             base=self.base)
+        client.login()
+        phone = client.get_phone()
+        self.assertIsNone(client.get_code(phone, max_wait=999, interval=0))
+        self.assertEqual(self.fake.code_polls, FysmsClient.MAX_POLLS)
 
     def test_stops_when_balance_runs_out(self):
-        self.fake.balance = 1.7      # enough for exactly one number
+        self.fake.balance = 1.7      # enough for exactly one code (1.6)
         gw = self._gateway()
         summary = register_batch(gw, 3, username=self.fake.username,
                                  password=self.fake.password, max_wait=5)
