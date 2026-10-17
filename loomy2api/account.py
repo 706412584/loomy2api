@@ -101,6 +101,10 @@ class Account:
     #: unix seconds when :meth:`AccountClient.set_password` last succeeded.
     #: A stored password makes the account renewable forever ("permanent").
     password_set_at: int = 0
+    #: unix seconds when that password was proven by an actual ``byPwd`` login.
+    #: The account service can report success while the password is not usable
+    #: yet (``0200103``), so a password is only trusted after this check.
+    password_verified_at: int = 0
 
     #: per-account device identity (devid / ua / campus device id / …)
     identity: Dict[str, Any] = field(default_factory=dict)
@@ -139,8 +143,13 @@ class Account:
 
     @property
     def permanent(self) -> bool:
-        """Upgraded account: it survives session expiry via password login."""
-        return self.has_password
+        """Upgraded account: it survives session expiry via password login.
+
+        Requires the password to have been proven by a real login — the
+        account service sometimes accepts ``update/pwd`` yet rejects the
+        password at ``byPwd`` (``0200103``).
+        """
+        return self.has_password and bool(self.password_verified_at)
 
     @property
     def in_cooldown(self) -> bool:
@@ -168,6 +177,8 @@ class Account:
             obtained_at=int(raw.get("obtainedAt") or raw.get("obtained_at") or 0),
             password_set_at=int(raw.get("passwordSetAt")
                                 or raw.get("password_set_at") or 0),
+            password_verified_at=int(raw.get("passwordVerifiedAt")
+                                     or raw.get("password_verified_at") or 0),
             identity=dict(identity) if isinstance(identity, dict) else {},
             available=(int(raw["available"]) if raw.get("available") is not None else None),
             balance=(int(raw["balance"]) if raw.get("balance") is not None else None),
@@ -187,6 +198,8 @@ class Account:
             out["password"] = self.password
         if self.password_set_at:
             out["passwordSetAt"] = self.password_set_at
+        if self.password_verified_at:
+            out["passwordVerifiedAt"] = self.password_verified_at
         if self.session:
             out["session"] = self.session
         if self.userid:
@@ -235,6 +248,8 @@ class Account:
             "has_password": self.has_password,
             "permanent": self.permanent,
             "password_set_at": self.password_set_at,
+            "password_verified_at": self.password_verified_at,
+            "password_ok": bool(self.password_verified_at),
             "session": (self.session[:8] + "…") if self.session else "",
             "session_days_left": (round(self.days_left, 2) if self.days_left is not None else None),
             "expire_at": self.expire_at,

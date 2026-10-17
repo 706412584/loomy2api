@@ -211,6 +211,7 @@ class AccountPool:
                     # login: force a fresh login on next use
                     acc.session, acc.expire_at = "", 0
                     acc.password_set_at = 0
+                    acc.password_verified_at = 0
         if "enabled" in fields and fields["enabled"] is not None:
             acc.enabled = bool(fields["enabled"])
         self.save(force=True)
@@ -262,9 +263,56 @@ class AccountPool:
         self.client.set_password(acc.session, new_password, acc.identity or None)
         acc.password = new_password
         acc.password_set_at = int(time.time())
+        acc.password_verified_at = 0
+
+        # "update/pwd succeeded" is not proof the password works: the service
+        # has been observed to accept it while ``byPwd`` still answers
+        # ``0200103 账号鉴权失败``.  Prove it with a real login before calling
+        # the account permanent — otherwise it silently fails at expiry.
+        try:
+            got = self.client.login_by_password(
+                acc.loginid, new_password, acc.identity or None)
+        except AccountError as exc:
+            self.save(force=True)
+            raise PoolError(
+                f"账号 {acc.name} 密码已设置，但用新密码登录验证失败：{exc}。"
+                f"该账号仍不是永久账号，请在面板重试或检查密码规则") from exc
+        acc.password_verified_at = int(time.time())
+        # A successful login hands back a fresh session; keep it.
+        if got.get("session"):
+            acc.session = got["session"]
+            acc.userid = got.get("userid") or acc.userid
+            acc.obtained_at = int(time.time())
+            acc.expire_at = acc.obtained_at + C.SESSION_EXPIRE_SECONDS
         self.save(force=True)
-        self.log(f"账号 {acc.name} 已设置登录密码（升级为可自动续期账号）")
+        self.log(f"账号 {acc.name} 已设置登录密码并验证通过（升级为可自动续期账号）")
         return new_password
+
+    def verify_password(self, acc: Account) -> bool:
+        """Prove the stored password works by logging in with it.
+
+        Returns True and refreshes the session on success; on failure the
+        password stays stored but is no longer treated as permanent.  Never
+        raises: callers use this as a health check.
+        """
+        if not (acc.loginid and acc.password):
+            return False
+        try:
+            got = self.client.login_by_password(
+                acc.loginid, acc.password, acc.identity or None)
+        except Exception as exc:                         # noqa: BLE001
+            acc.password_verified_at = 0
+            self.log(f"账号 {acc.name} 密码验证失败：{exc}")
+            self.save()
+            return False
+        acc.password_verified_at = int(time.time())
+        if got.get("session"):
+            acc.session = got["session"]
+            acc.userid = got.get("userid") or acc.userid
+            acc.obtained_at = int(time.time())
+            acc.expire_at = acc.obtained_at + C.SESSION_EXPIRE_SECONDS
+        self.save()
+        return True
 
     def ensure_password(self, acc: Account, *, force: bool = False) -> bool:
         """Give a password-less account one while its session still works.
@@ -274,7 +322,12 @@ class AccountPool:
         gateway cannot do unattended.  Returns True when a password was set.
         """
         if acc.has_password and not force:
-            return False
+            if acc.password_verified_at:
+                return False
+            # A stored but unproven password: verify it with a real login
+            # before spending a rotation on it.
+            if self.verify_password(acc):
+                return False
         if not acc.session_valid:
             return False
         # Derived accounts (imported from the desktop client) are never written
@@ -327,9 +380,9 @@ class AccountPool:
             self.log(f"账号 {acc.name} session 剩余 {acc.days_left:.1f} 天，提前续期")
         if not needs:
             return acc
-        if not acc.has_password:
-            # last chance: the session still works, so we can set a password
-            # now and make every future expiry automatic
+        if not acc.has_password or not acc.password_verified_at:
+            # last chance: the session still works, so we can set (or prove)
+            # a password now and make every future expiry automatic
             if acc.session_valid:
                 self.ensure_password(acc)
         if not (acc.loginid and acc.password):
@@ -337,6 +390,9 @@ class AccountPool:
                 f"账号 {acc.name} 的 session 不可用且没有账号密码，无法自动重登"
                 f"（请在 accounts.json 补 loginid/password，或用 `loomy2api login` 短信登录）")
         self.client.fill(acc)
+        # a successful password login is the strongest proof the password works
+        if acc.has_password:
+            acc.password_verified_at = int(time.time())
         self.save()
         self.log(f"账号 {acc.name} 登录成功 userid={acc.userid} "
                  f"session={acc.session[:8]}… 剩余 {(acc.days_left or 0):.1f} 天")

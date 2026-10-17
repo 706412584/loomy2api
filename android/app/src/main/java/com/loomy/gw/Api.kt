@@ -120,6 +120,7 @@ data class AccountView(
     val source: String,
     val permanent: Boolean,
     val passwordSetAt: Long,
+    val passwordVerifiedAt: Long,
 ) {
     val statusLabel: String
         get() = when {
@@ -212,6 +213,7 @@ fun parseState(o: JSONObject): StateView {
             source = a.optString("source"),
             permanent = a.optBoolean("permanent"),
             passwordSetAt = a.optLong("password_set_at"),
+            passwordVerifiedAt = a.optLong("password_verified_at"),
         )
     }
     val keys = c.optJSONArray("api_keys") ?: JSONArray()

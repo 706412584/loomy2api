@@ -305,6 +305,8 @@ class Panel:
                 out["password"] = acc.password
             if acc.password_set_at:
                 out["passwordSetAt"] = acc.password_set_at
+            if acc.password_verified_at:
+                out["passwordVerifiedAt"] = acc.password_verified_at
             items.append(out)
         return {"ok": True, "version": 1, "exported_at": int(time.time()),
                 "accounts": items}
@@ -412,6 +414,9 @@ class Panel:
                         existing.password = str(raw["password"])
                         existing.password_set_at = int(
                             raw.get("passwordSetAt") or raw.get("password_set_at") or 0)
+                        existing.password_verified_at = int(
+                            raw.get("passwordVerifiedAt")
+                            or raw.get("password_verified_at") or 0)
                     updated.append(name)
                 else:
                     skipped.append(name)
@@ -430,6 +435,9 @@ class Panel:
             if acc is not None and raw.get("password"):
                 acc.password_set_at = int(
                     raw.get("passwordSetAt") or raw.get("password_set_at") or 0)
+                acc.password_verified_at = int(
+                    raw.get("passwordVerifiedAt")
+                    or raw.get("password_verified_at") or 0)
             added.append(name)
 
         # Never let a fully-rejected import rewrite the pool file: if nothing
@@ -506,9 +514,10 @@ class Panel:
         if password:
             self._validate_password(password)
         pwd = self.pool.set_account_password(acc, password)
-        self.log(f"[panel] {acc.name} 已设置登录密码（账号升级为可自动续期）")
+        self.log(f"[panel] {acc.name} 已设置登录密码并验证通过")
         return {"ok": True, "name": acc.name, "password": pwd,
-                "generated": not bool(password), "state": self.state()}
+                "verified": True, "generated": not bool(password),
+                "state": self.state()}
 
     @staticmethod
     def _validate_password(password: str) -> None:
@@ -545,9 +554,12 @@ class Panel:
         if manual:
             self._validate_password(manual)
         only = {str(n) for n in (payload.get("names") or [])}
-        skipped = [a.name for a in self.pool.accounts if a.enabled and a.has_password]
+        # "permanent" means the password was proven by a real login; an account
+        # with a stored but unverified password is still a target (it is first
+        # verified, and only rotated when that fails).
+        skipped = [a.name for a in self.pool.accounts if a.enabled and a.permanent]
         targets = [a for a in self.pool.accounts
-                   if a.enabled and not a.has_password
+                   if a.enabled and not a.permanent
                    and (not only or a.name in only)]
         results: list = []
         if targets:
@@ -556,6 +568,12 @@ class Panel:
                 if not acc.session_valid:
                     return {"name": acc.name, "ok": False,
                             "error": "没有有效 session，请先续期或验证码登录"}
+                # A stored password that was never proven: test it first and
+                # keep it when it works, instead of rotating blindly.
+                if acc.password and not acc.password_verified_at:
+                    if self.pool.verify_password(acc):
+                        return {"name": acc.name, "ok": True,
+                                "password": acc.password, "verified": True}
                 # A manual password is an explicit request to (re)set it, so
                 # skip the "already has one upstream" guard in that case.
                 if not manual:
@@ -573,7 +591,8 @@ class Panel:
                 for attempt in range(2):
                     try:
                         pwd = self.pool.set_account_password(acc, manual)
-                        return {"name": acc.name, "ok": True, "password": pwd}
+                        return {"name": acc.name, "ok": True, "password": pwd,
+                                "verified": True}
                     except AccountError as exc:
                         last = exc
                         transient = exc.retryable or str(exc.code).startswith("HTTP_5")

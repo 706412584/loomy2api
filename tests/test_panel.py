@@ -24,6 +24,7 @@ class PanelHarness:
         base = self.upstream.start()
         write_accounts(self.dir / "accounts.json", [
             {"name": "a", "loginid": "13800000001", "password": "pw",
+             "passwordVerifiedAt": int(time.time()),
              "session": "s1", "userid": "u1",
              "expireAt": int(time.time()) + 14 * 86400,
              "identity": {"devid": "web-aaaaaaaaaaaaaaaa", "ua": "UA",

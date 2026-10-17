@@ -1258,12 +1258,19 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                 ) {
                     Column(Modifier.weight(1f)) {
                         Text(
-                            if (acc.permanent) "永久账号（已设密码）" else "未设密码：到期后需短信重新登录",
+                            when {
+                                acc.permanent -> "永久账号（密码已验证）"
+                                acc.passwordSetAt > 0 -> "密码未验证：请重设以确认可用"
+                                else -> "未设密码：到期后需短信重新登录"
+                            },
                             fontSize = 13.sp,
                             color = if (acc.permanent) Green else Amber,
                         )
                         if (!acc.permanent) {
-                            Text("设置密码后 session 到期会自动续期",
+                            Text(
+                                if (acc.passwordSetAt > 0)
+                                    "上次设置成功但登录验证未通过，到期可能无法自动续期"
+                                else "设置密码后 session 到期会自动续期",
                                 fontSize = 11.sp, color = Muted)
                         }
                     }

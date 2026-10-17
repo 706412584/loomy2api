@@ -364,7 +364,9 @@ function render(state) {
     return '<tr onclick="openAccountModal(\'' + a.name + '\')" style="cursor:pointer">'
       + '<td data-label="账号"><b>' + a.name + '</b><div class="mono">'
         + (a.source === 'client' ? 'client 导入' : (a.mode === 'session' ? '仅 session' : '密码账号'))
-        + (a.permanent ? ' · <span style="color:var(--ok)">永久</span>' : '') + '</div></td>'
+        + (a.permanent ? ' · <span style="color:var(--ok)">永久</span>'
+           : (a.password_set_at ? ' · <span style="color:var(--warn)">密码未验证</span>' : ''))
+        + '</div></td>'
       + '<td data-label="手机号" class="mono">' + (a.loginid_masked || '—') + '</td>'
       + '<td data-label="状态">' + badge(a) + '</td>'
       + '<td data-label="剩余">' + remainingText(a) + '</td>'
@@ -406,9 +408,12 @@ function openAccountModal(name) {
     + (id.devid || '—') + '</small></div></div>'
     + '</div>'
     + (a.permanent
-        ? '<div class="hint" style="color:var(--ok)">该账号已设置登录密码，session 到期会自动续期（永久可用）。</div>'
-        : '<div class="hint" style="color:var(--warn)">该账号还没有登录密码：session 到期后需要重新短信登录。'
-          + '现在设置密码即可升级为永久账号。</div>')
+        ? '<div class="hint" style="color:var(--ok)">密码已验证，session 到期会自动续期（永久可用）。</div>'
+        : (a.password_set_at
+            ? '<div class="hint" style="color:var(--warn)">密码已设置但登录验证未通过，'
+              + '到期可能无法自动续期。请点「重设密码」再试一次。</div>'
+            : '<div class="hint" style="color:var(--warn)">该账号还没有登录密码：session 到期后需要重新短信登录。'
+              + '现在设置密码即可升级为永久账号。</div>'))
     + '<div class="ops">'
     + '<button class="primary" onclick="modalAct(\'points\')">查积分</button>'
     + '<button onclick="modalAct(\'checkin\')">每日签到</button>'

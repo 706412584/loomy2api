@@ -159,6 +159,9 @@ class TestSessionLifecycle(unittest.TestCase):
                 account.expire_at = int(time.time()) + 14 * 86400
                 return account
 
+            def login_by_password(self, loginid, password, identity=None):
+                return {"session": "verified", "userid": "uid-a"}
+
         pool.client = FakeClient()
         pool.acquire()
         self.assertEqual(calls, ["a"])
@@ -210,6 +213,10 @@ class TestSessionLifecycle(unittest.TestCase):
             def set_password(self, session, new_password, identity=None):
                 self.passwords.append((session, new_password))
 
+            def login_by_password(self, loginid, password, identity=None):
+                # the real client proves a new password with a login
+                return {"session": "verified", "userid": "uid-a"}
+
             def fill(self, account):
                 account.session = "renewed"
                 account.expire_at = int(time.time()) + 14 * 86400
@@ -222,12 +229,69 @@ class TestSessionLifecycle(unittest.TestCase):
         self.assertEqual(len(client.passwords), 1)
         self.assertEqual(client.passwords[0][0], "s")
         self.assertTrue(acc.has_password)
-        self.assertEqual(acc.session, "renewed")
+        self.assertTrue(acc.password_verified_at)
+        # the verification login already returned a fresh 14-day session, so
+        # ensure_session has nothing left to renew
+        self.assertEqual(acc.session, "verified")
         # persisted, so it survives a restart / travels with an export
         saved = json.loads((self.dir / "accounts.json").read_text(encoding="utf-8"))
         row = next(a for a in saved["accounts"] if a["name"] == "a")
         self.assertEqual(row["password"], acc.password)
         self.assertTrue(row.get("passwordSetAt"))
+
+    def test_password_set_but_login_rejected_is_not_permanent(self):
+        """``update/pwd`` can succeed while ``byPwd`` still refuses (0200103)."""
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "session": "s",
+             "expireAt": int(time.time()) + 3600},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+
+        class FakeClient:
+            def set_password(self, session, new_password, identity=None):
+                return None                      # upstream says "成功"
+
+            def login_by_password(self, loginid, password, identity=None):
+                from loomy2api.account import AccountError
+                raise AccountError("账号鉴权失败", code="0200103")
+
+        pool.client = FakeClient()
+        with self.assertRaises(PoolError) as ctx:
+            pool.set_account_password(acc)
+        self.assertIn("验证失败", str(ctx.exception))
+        # the password is kept (the user may still need it), but the account
+        # must not be advertised as permanent
+        self.assertTrue(acc.password)
+        self.assertFalse(acc.permanent)
+        self.assertFalse(acc.password_verified_at)
+
+    def test_unverified_password_is_checked_before_rotation(self):
+        """A stored but unproven password is tested, not overwritten."""
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "pw",
+             "session": "s", "expireAt": int(time.time()) + 3600},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        rotated = []
+
+        class FakeClient:
+            def login_by_password(self, loginid, password, identity=None):
+                return {"session": "verified", "userid": "uid-a"}
+
+            def set_password(self, session, new_password, identity=None):
+                rotated.append(new_password)
+
+        pool.client = FakeClient()
+        self.assertFalse(pool.ensure_password(acc))
+        self.assertEqual(rotated, [])
+        self.assertTrue(acc.password_verified_at)
+        self.assertEqual(acc.session, "verified")
 
     def test_upgrade_skips_account_with_upstream_password(self):
         """Never rotate a password the user set but we don't know."""
@@ -285,6 +349,7 @@ class TestSessionLifecycle(unittest.TestCase):
 
         write_accounts(self.dir / "accounts.json", [
             {"name": "a", "loginid": "13800000001", "password": "pw",
+             "passwordVerifiedAt": int(time.time()),
              "session": "s1", "expireAt": int(time.time()) + 3600},
             {"name": "b", "session": "s2", "expireAt": int(time.time()) + 3600},
         ])
