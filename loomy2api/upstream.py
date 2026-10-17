@@ -18,6 +18,33 @@ class UpstreamError(RuntimeError):
         self.status = status
 
 
+#: The model gateway answers HTTP 200 with a business code when the session is
+#: no longer accepted (e.g. ``points/first-login`` → "登录已失效，请重新登录").
+#: Treating that as a plain upstream failure skipped the password re-login and
+#: left the account stuck until the local 14-day expiry.
+SESSION_EXPIRED_MARKERS = ("登录已失效", "重新登录", "session 失效",
+                           "登录状态已失效", "token 已失效")
+
+
+def _check_payload(status: int, payload: Dict[str, Any], data: bytes,
+                   path: str) -> None:
+    """Raise :class:`UpstreamError` for an error payload.
+
+    A session-expiry message is promoted to ``status=401`` so callers rotate /
+    re-login exactly as they do for a real 401.
+    """
+    code = str(payload.get("code") or "")
+    desc = str(payload.get("desc") or payload.get("message") or "")
+    if status == 200 and code in ("", "000000", "None"):
+        return
+    if status == 200 and not desc:
+        return
+    text = desc or data[:200].decode("utf-8", "replace")
+    if any(marker in text for marker in SESSION_EXPIRED_MARKERS):
+        raise UpstreamError(f"{path} HTTP {status}: {text}", 401)
+    raise UpstreamError(f"{path} HTTP {status}: {text}", status)
+
+
 def build_model_headers(session: str, *, version: str = "",
                         extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Headers the model gateway requires.
@@ -108,7 +135,9 @@ class ModelGateway:
                 headers=self._headers(session), body=b"{}",
                 timeout=30, proxy=str(self.cfg.get("proxy") or ""))
             if status == 200:
-                node = json.loads(data.decode("utf-8")).get("data") or {}
+                payload = json.loads(data.decode("utf-8"))
+                _check_payload(status, payload, data, "/points/first-login")
+                node = payload.get("data") or {}
                 out.update({
                     "daily_quota": node.get("dailyQuota"),
                     "daily_consumed": node.get("dailyConsumed"),
@@ -120,6 +149,12 @@ class ModelGateway:
                     "inviter_reward": node.get("inviterReward"),
                     "invitation_codes": node.get("invitationCodes") or [],
                 })
+        except UpstreamError as exc:
+            # An expired session must reach the caller so it can re-login;
+            # everything else degrades to a partial overview.
+            if exc.status == 401:
+                raise
+            out["error"] = str(exc)
         except Exception as exc:                        # noqa: BLE001
             out["error"] = str(exc)
         try:
@@ -128,9 +163,15 @@ class ModelGateway:
                 headers=self._headers(session), timeout=20,
                 proxy=str(self.cfg.get("proxy") or ""))
             if status == 200:
-                node = json.loads(data.decode("utf-8")).get("data") or {}
+                payload = json.loads(data.decode("utf-8"))
+                _check_payload(status, payload, data, "/points/activation")
+                node = payload.get("data") or {}
                 out["activated"] = node.get("activated")
                 out["applied_invitation_code"] = node.get("appliedInvitationCode")
+        except UpstreamError as exc:
+            if exc.status == 401:
+                raise
+            out.setdefault("error", str(exc))
         except Exception as exc:                        # noqa: BLE001
             out.setdefault("error", str(exc))
         return out
@@ -146,11 +187,7 @@ class ModelGateway:
             headers=self._headers(session), body=body, timeout=30,
             proxy=str(self.cfg.get("proxy") or ""))
         payload = json.loads(data.decode("utf-8"))
-        if status != 200 or payload.get("code") not in (None, "000000"):
-            raise UpstreamError(
-                f"/points/first-login HTTP {status}: "
-                f"{payload.get('desc') or data[:200].decode('utf-8', 'replace')}",
-                status)
+        _check_payload(status, payload, data, "/points/first-login")
         return payload.get("data") or {}
 
     def points_activate(self, session: str, device_id: str,
@@ -166,11 +203,7 @@ class ModelGateway:
             headers=self._headers(session), body=body, timeout=30,
             proxy=str(self.cfg.get("proxy") or ""))
         payload = json.loads(data.decode("utf-8"))
-        if status != 200 or payload.get("code") not in (None, "000000"):
-            raise UpstreamError(
-                f"/points/activation HTTP {status}: "
-                f"{payload.get('desc') or data[:200].decode('utf-8', 'replace')}",
-                status)
+        _check_payload(status, payload, data, "/points/activation")
         return payload.get("data") or {}
 
     def onboarding_tasks(self, session: str) -> Dict[str, Any]:
@@ -195,11 +228,7 @@ class ModelGateway:
             headers=self._headers(session), body=body, timeout=30,
             proxy=str(self.cfg.get("proxy") or ""))
         payload = json.loads(data.decode("utf-8"))
-        if status != 200 or payload.get("code") not in (None, "000000"):
-            raise UpstreamError(
-                f"/onboarding/tasks/complete HTTP {status}: "
-                f"{payload.get('desc') or data[:200].decode('utf-8', 'replace')}",
-                status)
+        _check_payload(status, payload, data, "/onboarding/tasks/complete")
         return payload.get("data") or {}
 
     def points_ledger(self, session: str, page_size: int = 50) -> Dict[str, Any]:

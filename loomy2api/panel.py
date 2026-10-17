@@ -838,7 +838,7 @@ class Panel:
         payload = payload or {}
         acc = self._pick_account(payload.get("name"))
         gw = self.gw.models_client
-        overview = gw.points_overview(acc.session)
+        overview = self._with_session(acc, lambda s: gw.points_overview(s))
         ledger = {"total": 0, "rows": []}
         if payload.get("ledger", True):
             try:
@@ -849,6 +849,34 @@ class Panel:
         return {"ok": True, "account": acc.name, "overview": overview,
                 "ledger": ledger}
 
+    def _with_session(self, acc: Account, call):
+        """Run ``call(session)``; on a rejected session re-login and retry once.
+
+        The upstream can reject a session that the local 14-day expiry still
+        considers valid (e.g. it was invalidated server-side).  Password
+        accounts can recover silently, so a 401 must never surface as a plain
+        upstream failure — that is what made "每日签到" fail on an otherwise
+        healthy account.
+        """
+        try:
+            return call(acc.session)
+        except UpstreamError as exc:
+            if exc.status != 401:
+                raise
+            if not acc.has_password:
+                acc.session, acc.expire_at = "", 0
+                self.pool.save(force=True)
+                raise PoolError(
+                    f"账号 {acc.name} 的 session 已失效且没有密码，无法自动重登"
+                    f"（请用验证码重新登录）") from exc
+            self.log(f"[panel] {acc.name} session 被上游拒绝，正在用密码重登")
+            try:
+                self.pool.ensure_session(acc, force=True)
+            except (AccountError, PoolError) as relogin:
+                raise PoolError(
+                    f"账号 {acc.name} session 失效，密码重登失败：{relogin}") from exc
+            return call(acc.session)
+
     def points_activate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Submit an invitation code for one account (mutates account state)."""
         code = str(payload.get("code") or "").strip()
@@ -856,7 +884,8 @@ class Panel:
             raise PoolError("需要邀请码 / invite code is required")
         acc = self._pick_account(payload.get("name"))
         dev = (acc.identity or {}).get("campus_device_id") or ""
-        data = self.gw.models_client.points_activate(acc.session, dev, code)
+        data = self._with_session(
+            acc, lambda s: self.gw.models_client.points_activate(s, dev, code))
         self.log(f"[panel] {acc.name} 提交邀请码 {code}："
                  f"activated={data.get('activated')} "
                  f"already={data.get('alreadyActivated')}")
@@ -880,6 +909,13 @@ class Panel:
         # call is a round-trip); in parallel it is one round-trip plus the
         # slowest task.  The upstream tolerates this — the official client also
         # fires the batch at once.
+        # A stale session would otherwise fail all eight tasks; recover once
+        # before fanning out.
+        try:
+            self._with_session(acc, lambda s: gw.onboarding_complete(s, "first_message"))
+        except UpstreamError as exc:
+            raise PoolError(f"新手任务失败：{exc}") from exc
+
         def run_one(task):
             key, label, reward = task
             row: Dict[str, Any] = {"key": key, "name": label, "expected": reward}
@@ -913,7 +949,8 @@ class Panel:
     def onboarding_state(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Read-only task list + completion state (``GET /onboarding/tasks``)."""
         acc = self._pick_account((payload or {}).get("name"))
-        data = self.gw.models_client.onboarding_tasks(acc.session)
+        data = self._with_session(
+            acc, lambda s: self.gw.models_client.onboarding_tasks(s))
         return {"ok": True, "account": acc.name, "tasks": data}
 
     def checkin(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -925,7 +962,8 @@ class Panel:
         payload = payload or {}
         acc = self._pick_account(payload.get("name"))
         dev = (acc.identity or {}).get("campus_device_id") or ""
-        data = self.gw.models_client.points_first_login(acc.session, dev)
+        data = self._with_session(
+            acc, lambda s: self.gw.models_client.points_first_login(s, dev))
         already = bool(data.get("alreadyProcessed"))
         self.log(f"[panel] {acc.name} 签到：{'今日已领' if already else '已签到'} "
                  f"balance={data.get('currentBalance') or data.get('permanentBalance')}")
