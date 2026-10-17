@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Loomy2API</string>
+    <string name="notif_title">Loomy2API 网关运行中</string>
+    <string name="notif_text">点按打开面板 · 端口 17991</string>
+</resources>

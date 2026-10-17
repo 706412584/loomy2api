@@ -213,6 +213,46 @@ class GatewayTestCase(_Harness, unittest.TestCase):
                              "5xx must not put an account in cooldown")
             self.assertTrue(acc.session_valid, "5xx must not drop the session")
 
+    def test_content_rejection_keeps_accounts_healthy(self):
+        """A 403 from the provider's content inspection is *not* an auth error.
+
+        Regression: it used to be classified as an account fault, so a single
+        rejected payload wiped every session in the pool (each retry hit the
+        next account with the same body and got the same 403) and left the pool
+        needing manual SMS re-login.
+        """
+        self.upstream.content_reject = ["fake-model"]
+        self.upstream.calls.clear()
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/v1/chat/completions", {
+                "model": "fake-model", "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(ctx.exception.code, 403)
+        # tried once only: rotating cannot help when the payload is the problem
+        self.assertEqual([c["path"] for c in self.upstream.calls],
+                         ["/api/v1/chat/completions"],
+                         "content rejection must not be retried on other accounts")
+        self.assertEqual(self.gateway.pool.usable(), self.gateway.pool.accounts)
+        for acc in self.gateway.pool.accounts:
+            self.assertTrue(acc.session_valid,
+                            "content rejection must not drop the session")
+            self.assertFalse(acc.in_cooldown,
+                             "content rejection must not cool the account down")
+
+    def test_content_rejection_keeps_sessions_in_streaming_path(self):
+        """Same guarantee on the streaming path, which is where it bit us."""
+        self.upstream.content_reject = ["fake-model"]
+        self.upstream.calls.clear()
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/v1/chat/completions", {
+                "model": "fake-model", "stream": True,
+                "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(ctx.exception.code, 403)
+        self.assertEqual([c["path"] for c in self.upstream.calls],
+                         ["/api/v1/chat/completions"])
+        for acc in self.gateway.pool.accounts:
+            self.assertTrue(acc.session_valid)
+            self.assertFalse(acc.in_cooldown)
+
     def test_rotation_when_account_quota_exhausted(self):
         self.upstream.exhausted_sessions = ["s1", "s2"]
         with self.assertRaises(urllib.error.HTTPError) as ctx:
@@ -321,6 +361,38 @@ class AuthTestCase(_Harness, unittest.TestCase):
         self.assertIn("authorization:bearer", logged)
         self.assertIn("wrong-ke…", logged)          # masked, not the full secret
         self.assertNotIn("wrong-key-123456", logged)
+
+
+class StreamReadTestCase(unittest.TestCase):
+    """The upstream SSE reader must not buffer into fixed-size blocks."""
+
+    class _FakeResponse:
+        def __init__(self):
+            self.calls = []
+
+        def read(self, n=-1):
+            self.calls.append(("read", n))
+            return b"whole-block"
+
+        def read1(self, n=-1):
+            self.calls.append(("read1", n))
+            return b"one-token"
+
+    def test_read_chunk_uses_read1(self):
+        """``read(n)`` on a BufferedReader blocks until n bytes or EOF, which
+        makes token-by-token output arrive as whole sentences.  ``read1``
+        returns whatever is available, preserving the upstream cadence."""
+        resp = self._FakeResponse()
+        chunk = Handler._read_chunk(None, None, resp, 30)
+        self.assertEqual(chunk, b"one-token")
+        self.assertEqual(resp.calls, [("read1", 4096)])
+
+    def test_read_chunk_falls_back_when_read1_missing(self):
+        class _Plain:
+            def read(self, n=-1):
+                return b"legacy"
+
+        self.assertEqual(Handler._read_chunk(None, None, _Plain(), 30), b"legacy")
 
 
 if __name__ == "__main__":

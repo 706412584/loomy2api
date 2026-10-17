@@ -21,7 +21,9 @@ Endpoints
 from __future__ import annotations
 
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -111,15 +113,26 @@ class Panel:
         return (time.time() - (acc.quota_updated_at or 0)) > minutes * 60
 
     def _refresh_all(self, only_stale: bool = True) -> None:
-        for acc in self.pool.accounts:
-            if not acc.session_valid:
-                continue
-            if only_stale and not self._quota_stale(acc):
-                continue
+        """Refresh quota for the accounts that need it, concurrently.
+
+        The upstream call is a network round-trip with a 30 s timeout, so doing
+        it serially made a cold panel load take 30 s *per unreachable account*
+        (on a phone that reads as "stuck loading accounts").  They are
+        independent, so fan them out and wait only as long as the slowest one.
+        """
+        pending = [a for a in self.pool.accounts
+                   if a.session_valid and not (only_stale and not self._quota_stale(a))]
+        if not pending:
+            return
+
+        def refresh_one(acc: Account) -> None:
             try:
                 self.pool.refresh_quota(acc)
             except Exception as exc:                     # noqa: BLE001
                 self.log(f"[panel] 刷新 {acc.name} 额度失败：{exc}")
+
+        with ThreadPoolExecutor(max_workers=min(8, len(pending))) as pool:
+            list(pool.map(refresh_one, pending))
         self.pool.save()
 
     # --------------------------------------------------------------- state
@@ -145,6 +158,10 @@ class Panel:
                 "unique_accounts": len(seen),
                 "requests": sum(a["requests"] for a in accounts),
                 "points_used": sum(a["points_used"] for a in accounts),
+                # gateway-wide counters (survive account edits; reset on restart)
+                "total_requests": self.gw.totals.get("requests", 0),
+                "tokens": self.gw.totals.get("tokens", 0),
+                "failures": self.gw.totals.get("failures", 0),
             },
             "config": {
                 "upstream": self.gw.cfg["upstream"],
@@ -154,9 +171,118 @@ class Panel:
                 "models": len(self.gw.catalogue()),
                 "auth_required": bool(self.gw.cfg.api_keys),
                 "quota_refresh_minutes": self.gw.cfg.get("quota_refresh_minutes"),
+                "host": self.gw.cfg.get("host"),
+                "port": self.gw.cfg.get("port"),
+                "api_keys": list(self.gw.cfg.api_keys),
+                "proxy": self.gw.cfg.get("proxy") or "",
+                "log_requests": bool(self.gw.cfg.get("log_requests", True)),
+                "timeout": self.gw.cfg.get("timeout"),
+                "max_retries": self.gw.cfg.get("max_retries"),
+                "cooldown_seconds": self.gw.cfg.get("cooldown_seconds"),
+                "session_renew_before_days": self.gw.cfg.get("session_renew_before_days"),
+                "sessions_from_client": bool(self.gw.cfg.get("sessions_from_client", True)),
             },
             "accounts": accounts,
         }
+
+    def update_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist the subset of settings the mobile UI exposes.
+
+        Only whitelisted keys are written, so a client cannot rewrite the
+        upstream endpoints or the accounts file path through this endpoint.
+        ``strategy``/``default_model`` apply to the live pool immediately;
+        ``host``/``port`` need a restart (the server is already bound).
+        """
+        editable = {
+            "strategy", "default_model", "api_keys", "proxy", "log_requests",
+            "timeout", "max_retries", "cooldown_seconds",
+            "session_renew_before_days", "quota_refresh_minutes",
+            "sessions_from_client", "identity_mode",
+        }
+        changes = {k: v for k, v in payload.items() if k in editable}
+
+        if "strategy" in changes:
+            strategy = str(changes["strategy"])
+            if strategy not in ("balance", "round_robin", "lru", "weighted"):
+                raise PoolError(f"未知调度策略 / unknown strategy: {strategy}")
+        if "api_keys" in changes:
+            raw = changes["api_keys"]
+            if isinstance(raw, str):
+                # tolerate a JSON-encoded list (some clients stringify it) as
+                # well as the plain "a,b" form; an empty value means "no auth"
+                text = raw.strip()
+                if text.startswith("["):
+                    try:
+                        import json as _json
+                        raw = _json.loads(text)
+                    except Exception:                     # noqa: BLE001
+                        raw = [v for v in text.strip("[]").split(",")]
+                else:
+                    raw = text.split(",")
+            changes["api_keys"] = [str(v).strip() for v in (raw or []) if str(v).strip()]
+        for flag in ("log_requests", "sessions_from_client"):
+            if flag in changes:
+                changes[flag] = bool(changes[flag])
+        for num_key in ("timeout", "max_retries", "cooldown_seconds",
+                        "session_renew_before_days", "quota_refresh_minutes"):
+            if num_key in changes:
+                try:
+                    changes[num_key] = int(changes[num_key])
+                except (TypeError, ValueError):
+                    raise PoolError(f"{num_key} 必须是整数") from None
+
+        self.gw.cfg.update(changes)
+        self._write_config(changes)
+        self.log(f"[panel] 配置已更新：{', '.join(sorted(changes)) or '（无变化）'}")
+        return {"ok": True, "changed": sorted(changes), "state": self.state()}
+
+    def _write_config(self, changes: Dict[str, Any]) -> None:
+        """Merge changes into the on-disk config.json (best effort).
+
+        The file lives next to accounts.json (both are per-install state); the
+        in-memory config is already updated, so a write failure only means the
+        change is not persisted across a restart.
+        """
+        import json as _json
+        cfg_file = Path(self.gw.cfg.get("_config_file")
+                        or self.pool._file.parent / "config.json")
+        try:
+            existing = {}
+            if cfg_file.exists():
+                existing = _json.loads(cfg_file.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                existing = {}
+            existing.update(changes)
+            cfg_file.write_text(_json.dumps(existing, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+        except Exception as exc:                          # noqa: BLE001
+            self.log(f"[panel] 写入 config.json 失败：{exc}")
+
+    def export_accounts(self) -> Dict[str, Any]:
+        """Accounts in the same shape the import endpoint accepts.
+
+        Sessions are included because this is a local-only export; callers are
+        expected to treat the result as a secret (the mobile UI warns).
+        """
+        items = []
+        for acc in self.pool.accounts:
+            if not acc.persist:
+                continue
+            out = {
+                "name": acc.name,
+                "loginid": acc.loginid,
+                "session": acc.session,
+                "userid": acc.userid,
+                "enabled": acc.enabled,
+                "expireAt": acc.expire_at,
+                "obtainedAt": acc.obtained_at,
+                "identity": acc.identity,
+            }
+            if acc.password:
+                out["password"] = acc.password
+            items.append(out)
+        return {"ok": True, "version": 1, "exported_at": int(time.time()),
+                "accounts": items}
 
     # --------------------------------------------------------------- writes
 
@@ -177,6 +303,7 @@ class Panel:
         if loginid and not password and not session:
             raise PoolError("只给手机号时还需要密码 / password required with phone")
 
+        existed = self.pool.get(name) is not None
         acc = self.pool.add_account(name, loginid=loginid, password=password,
                                     session=session)
         result: Dict[str, Any] = {"ok": True, "name": acc.name,
@@ -190,6 +317,17 @@ class Panel:
             except (AccountError, PoolError) as exc:
                 result["logged_in"] = False
                 result["error"] = str(exc)
+                # Roll the new account back on a failed first login.  Leaving
+                # it in the pool with no session made a retry fail with
+                # "account already exists", so users had to tap "add" several
+                # times (and the web panel had the same problem).
+                if not existed and not acc.session_valid:
+                    self.pool.remove_account(name)
+                    result["ok"] = False
+                    result["rolled_back"] = True
+                    self.log(f"[panel] 添加 {name} 登录失败，已回滚（{exc}）")
+                    result["state"] = self.state()
+                    return result
             self.pool.save(force=True)
         self.pool.save(force=True)
         result["state"] = self.state()

@@ -56,6 +56,16 @@ CLIENT_UA = "Loomy|Desktop|Electron|macOS"
 #: requests — but it is the one field that is device-scoped by design.
 CAMPUS_DEVICE_ID_PREFIX = "loomy-campus-"
 
+#: The upstream runs the provider's own content inspection and answers HTTP 403
+#: with these markers when it rejects the *payload* — not the credentials.  Such
+#: a response must never drop a session or cool an account down: the session is
+#: still valid, and rotating only burns the pool (every account sees the same
+#: body and gets rejected identically).  Observed shape:
+#: ``{"error":{"message":"内容可能包含敏感信息，无法处理，请调整后重试",
+#: "type":"data_inspection_failed","code":403,
+#: "metadata":{"provider_name":"alibaba-dashscope"}}}``
+CONTENT_FAULT_MARKERS = ("data_inspection_failed", "内容可能包含敏感信息")
+
 #: ``X-Loomy-Request-Purpose`` values understood by the upstream (17 total).
 REQUEST_PURPOSES = (
     "chat.message", "chat.title", "pet.comment", "pet.reward",

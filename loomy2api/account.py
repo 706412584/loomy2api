@@ -153,6 +153,11 @@ class Account:
             expire_at=int(raw.get("expireAt") or raw.get("expire_at") or 0),
             obtained_at=int(raw.get("obtainedAt") or raw.get("obtained_at") or 0),
             identity=dict(identity) if isinstance(identity, dict) else {},
+            available=(int(raw["available"]) if raw.get("available") is not None else None),
+            balance=(int(raw["balance"]) if raw.get("balance") is not None else None),
+            daily_balance=(int(raw["dailyBalance"])
+                           if raw.get("dailyBalance") is not None else None),
+            quota_updated_at=int(raw.get("quotaUpdatedAt") or 0),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -174,6 +179,17 @@ class Account:
             out["obtainedAt"] = self.obtained_at
         if self.identity:
             out["identity"] = self.identity
+        # Cache the last known quota so a cold start (especially on mobile,
+        # where the first panel load used to block on upstream calls) can
+        # render immediately and only refresh what is actually stale.
+        if self.available is not None:
+            out["available"] = self.available
+        if self.balance is not None:
+            out["balance"] = self.balance
+        if self.daily_balance is not None:
+            out["dailyBalance"] = self.daily_balance
+        if self.quota_updated_at:
+            out["quotaUpdatedAt"] = self.quota_updated_at
         return out
 
     def identity_view(self) -> Dict[str, Any]:

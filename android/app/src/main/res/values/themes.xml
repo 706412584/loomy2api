@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose owns the real styling; this only avoids a system action bar
+         and gives the window a light background before the first frame. -->
+    <style name="Theme.Loomy" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#F5F6F8</item>
+        <item name="android:statusBarColor">#F5F6F8</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

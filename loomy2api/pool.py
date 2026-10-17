@@ -322,9 +322,29 @@ class AccountPool:
         acc.last_error = ""
         self.save()
 
+    @staticmethod
+    def is_content_rejection(status: int, reason: str = "") -> bool:
+        """True when a 403 is the provider's *content inspection*, not auth.
+
+        Such a reply says nothing about the account: the session is still
+        valid, so dropping it would force a manual re-login, and cooling the
+        account down is pointless because every other account would reject the
+        identical request body too.
+        """
+        if status != 403:
+            return False
+        return any(marker in (reason or "") for marker in C.CONTENT_FAULT_MARKERS)
+
     def report_failure(self, acc: Account, status: int, reason: str = "") -> None:
         acc.failures += 1
         acc.last_error = reason or f"HTTP {status}"
+        if self.is_content_rejection(status, reason):
+            # the payload was rejected, not the credentials — keep the session
+            # and leave the account usable for the next (different) request
+            self.log(f"账号 {acc.name} HTTP {status} 内容审核拒绝（保留 session，"
+                     f"不冷却）：{acc.last_error}")
+            self.save()
+            return
         if status in (401, 403):
             acc.session, acc.expire_at = "", 0
         cooldown = float(self.cfg.get("cooldown_seconds") or 300)

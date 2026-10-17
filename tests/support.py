@@ -105,6 +105,11 @@ class FakeUpstream:
         self.exhausted_sessions: List[str] = []
         #: model-id substring → (status, message); simulates upstream hiccups
         self.reject_with: Dict[str, Any] = {}
+        #: model-id substrings the provider's content inspection refuses.  The
+        #: reply carries the real upstream shape (403 + ``data_inspection_failed``)
+        #: because the gateway keys off those fields to tell "the payload was
+        #: rejected" apart from "the credentials were rejected".
+        self.content_reject: List[str] = []
         self.calls: List[Dict[str, Any]] = []
         self.models_payload = {
             "object": "list",
@@ -144,6 +149,19 @@ class FakeUpstream:
     def _reject(self, handler, status: int, message: str = "denied") -> None:
         body = json.dumps({"error": {"message": message}}).encode()
         handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def _reject_content(self, handler) -> None:
+        """403 as the provider's content inspection emits it (not an auth error)."""
+        body = json.dumps({"error": {
+            "message": "内容可能包含敏感信息，无法处理，请调整后重试",
+            "type": "data_inspection_failed", "param": None, "code": 403,
+            "metadata": {"provider_name": "alibaba-dashscope"},
+        }}).encode()
+        handler.send_response(403)
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Content-Length", str(len(body)))
         handler.end_headers()
@@ -200,6 +218,9 @@ class FakeUpstream:
 
                 if path.endswith("/chat/completions"):
                     model = body.get("model", "fake-model")
+                    for needle in fake.content_reject:
+                        if needle in str(model):
+                            return fake._reject_content(self)
                     for needle, (status, message) in fake.reject_with.items():
                         if needle in str(model):
                             return fake._reject(self, status, message)

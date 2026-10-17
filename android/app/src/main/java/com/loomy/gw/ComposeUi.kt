@@ -1,0 +1,1592 @@
+package com.loomy.gw
+
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material.icons.outlined.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+// ===================================================================== state
+
+data class UiState(
+    val loading: Boolean = true,
+    val ready: Boolean = false,
+    val state: StateView? = null,
+    val models: List<ModelView> = emptyList(),
+    val records: List<CallRecord> = emptyList(),
+    val recordTotals: JSONObject = JSONObject(),
+    val logLines: List<String> = emptyList(),
+    val logPath: String = "",
+    val error: String? = null,
+    val toast: String? = null,
+)
+
+class GatewayViewModel : ViewModel() {
+    private val _ui = MutableStateFlow(UiState())
+    val ui: StateFlow<UiState> = _ui.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            val ok = Api.waitUntilReady()
+            _ui.update { it.copy(ready = ok, loading = false,
+                error = if (ok) null else "网关未启动（请点首页的启动按钮）") }
+            if (ok) refreshAll()
+        }
+        // keep the dashboard live while the screen is open
+        viewModelScope.launch {
+            while (true) {
+                delay(10_000)
+                if (_ui.value.ready) runCatching { loadState() }
+            }
+        }
+    }
+
+    fun startGateway() {
+        _ui.update { it.copy(loading = true, error = null) }
+        GatewayService.start(AssetBridge.appContext!!)
+        viewModelScope.launch {
+            val ok = Api.waitUntilReady()
+            _ui.update { it.copy(loading = false, ready = ok) }
+            if (ok) refreshAll()
+        }
+    }
+
+    fun refreshAll() {
+        viewModelScope.launch {
+            _ui.update { it.copy(loading = true) }
+            val errors = mutableListOf<String>()
+            runCatching { loadState() }.onFailure { errors += "状态: ${it.message}" }
+            runCatching { loadModels() }.onFailure { errors += "模型: ${it.message}" }
+            runCatching { loadRecords() }.onFailure { errors += "记录: ${it.message}" }
+            _ui.update { it.copy(
+                loading = false,
+                error = errors.firstOrNull(),
+            ) }
+        }
+    }
+
+    private suspend fun loadState(refresh: Boolean = false) {
+        val s = parseState(Api.get("/api/panel/state" + if (refresh) "?refresh=1" else ""))
+        // keep the client key in sync with the gateway: if the user set keys
+        // in the settings tab, every later call needs them (and vice versa)
+        val key = s.config.apiKeys.firstOrNull().orEmpty()
+        if (Api.apiKey != key) Api.apiKey = key
+        _ui.update { it.copy(state = s, ready = true) }
+    }
+
+    private suspend fun loadModels(refresh: Boolean = false) {
+        val m = parseModels(Api.get("/api/panel/models" + if (refresh) "?refresh=1" else ""))
+        _ui.update { it.copy(models = m) }
+    }
+
+    private suspend fun loadRecords() {
+        val (rows, totals) = parseRecords(Api.get("/api/panel/records?limit=200"))
+        _ui.update { it.copy(records = rows, recordTotals = totals) }
+    }
+
+    fun refreshQuota() = viewModelScope.launch {
+        toast("正在刷新额度…")
+        // many accounts × 30 s upstream timeout — the default 120 s is too tight
+        runCatching { Api.post("/api/panel/refresh", timeoutSec = 300) }
+            .onSuccess { loadState(refresh = true); toast("额度已刷新") }
+            .onFailure { toast("刷新失败：${it.message}") }
+    }
+
+    fun refreshModels() = viewModelScope.launch {
+        toast("正在刷新模型…")
+        runCatching { loadModels(refresh = true); toast("模型已刷新") }
+            .onFailure { toast("刷新失败：${it.message}") }
+    }
+
+    fun refreshRecords() = viewModelScope.launch {
+        runCatching { loadRecords() }.onFailure { toast("读取失败：${it.message}") }
+    }
+
+    /** Tail the gateway's own log file (same source as the desktop panel). */
+    fun refreshLog() = viewModelScope.launch {
+        runCatching {
+            val r = Api.get("/api/panel/logs?lines=400")
+            val arr = r.optJSONArray("lines") ?: JSONArray()
+            val lines = (0 until arr.length()).map { arr.optString(it) }
+            _ui.update { it.copy(logLines = lines, logPath = r.optString("path")) }
+        }.onFailure { toast("读取日志失败：${it.message}") }
+    }
+
+    /**
+     * Run a per-account action; returns the message to show in the dialog.
+     *
+     * The gateway answers HTTP 200 with `{"ok": false, "error": ...}` for
+     * business failures (e.g. renewing an account that has no stored
+     * password), so the body must be inspected, not just the status code.
+     * `onboarding` runs eight sequential upstream calls and takes ~2 minutes,
+     * hence its larger timeout.
+     */
+    suspend fun accountAction(kind: String, acc: AccountView): String = try {
+        fun check(r: JSONObject) {
+            if (!r.optBoolean("ok", true)) {
+                throw IllegalStateException(r.optString("error").ifBlank { "操作失败" })
+            }
+        }
+        when (kind) {
+            "checkin" -> {
+                val r = Api.post("/api/panel/points/checkin",
+                    JSONObject().put("name", acc.name), timeoutSec = 60)
+                check(r)
+                if (r.optBoolean("already")) "今日已签到"
+                else "签到成功，余额 ${r.opt("current_balance") ?: "—"}"
+            }
+            "onboarding" -> {
+                val r = Api.post("/api/panel/points/onboarding",
+                    JSONObject().put("name", acc.name), timeoutSec = 300)
+                check(r)
+                val tasks = r.optJSONArray("tasks") ?: JSONArray()
+                val ok = (0 until tasks.length()).count { tasks.getJSONObject(it).optBoolean("ok") }
+                "新手任务 $ok/${tasks.length()} 完成，到账 ${r.optInt("gained")} 积分"
+            }
+            "renew" -> {
+                val r = Api.post("/api/panel/accounts/renew",
+                    JSONObject().put("name", acc.name), timeoutSec = 60)
+                check(r)
+                loadState(); "已续期"
+            }
+            "quota" -> {
+                // /accounts/update with only a name is an empty patch — it does
+                // not refresh anything.  Force a real quota read instead.
+                loadState(refresh = true)
+                "已刷新"
+            }
+            "identity" -> {
+                val r = Api.post("/api/panel/accounts/identity",
+                    JSONObject().put("name", acc.name).put("regenerate", true))
+                check(r)
+                loadState()
+                "已换新设备标识：${r.optJSONObject("identity")?.optString("devid") ?: "—"}"
+            }
+            "toggle" -> {
+                val r = Api.post("/api/panel/accounts/update",
+                    JSONObject().put("name", acc.name).put("enabled", !acc.enabled))
+                check(r)
+                loadState()
+                if (acc.enabled) "已禁用" else "已启用"
+            }
+            "remove" -> {
+                val r = Api.post("/api/panel/accounts/remove",
+                    JSONObject().put("name", acc.name))
+                check(r)
+                loadState(); "已删除"
+            }
+            else -> "未知操作"
+        }
+    } catch (e: Exception) {
+        val reason = when (e) {
+            is java.net.SocketTimeoutException -> "请求超时（上游较慢，请稍后重试）"
+            else -> e.message ?: e.javaClass.simpleName
+        }
+        "失败：$reason"
+    }
+
+    /**
+     * Add (and optionally log in) an account.  Suspend, so a caller's
+     * `finally { busy = false }` runs only after the request really finished —
+     * launching internally made the dialog's spinner vanish immediately.
+     */
+    suspend fun addAccount(name: String, phone: String, password: String,
+                           session: String, login: Boolean,
+                           onDone: (String) -> Unit) {
+        runCatching {
+            val body = JSONObject().put("name", name)
+            if (phone.isNotBlank()) body.put("loginid", phone)
+            if (password.isNotBlank()) body.put("password", password)
+            if (session.isNotBlank()) body.put("session", session)
+            body.put("login", login)
+            val r = Api.post("/api/panel/accounts", body, timeoutSec = 90)
+            loadState()
+            r
+        }.onSuccess { r ->
+            // the endpoint answers 200 even when the login attempt failed
+            val loggedIn = r.optBoolean("logged_in", !login)
+            val err = r.optString("error")
+            val rolledBack = r.optBoolean("rolled_back", false)
+            onDone(
+                when {
+                    err.isNotBlank() && rolledBack ->
+                        "添加失败：$err（已撤销，可直接重试）"
+                    err.isNotBlank() -> "添加失败：$err"
+                    login && !loggedIn -> "账号已添加，但登录失败"
+                    else -> "已添加 $name"
+                }
+            )
+        }.onFailure { onDone("添加失败：${it.message}") }
+    }
+
+    // -- SMS login -------------------------------------------------------
+
+    /** Step 1: ask the upstream to send a code; returns the msgid or null. */
+    suspend fun smsSend(phone: String): Pair<String?, String> = try {
+        val r = Api.post("/api/panel/accounts/sms",
+            JSONObject().put("loginid", phone), timeoutSec = 60)
+        val msgid = r.optString("msgid")
+        if (msgid.isBlank()) null to "上游未返回 msgid"
+        else msgid to "验证码已发送"
+    } catch (e: Exception) {
+        null to "发送失败：${e.message}"
+    }
+
+    /** Step 2: exchange phone + code + msgid for a session. */
+    suspend fun smsLogin(name: String, phone: String, code: String, msgid: String,
+                         onDone: (String) -> Unit) {
+        runCatching {
+            val r = Api.post("/api/panel/accounts/sms-login", JSONObject()
+                .put("name", name.ifBlank { phone })
+                .put("loginid", phone)
+                .put("code", code)
+                .put("msgid", msgid), timeoutSec = 120)
+            if (!r.optBoolean("ok", true)) {
+                throw IllegalStateException(r.optString("error").ifBlank { "登录失败" })
+            }
+            loadState()
+            r
+        }.onSuccess { onDone("登录成功") }
+            .onFailure { onDone("登录失败：${it.message}") }
+    }
+
+    // -- import / export -------------------------------------------------
+
+    /** Read an accounts.json picked by the user and POST it. */
+    suspend fun importAccountsFromUri(uri: android.net.Uri, onDone: (String) -> Unit) {
+        val ctx = AssetBridge.appContext
+        if (ctx == null) { onDone("应用上下文不可用"); return }
+        val text = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                ctx.contentResolver.openInputStream(uri)?.use {
+                    it.readBytes().toString(Charsets.UTF_8)
+                } ?: throw IllegalStateException("无法读取文件")
+            }.getOrNull()
+        }
+        if (text == null) {
+            onDone("读取文件失败")
+            return
+        }
+        importAccounts(text, onDone)
+    }
+
+    /**
+     * Fetch the account export (contains plaintext sessions/passwords) and
+     * hand it to the caller, which writes it wherever the user chooses.
+     */
+    suspend fun exportAccounts(): String? = runCatching {
+        Api.get("/api/panel/export").toString(2)
+    }.onFailure { toast("导出失败：${it.message}") }.getOrNull()
+
+    suspend fun importAccounts(text: String, onDone: (String) -> Unit) {
+        runCatching {
+            val parsed = JSONObject(text)
+            val result = Api.post("/api/panel/accounts/import",
+                parsed.put("mode", "update"))
+            loadState()
+            result
+        }.onSuccess { r ->
+            onDone("导入完成：新增 ${r.optJSONArray("added")?.length() ?: 0}，"
+                + "更新 ${r.optJSONArray("updated")?.length() ?: 0}")
+        }.onFailure { onDone("导入失败：${it.message}") }
+    }
+
+    fun saveConfig(changes: Map<String, Any>, onDone: (String) -> Unit) =
+        viewModelScope.launch {
+            runCatching {
+                val body = JSONObject()
+                changes.forEach { (k, v) ->
+                    // JSONObject.put would call toString() on a List, turning
+                    // an empty key list into the literal "[]" — which the
+                    // gateway then treats as one (wrong) API key.
+                    if (v is List<*>) body.put(k, JSONArray(v)) else body.put(k, v)
+                }
+                Api.post("/api/panel/config", body)
+                loadState()
+            }.onSuccess { onDone("配置已保存") }
+                .onFailure { onDone("保存失败：${it.message}") }
+        }
+
+    fun toast(msg: String) {
+        _ui.update { it.copy(toast = msg) }
+        viewModelScope.launch {
+            delay(2500)
+            if (_ui.value.toast == msg) _ui.update { it.copy(toast = null) }
+        }
+    }
+
+    fun clearToast() { _ui.update { it.copy(toast = null) } }
+}
+
+// ===================================================================== theme
+
+private val Blue = Color(0xFF2563EB)
+private val BlueSoft = Color(0xFFEFF4FF)
+private val Green = Color(0xFF16A34A)
+private val GreenSoft = Color(0xFFE9F9EF)
+private val Red = Color(0xFFDC2626)
+private val RedSoft = Color(0xFFFDECEC)
+private val Amber = Color(0xFFD97706)
+private val AmberSoft = Color(0xFFFEF6E7)
+private val Bg = Color(0xFFF5F6F8)
+private val CardBg = Color.White
+private val Ink = Color(0xFF111827)
+private val Muted = Color(0xFF6B7280)
+private val Line = Color(0xFFE8EAEE)
+
+@Composable
+fun LoomyTheme(content: @Composable () -> Unit) {
+    MaterialTheme(
+        colorScheme = lightColorScheme(
+            primary = Blue,
+            onPrimary = Color.White,
+            background = Bg,
+            surface = CardBg,
+            onSurface = Ink,
+            outline = Line,
+        ),
+        typography = Typography(
+            titleLarge = androidx.compose.ui.text.TextStyle(
+                fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Ink),
+            titleMedium = androidx.compose.ui.text.TextStyle(
+                fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Ink),
+            bodyMedium = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = Ink),
+            bodySmall = androidx.compose.ui.text.TextStyle(fontSize = 12.sp, color = Muted),
+        ),
+        content = content,
+    )
+}
+
+// ===================================================================== app
+
+enum class Tab(val label: String, val icon: ImageVector) {
+    Home("首页", Icons.Outlined.Home),
+    Accounts("账号", Icons.Outlined.AccountCircle),
+    Models("模型", Icons.Outlined.Diamond),
+    Records("记录", Icons.Outlined.List),
+    Settings("设置", Icons.Outlined.Settings),
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun GatewayApp(vm: GatewayViewModel) {
+    val ui by vm.ui.collectAsState()
+    var tab by remember { mutableStateOf(Tab.Home) }
+    val snackbar = remember { SnackbarHostState() }
+
+    LaunchedEffect(ui.toast) {
+        ui.toast?.let {
+            snackbar.showSnackbar(it)
+            vm.clearToast()
+        }
+    }
+
+    LoomyTheme {
+        Scaffold(
+            containerColor = Bg,
+            snackbarHost = { SnackbarHost(snackbar) },
+            bottomBar = {
+                NavigationBar(containerColor = CardBg, tonalElevation = 0.dp) {
+                    Tab.entries.forEach { t ->
+                        NavigationBarItem(
+                            selected = tab == t,
+                            onClick = { tab = t },
+                            icon = { Icon(t.icon, t.label) },
+                            label = { Text(t.label, fontSize = 11.sp) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = Blue,
+                                selectedTextColor = Blue,
+                                indicatorColor = BlueSoft,
+                                unselectedIconColor = Muted,
+                                unselectedTextColor = Muted,
+                            ),
+                        )
+                    }
+                }
+            },
+        ) { pad ->
+            Box(Modifier.padding(pad).fillMaxSize()) {
+                if (ui.loading && ui.state == null) {
+                    LoadingScreen()
+                } else {
+                    when (tab) {
+                        Tab.Home -> HomeScreen(vm, ui)
+                        Tab.Accounts -> AccountsScreen(vm, ui)
+                        Tab.Models -> ModelsScreen(vm, ui)
+                        Tab.Records -> RecordsScreen(vm, ui)
+                        Tab.Settings -> SettingsScreen(vm, ui)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LoadingScreen() {
+    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            CircularProgressIndicator(color = Blue)
+            Spacer(Modifier.height(14.dp))
+            Text("正在启动网关…", color = Muted)
+        }
+    }
+}
+
+// ================================================================ home
+
+@Composable
+private fun HomeScreen(vm: GatewayViewModel, ui: UiState) {
+    val s = ui.state
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp, 18.dp, 16.dp, 24.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        item { BrandHeader() }
+
+        item {
+            SectionCard {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        Modifier.size(9.dp).background(
+                            if (ui.ready) Green else Muted,
+                            RoundedCornerShape(50))
+                    )
+                    Spacer(Modifier.width(9.dp))
+                    Text(
+                        if (ui.ready) "网关运行中" else "网关已停止",
+                        fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    Text("端口 ${GatewayService.PORT}", color = Muted, fontSize = 13.sp)
+                }
+                Spacer(Modifier.height(14.dp))
+                if (ui.ready) {
+                    OutlinedButton(
+                        onClick = { vm.refreshAll() },
+                        modifier = Modifier.fillMaxWidth().height(46.dp),
+                        shape = RoundedCornerShape(12.dp),
+                    ) { Text("刷新状态") }
+                } else {
+                    Button(
+                        onClick = { vm.startGateway() },
+                        modifier = Modifier.fillMaxWidth().height(46.dp),
+                        shape = RoundedCornerShape(12.dp),
+                    ) { Text("启动网关", fontSize = 15.sp) }
+                }
+            }
+        }
+
+        item { SectionTitle("概览") }
+        item {
+            val t = s?.totals
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                StatCard("可用账号", "${t?.usable ?: 0}/${t?.accounts ?: 0}", Modifier.weight(1f))
+                StatCard("累计请求", "${t?.totalRequests ?: 0}", Modifier.weight(1f))
+            }
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                StatCard("剩余积分", "${t?.available ?: 0}", Modifier.weight(1f))
+                StatCard("总 Tokens", formatTokens(t?.tokens ?: 0), Modifier.weight(1f))
+            }
+        }
+
+        item { SectionTitle("客户端接入") }
+        item {
+            SectionCard {
+                CopyRow("OpenAI Base URL", "http://127.0.0.1:${GatewayService.PORT}/v1")
+                Divider(Modifier.padding(vertical = 10.dp), color = Line)
+                CopyRow("Anthropic Base URL", "http://127.0.0.1:${GatewayService.PORT}")
+                Divider(Modifier.padding(vertical = 10.dp), color = Line)
+                CopyRow("局域网地址", "http://${localIp() ?: "127.0.0.1"}:${GatewayService.PORT}")
+                Divider(Modifier.padding(vertical = 10.dp), color = Line)
+                Text("API Key", color = Muted, fontSize = 13.sp)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    if (s?.config?.authRequired == true) "已设置（需鉴权）" else "未设置（免鉴权）",
+                    fontSize = 15.sp,
+                )
+            }
+        }
+
+        if (ui.error != null) {
+            item {
+                SectionCard(background = RedSoft) {
+                    Text(ui.error, color = Red, fontSize = 13.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BrandHeader() {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            Modifier.size(44.dp).background(Blue, RoundedCornerShape(12.dp)),
+            contentAlignment = Alignment.Center,
+        ) { Icon(Icons.Filled.Bolt, null, tint = Color.White) }
+        Spacer(Modifier.width(12.dp))
+        Column {
+            Text("Loomy2API", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Text("本地 API 网关 · 账号池调度", color = Muted, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun SectionTitle(text: String) {
+    Text(text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+}
+
+@Composable
+private fun StatCard(label: String, value: String, modifier: Modifier = Modifier) {
+    Card(
+        modifier = modifier,
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = CardBg),
+        elevation = CardDefaults.cardElevation(0.dp),
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Text(value, fontSize = 21.sp, fontWeight = FontWeight.Bold)
+            Text(label, color = Muted, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun SectionCard(
+    modifier: Modifier = Modifier,
+    background: Color = CardBg,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = background),
+        elevation = CardDefaults.cardElevation(0.dp),
+    ) {
+        Column(Modifier.padding(16.dp), content = content)
+    }
+}
+
+@Composable
+private fun CopyRow(label: String, value: String) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(label, color = Muted, fontSize = 13.sp)
+            Spacer(Modifier.height(3.dp))
+            Text(value, fontSize = 14.sp, fontFamily = FontFamily.Monospace,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        TextButton(onClick = {
+            val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                    as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText(label, value))
+            android.widget.Toast.makeText(ctx, "已复制", android.widget.Toast.LENGTH_SHORT).show()
+        }) { Text("复制", color = Blue) }
+    }
+}
+
+// ================================================================ accounts
+
+@Composable
+private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
+    var selected by remember { mutableStateOf<AccountView?>(null) }
+    var showAdd by remember { mutableStateOf(false) }
+    var showImport by remember { mutableStateOf(false) }
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    val accounts = ui.state?.accounts.orEmpty()
+
+    // Export via SAF so the file lands where the user picks (Downloads etc.)
+    // rather than in an app-private folder they cannot find.
+    val exportLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.CreateDocument(
+            "application/json")
+    ) { uri ->
+        if (uri != null) {
+            scope.launch {
+                val json = vm.exportAccounts() ?: return@launch
+                runCatching {
+                    withContext(Dispatchers.IO) {
+                        ctx.contentResolver.openOutputStream(uri)?.use {
+                            it.write(json.toByteArray(Charsets.UTF_8))
+                        } ?: throw IllegalStateException("无法写入文件")
+                    }
+                }.onSuccess {
+                    android.widget.Toast.makeText(ctx, "账号已导出（含明文 session，请妥善保管）",
+                        android.widget.Toast.LENGTH_LONG).show()
+                }.onFailure {
+                    android.widget.Toast.makeText(ctx, "导出失败：${it.message}",
+                        android.widget.Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+        LazyColumn(
+            contentPadding = PaddingValues(16.dp, 16.dp, 16.dp, 90.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("账号", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = { showImport = true }) { Text("导入") }
+                    TextButton(onClick = {
+                        exportLauncher.launch("loomy2api-accounts-${SimpleDateFormat(
+                            "yyyyMMdd-HHmm", Locale.US).format(Date())}.json")
+                    }) { Text("导出") }
+                    TextButton(onClick = { vm.refreshAll() }) { Text("刷新") }
+                }
+                Text("共 ${accounts.size} 个账号，可用 ${accounts.count { it.healthy }} 个",
+                    color = Muted, fontSize = 13.sp)
+            }
+
+            item {
+                SectionCard {
+                    Text("积分", color = Muted, fontSize = 13.sp)
+                    Spacer(Modifier.height(10.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { vm.refreshQuota() },
+                            shape = RoundedCornerShape(10.dp),
+                        ) { Text("刷新额度") }
+                        OutlinedButton(
+                            onClick = { vm.refreshModels() },
+                            shape = RoundedCornerShape(10.dp),
+                        ) { Text("刷新模型") }
+                    }
+                }
+            }
+
+            items(accounts, key = { it.name }) { acc ->
+                AccountCard(acc, onClick = { selected = acc },
+                    onRefreshQuota = { vm.refreshQuota() })
+            }
+        }
+
+        Button(
+            onClick = { showAdd = true },
+            modifier = Modifier.align(Alignment.BottomEnd)
+                .padding(end = 18.dp, bottom = 18.dp)
+                .height(52.dp),
+            shape = RoundedCornerShape(16.dp),
+        ) {
+            Icon(Icons.Filled.Add, null)
+            Spacer(Modifier.width(6.dp))
+            Text("添加账号", fontSize = 15.sp)
+        }
+    }
+
+    // Re-resolve the selection against the latest state: after an action
+    // (disable, renew, …) the dialog must show the new values instead of the
+    // snapshot taken when it was opened.
+    selected?.let { chosen ->
+        val fresh = accounts.firstOrNull { it.name == chosen.name } ?: chosen
+        AccountDialog(vm, fresh, onDismiss = { selected = null })
+    }
+    if (showAdd) {
+        AddAccountDialog(vm, onDismiss = { showAdd = false })
+    }
+    if (showImport) {
+        ImportDialog(vm, onDismiss = { showImport = false })
+    }
+}
+
+@Composable
+private fun AccountCard(acc: AccountView, onClick: () -> Unit,
+                        onRefreshQuota: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = CardBg),
+        elevation = CardDefaults.cardElevation(0.dp),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(9.dp).background(
+                        if (acc.healthy) Green else if (acc.inCooldown) Amber else Red,
+                        RoundedCornerShape(50))
+                )
+                Spacer(Modifier.width(9.dp))
+                Text(acc.name, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.weight(1f))
+                StatusChip(acc)
+            }
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "可用 ${acc.available ?: "—"} · 余额 ${acc.balance ?: "—"} · 累计耗 ${acc.pointsUsed}",
+                color = Muted, fontSize = 13.sp,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "请求 ${acc.requests} · 失败 ${acc.failures}"
+                    + (acc.sessionDaysLeft?.let { " · 剩余 ${"%.1f".format(it)} 天" } ?: ""),
+                color = Muted, fontSize = 12.sp,
+            )
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+                ActionLink("管理") { onClick() }
+                // direct action: the card link used to just open the dialog
+                ActionLink("刷额度") { onRefreshQuota() }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusChip(acc: AccountView) {
+    val (bg, fg) = when {
+        !acc.enabled -> Line to Muted
+        acc.inCooldown -> AmberSoft to Amber
+        !acc.hasSession -> RedSoft to Red
+        acc.sessionDaysLeft != null && acc.sessionDaysLeft < 3 -> AmberSoft to Amber
+        else -> GreenSoft to Green
+    }
+    Box(
+        Modifier.background(bg, RoundedCornerShape(20.dp)).padding(horizontal = 10.dp, vertical = 4.dp)
+    ) { Text(acc.statusLabel, color = fg, fontSize = 12.sp) }
+}
+
+@Composable
+private fun ActionLink(text: String, onClick: () -> Unit) {
+    Text(text, color = Blue, fontSize = 14.sp, modifier = Modifier.clickable(onClick = onClick))
+}
+
+// ================================================================ dialogs
+
+@Composable
+private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () -> Unit) {
+    var msg by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = CardBg,
+        shape = RoundedCornerShape(18.dp),
+        title = {
+            Column {
+                Text(acc.name, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Text(acc.loginidMasked, color = Muted, fontSize = 13.sp)
+            }
+        },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MiniStat("状态", acc.statusLabel, Modifier.weight(1f))
+                    MiniStat("可用积分", "${acc.available ?: "—"}", Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MiniStat("session 剩余",
+                        acc.sessionDaysLeft?.let { "%.1f 天".format(it) } ?: "—",
+                        Modifier.weight(1f))
+                    MiniStat("设备", acc.devid.ifBlank { "—" }, Modifier.weight(1f))
+                }
+                Spacer(Modifier.height(14.dp))
+
+                val actions = listOf(
+                    "查积分" to "quota", "每日签到" to "checkin",
+                    "新手任务" to "onboarding", "续期重登" to "renew",
+                    "换设备标识" to "identity",
+                    if (acc.enabled) "禁用" to "toggle" else "启用" to "toggle",
+                )
+                actions.chunked(2).forEach { pair ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                        pair.forEach { (label, kind) ->
+                            OutlinedButton(
+                                onClick = {
+                                    if (busy) return@OutlinedButton
+                                    busy = true
+                                    msg = "正在执行：$label…"
+                                    scope.launch {
+                                        try {
+                                            msg = vm.accountAction(kind, acc)
+                                        } finally {
+                                            busy = false   // never leave it spinning
+                                        }
+                                    }
+                                },
+                                enabled = !busy,
+                                modifier = Modifier.weight(1f),
+                                shape = RoundedCornerShape(10.dp),
+                            ) { Text(label, fontSize = 13.sp) }
+                        }
+                        if (pair.size == 1) Spacer(Modifier.weight(1f))
+                    }
+                }
+                OutlinedButton(
+                    onClick = {
+                        if (busy) return@OutlinedButton
+                        busy = true
+                        msg = "正在删除…"
+                        scope.launch {
+                            val result = try {
+                                vm.accountAction("remove", acc)
+                            } finally {
+                                busy = false
+                            }
+                            msg = result
+                            if (!result.startsWith("失败")) onDismiss()
+                        }
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Red),
+                ) { Text("删除账号", color = Red) }
+
+                if (busy) {
+                    Spacer(Modifier.height(12.dp))
+                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+                }
+                if (msg.isNotBlank()) {
+                    Spacer(Modifier.height(12.dp))
+                    Text(msg, fontSize = 13.sp,
+                        color = when {
+                            msg.startsWith("失败") -> Red
+                            msg.startsWith("正在") -> Muted
+                            else -> Green
+                        })
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("关闭") }
+        },
+    )
+}
+
+@Composable
+private fun MiniStat(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(
+        modifier.background(Bg, RoundedCornerShape(10.dp)).padding(10.dp)
+    ) {
+        Text(label, color = Muted, fontSize = 11.sp)
+        Spacer(Modifier.height(2.dp))
+        Text(value, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
+            overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+private fun AddAccountDialog(vm: GatewayViewModel, onDismiss: () -> Unit) {
+    var mode by remember { mutableStateOf("password") }   // password | sms | session
+    var name by remember { mutableStateOf("") }
+    var phone by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var session by remember { mutableStateOf("") }
+    var login by remember { mutableStateOf(true) }
+    var code by remember { mutableStateOf("") }
+    var msgid by remember { mutableStateOf("") }
+    var msg by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        containerColor = CardBg,
+        shape = RoundedCornerShape(18.dp),
+        title = { Text("添加账号", fontWeight = FontWeight.Bold) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("password" to "密码登录", "sms" to "验证码", "session" to "session")
+                        .forEach { (key, label) ->
+                            ChipButton(mode == key, label, {
+                                mode = key; msg = ""
+                            })
+                        }
+                }
+                Spacer(Modifier.height(12.dp))
+
+                OutlinedTextField(name, { name = it }, label = { Text("名称") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(phone, { phone = it }, label = { Text("手机号") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                    modifier = Modifier.fillMaxWidth())
+
+                when (mode) {
+                    "password" -> {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(password, { password = it },
+                            label = { Text("密码") }, singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(6.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(login, { login = it })
+                            Text("添加后立即登录", fontSize = 13.sp)
+                        }
+                    }
+                    "sms" -> {
+                        Spacer(Modifier.height(8.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedTextField(code, { code = it },
+                                label = { Text("验证码") }, singleLine = true,
+                                keyboardOptions = KeyboardOptions(
+                                    keyboardType = KeyboardType.Number),
+                                modifier = Modifier.weight(1f))
+                            OutlinedButton(
+                                onClick = {
+                                    if (phone.isBlank()) { msg = "请先填手机号"; return@OutlinedButton }
+                                    busy = true
+                                    scope.launch {
+                                        try {
+                                            val (id, text) = vm.smsSend(phone)
+                                            msgid = id ?: ""
+                                            // clear the previous failure so a
+                                            // stale "msgid required" message
+                                            // does not sit under a fresh code
+                                            msg = text
+                                        } finally { busy = false }
+                                    }
+                                },
+                                enabled = !busy,
+                                shape = RoundedCornerShape(10.dp),
+                            ) { Text(if (msgid.isBlank()) "获取验证码" else "重新获取") }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text("验证码登录不需要密码，适合未设置密码的账号",
+                            color = Muted, fontSize = 11.sp)
+                    }
+                    "session" -> {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedTextField(session, { session = it },
+                            label = { Text("session") }, singleLine = true,
+                            modifier = Modifier.fillMaxWidth())
+                    }
+                }
+
+                if (busy) {
+                    Spacer(Modifier.height(10.dp))
+                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+                }
+                if (msg.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(msg, fontSize = 13.sp,
+                        color = if (msg.contains("失败")) Red else Green)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !busy,
+                onClick = {
+                    when {
+                        name.isBlank() && mode != "sms" -> msg = "请填写名称"
+                        mode == "sms" -> {
+                            when {
+                                phone.isBlank() -> { msg = "请填写手机号"; return@TextButton }
+                                msgid.isBlank() -> {
+                                    msg = "请先点「获取验证码」"
+                                    return@TextButton
+                                }
+                                code.isBlank() -> { msg = "请填写收到的验证码"; return@TextButton }
+                            }
+                            busy = true
+                            scope.launch {
+                                try {
+                                    vm.smsLogin(name, phone, code, msgid) { msg = it }
+                                } finally { busy = false }
+                            }
+                        }
+                        mode == "session" -> {
+                            if (session.isBlank()) { msg = "请填写 session"; return@TextButton }
+                            busy = true
+                            scope.launch {
+                                try {
+                                    vm.addAccount(name.ifBlank { phone }, phone, "", session,
+                                        false) { msg = it }
+                                } finally { busy = false }
+                            }
+                        }
+                        else -> {
+                            busy = true
+                            scope.launch {
+                                try {
+                                    vm.addAccount(name, phone, password, "", login) { msg = it }
+                                } finally { busy = false }
+                            }
+                        }
+                    }
+                },
+            ) { Text(if (mode == "sms") "登录" else "添加") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !busy) { Text("取消") }
+        },
+    )
+}
+
+@Composable
+private fun ImportDialog(vm: GatewayViewModel, onDismiss: () -> Unit) {
+    var text by remember { mutableStateOf("") }
+    var msg by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+
+    // SAF picker: lets the user pick an accounts.json from Downloads/Drive/etc.
+    val picker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            busy = true
+            scope.launch {
+                try {
+                    vm.importAccountsFromUri(uri) { result -> msg = result }
+                } finally {
+                    busy = false
+                }
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = { if (!busy) onDismiss() },
+        containerColor = CardBg,
+        shape = RoundedCornerShape(18.dp),
+        title = { Text("导入账号", fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                OutlinedButton(
+                    onClick = {
+                        picker.launch(arrayOf("application/json", "text/plain", "*/*"))
+                    },
+                    enabled = !busy,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                ) {
+                    Icon(Icons.Filled.FolderOpen, null)
+                    Spacer(Modifier.width(6.dp))
+                    Text("选择 accounts.json 文件")
+                }
+                Spacer(Modifier.height(12.dp))
+                Text("或直接粘贴内容（含 accounts 数组）", color = Muted, fontSize = 12.sp)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(text, { text = it }, minLines = 5,
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp))
+                if (busy) {
+                    Spacer(Modifier.height(10.dp))
+                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+                }
+                if (msg.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(msg, fontSize = 13.sp,
+                        color = if (msg.contains("失败")) Red else Green)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = !busy && text.isNotBlank(),
+                onClick = {
+                    busy = true
+                    scope.launch {
+                        try {
+                            vm.importAccounts(text) { msg = it }
+                        } finally { busy = false }
+                    }
+                },
+            ) { Text("粘贴导入") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !busy) { Text("关闭") }
+        },
+    )
+}
+
+// ================================================================ models
+
+@Composable
+private fun ModelsScreen(vm: GatewayViewModel, ui: UiState) {
+    var query by remember { mutableStateOf("") }
+    val models = ui.models.filter {
+        query.isBlank() || it.id.contains(query, true) || it.name.contains(query, true)
+    }
+    LazyColumn(
+        contentPadding = PaddingValues(16.dp, 16.dp, 16.dp, 24.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column {
+                    Text("模型", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                    Text("共 ${ui.models.size} 个 · 内置清单", color = Muted, fontSize = 13.sp)
+                }
+                Spacer(Modifier.weight(1f))
+                OutlinedButton(onClick = { vm.refreshModels() },
+                    shape = RoundedCornerShape(12.dp)) { Text("刷新") }
+            }
+        }
+        item {
+            OutlinedTextField(query, { query = it }, placeholder = { Text("搜索模型 id / 名称") },
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp))
+        }
+        item {
+            ui.state?.config?.defaultModel?.let { def ->
+                Box(
+                    Modifier.background(BlueSoft, RoundedCornerShape(12.dp))
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                ) {
+                    Row {
+                        Text("默认模型", color = Blue, fontSize = 13.sp)
+                        Spacer(Modifier.width(10.dp))
+                        Text(def, color = Blue, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+        items(models, key = { it.id }) { m -> ModelCard(m) }
+    }
+}
+
+@Composable
+private fun ModelCard(m: ModelView) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (m.isDefault) BlueSoft else CardBg),
+        elevation = CardDefaults.cardElevation(0.dp),
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(m.name.ifBlank { m.id }, fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                if (m.isDefault) Text("默认", color = Blue, fontSize = 12.sp)
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(m.id, color = Muted, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+            Spacer(Modifier.height(10.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Chip("x${m.multiplier ?: "—"}")
+                m.contextLength?.let { Chip("上下文 ${formatTokens(it)}") }
+                Chip(capabilityText(m))
+            }
+        }
+    }
+}
+
+@Composable
+private fun Chip(text: String) {
+    Box(Modifier.background(Bg, RoundedCornerShape(8.dp))
+        .padding(horizontal = 9.dp, vertical = 5.dp)) {
+        Text(text, color = Muted, fontSize = 11.sp)
+    }
+}
+
+private fun capabilityText(m: ModelView): String {
+    val caps = mutableListOf<String>()
+    if (m.vision) caps += "image"
+    if (m.reasoning) caps += "think"
+    if (m.tools) caps += "tools"
+    return if (caps.isEmpty()) "text" else "text/" + caps.joinToString("/")
+}
+
+// ================================================================ records
+
+@Composable
+private fun RecordsScreen(vm: GatewayViewModel, ui: UiState) {
+    var filter by remember { mutableStateOf("all") }
+    var pane by remember { mutableStateOf("calls") }   // calls | log
+    val rows = when (filter) {
+        "ok" -> ui.records.filter { it.ok }
+        "fail" -> ui.records.filter { !it.ok }
+        else -> ui.records
+    }
+
+    if (pane == "log") {
+        RunLogPane(vm, ui, onSwitch = { pane = "calls" })
+        return
+    }
+    LazyColumn(
+        contentPadding = PaddingValues(16.dp, 16.dp, 16.dp, 24.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column {
+                    Text("记录", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                    Text("调用与请求日志", color = Muted, fontSize = 13.sp)
+                }
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = { vm.refreshRecords() }) { Text("刷新") }
+            }
+        }
+        item {
+            // segmented control: call records vs raw gateway log
+            Row(Modifier.fillMaxWidth()) {
+                SegmentedButton("调用记录", pane == "calls",
+                    Modifier.weight(1f)) { pane = "calls" }
+                SegmentedButton("运行日志", pane == "log",
+                    Modifier.weight(1f)) { pane = "log" }
+            }
+        }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ChipButton(filter == "all", "全部", { filter = "all" })
+                ChipButton(filter == "ok", "成功", { filter = "ok" })
+                ChipButton(filter == "fail", "失败", { filter = "fail" })
+            }
+        }
+        if (rows.isEmpty()) {
+            item {
+                SectionCard {
+                    Text(
+                        if (ui.records.isEmpty()) "暂无记录。发起一次 API 请求后会显示在这里。"
+                        else "没有符合条件的记录。",
+                        color = Muted, fontSize = 13.sp,
+                    )
+                }
+            }
+        }
+        // include the index: two calls in the same second to the same model
+        // would otherwise collide and crash the lazy list
+        itemsIndexed(rows) { i, r ->
+            RecordCard(r)
+        }
+    }
+}
+
+@Composable
+private fun SegmentedButton(text: String, selected: Boolean, modifier: Modifier = Modifier,
+                            onClick: () -> Unit) {
+    Box(
+        modifier
+            .padding(2.dp)
+            .background(if (selected) CardBg else Color.Transparent, RoundedCornerShape(20.dp))
+            .clickable(onClick = onClick)
+            .padding(vertical = 9.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(text, fontSize = 14.sp,
+            color = if (selected) Blue else Muted,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+    }
+}
+
+@Composable
+private fun RunLogPane(vm: GatewayViewModel, ui: UiState, onSwitch: () -> Unit) {
+    val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+
+    LaunchedEffect(Unit) { vm.refreshLog() }
+    // keep tailing while this pane is open
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(5000)
+            vm.refreshLog()
+        }
+    }
+    // jump to the newest line whenever the log grows
+    LaunchedEffect(ui.logLines.size) {
+        if (ui.logLines.isNotEmpty()) {
+            listState.scrollToItem(ui.logLines.lastIndex)
+        }
+    }
+
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column {
+                Text("记录", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                Text("调用与请求日志", color = Muted, fontSize = 13.sp)
+            }
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = { vm.refreshLog() }) { Text("刷新") }
+        }
+        Spacer(Modifier.height(10.dp))
+        Row(Modifier.fillMaxWidth()) {
+            SegmentedButton("调用记录", false, Modifier.weight(1f)) { onSwitch() }
+            SegmentedButton("运行日志", true, Modifier.weight(1f)) {}
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(ui.logPath, color = Muted, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+            maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Spacer(Modifier.height(8.dp))
+        Card(
+            Modifier.fillMaxSize(),
+            shape = RoundedCornerShape(14.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF0B0D11)),
+        ) {
+            if (ui.logLines.isEmpty()) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("暂无日志", color = Muted, fontSize = 13.sp)
+                }
+            } else {
+                LazyColumn(
+                    state = listState,
+                    contentPadding = PaddingValues(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    itemsIndexed(ui.logLines) { _, line ->
+                        Text(
+                            line,
+                            color = when {
+                                line.contains("[error]") || line.contains("失败") -> Color(0xFFFF8A8A)
+                                line.contains("[warn]") -> Color(0xFFF5C26B)
+                                line.contains("http=200") -> Color(0xFF8FD9A8)
+                                else -> Color(0xFFB9C2D4)
+                            },
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ChipButton(selected: Boolean, text: String, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .background(if (selected) Blue else CardBg, RoundedCornerShape(20.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp)
+    ) {
+        Text(text, color = if (selected) Color.White else Muted, fontSize = 13.sp)
+    }
+}
+
+@Composable
+private fun RecordCard(r: CallRecord) {
+    val (bg, fg) = if (r.ok) GreenSoft to Green else RedSoft to Red
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = CardBg),
+        elevation = CardDefaults.cardElevation(0.dp),
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.background(bg, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)) {
+                    Text(if (r.ok) "成功" else "失败", color = fg, fontSize = 12.sp)
+                }
+                Spacer(Modifier.width(10.dp))
+                Text(r.model, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(formatTime(r.ts), color = Muted, fontSize = 11.sp)
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "${r.kind}${if (r.stream) " · stream" else ""} · ${"%.1f".format(r.seconds)}s"
+                    + " · ${r.tokens} tok · ${r.points} 分",
+                color = Muted, fontSize = 12.sp,
+            )
+            Spacer(Modifier.height(3.dp))
+            Text("账号：${r.account}", color = Muted, fontSize = 12.sp)
+            if (r.error.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Text(r.error, color = Red, fontSize = 11.sp, maxLines = 3,
+                    overflow = TextOverflow.Ellipsis)
+            }
+        }
+    }
+}
+
+// ================================================================ settings
+
+@Composable
+private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
+    val cfg = ui.state?.config
+    var strategy by remember(cfg) { mutableStateOf(cfg?.strategy ?: "balance") }
+    var proxy by remember(cfg) { mutableStateOf(cfg?.proxy ?: "") }
+    var apiKeys by remember(cfg) { mutableStateOf(cfg?.apiKeys?.joinToString(",") ?: "") }
+    var logRequests by remember(cfg) { mutableStateOf(cfg?.logRequests ?: true) }
+    var timeout by remember(cfg) { mutableStateOf("${cfg?.timeout ?: 1200}") }
+    var cooldown by remember(cfg) { mutableStateOf("${cfg?.cooldownSeconds ?: 300}") }
+    var msg by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+            .padding(16.dp, 16.dp, 16.dp, 32.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        Text("设置", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+
+        SectionTitle("调度")
+        SectionCard {
+            Text("选号策略", color = Muted, fontSize = 13.sp)
+            Spacer(Modifier.height(10.dp))
+            val options = listOf(
+                "balance" to "余额均衡", "round_robin" to "顺序轮询",
+                "lru" to "最久未用", "weighted" to "加权随机",
+            )
+            options.chunked(2).forEach { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                    row.forEach { (key, label) ->
+                        StrategyTile(label, key, strategy == key, Modifier.weight(1f)) {
+                            strategy = key
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            NumberField("上游超时（秒）", timeout) { timeout = it }
+            Spacer(Modifier.height(8.dp))
+            NumberField("冷却时间（秒）", cooldown) { cooldown = it }
+        }
+
+        SectionTitle("网络与安全")
+        SectionCard {
+            Text("监听范围", color = Muted, fontSize = 13.sp)
+            Spacer(Modifier.height(8.dp))
+            Text("当前：${cfg?.host ?: "127.0.0.1"}:${GatewayService.PORT}",
+                fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                if (cfg?.host == "0.0.0.0") "同一 Wi-Fi 下的电脑/其他设备可直连网关"
+                else "仅本机可访问（在 config.json 把 host 改为 0.0.0.0 可开放局域网）",
+                color = Muted, fontSize = 12.sp,
+            )
+            Spacer(Modifier.height(14.dp))
+            OutlinedTextField(proxy, { proxy = it },
+                label = { Text("全局代理（留空直连）") },
+                placeholder = { Text("http://host:port") },
+                singleLine = true, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(apiKeys, { apiKeys = it },
+                label = { Text("API Keys（逗号分隔，留空免鉴权）") },
+                placeholder = { Text("sk-xxx,sk-yyy") },
+                singleLine = true, modifier = Modifier.fillMaxWidth())
+        }
+
+        SectionTitle("其他")
+        SectionCard {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("记录请求日志", fontSize = 15.sp)
+                    Text("写入用量台账与运行日志", color = Muted, fontSize = 12.sp)
+                }
+                Switch(logRequests, { logRequests = it })
+            }
+        }
+
+        Button(
+            onClick = {
+                scope.launch {
+                    vm.saveConfig(mapOf(
+                        "strategy" to strategy,
+                        "proxy" to proxy,
+                        "api_keys" to apiKeys.split(",").map { it.trim() }.filter { it.isNotEmpty() },
+                        "log_requests" to logRequests,
+                        "timeout" to (timeout.toIntOrNull() ?: 1200),
+                        "cooldown_seconds" to (cooldown.toIntOrNull() ?: 300),
+                    )) { msg = it }
+                }
+            },
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            shape = RoundedCornerShape(12.dp),
+        ) { Text("保存配置", fontSize = 15.sp) }
+
+        if (msg.isNotBlank()) {
+            Text(msg, fontSize = 13.sp, color = if (msg.contains("失败")) Red else Green)
+        }
+
+        Spacer(Modifier.height(6.dp))
+        Text("Loomy2API for Android · 核心链路移植版", color = Muted, fontSize = 12.sp)
+        Text("账号数据与配置保存在应用私有目录，卸载即清除。",
+            color = Muted, fontSize = 12.sp)
+    }
+}
+
+@Composable
+private fun StrategyTile(label: String, key: String, selected: Boolean,
+                         modifier: Modifier, onClick: () -> Unit) {
+    Column(
+        modifier
+            .background(if (selected) BlueSoft else Color.Transparent, RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .padding(12.dp)
+    ) {
+        Text(label, fontSize = 14.sp,
+            color = if (selected) Blue else Ink,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+        Text(key, color = Muted, fontSize = 11.sp)
+    }
+}
+
+@Composable
+private fun NumberField(label: String, value: String, onChange: (String) -> Unit) {
+    OutlinedTextField(value, onChange, label = { Text(label) },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+        modifier = Modifier.fillMaxWidth())
+}
+
+// ================================================================ helpers
+
+private fun formatTokens(v: Int): String = when {
+    v >= 1_000_000 -> "%.1fM".format(v / 1_000_000.0)
+    v >= 1_000 -> "%.1fK".format(v / 1_000.0)
+    else -> "$v"
+}
+
+private fun formatTime(ts: Long): String =
+    SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(ts * 1000))
+
+private fun localIp(): String? {
+    return try {
+        java.net.NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }
+            .firstOrNull {
+                !it.isLoopbackAddress && it is java.net.Inet4Address
+            }?.hostAddress
+    } catch (_: Exception) {
+        null
+    }
+}

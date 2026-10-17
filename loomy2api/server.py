@@ -31,6 +31,27 @@ class StreamStalled(Exception):
         self.kind = kind
 
 
+class _ContentRejected:
+    """Stand-in for an upstream response when content inspection said no.
+
+    ``_open_stream`` normally hands back the live ``http.client`` response so
+    the caller can read and forward the error.  A content rejection is
+    terminal — no other account will accept the same body — so it is returned
+    as this tiny value object carrying the already-read status and body, which
+    the callers handle exactly like a drained response.
+    """
+
+    def __init__(self, status: int, data: bytes):
+        self.status = status
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+    def close(self) -> None:
+        pass
+
+
 class Logger:
     """Timestamped file+console logger (never raises)."""
 
@@ -65,6 +86,69 @@ class Gateway:
         self.panel = Panel(self)
         self.models: list = []
         self._models_lock = threading.Lock()
+        # Rolling call records for the mobile "记录" tab.  Kept in memory: the
+        # gateway is a long-lived process and this is diagnostics, not an audit
+        # log — the file log remains the durable record.
+        self.calls: list = []
+        self._calls_lock = threading.Lock()
+        self.totals: Dict[str, Any] = {"requests": 0, "tokens": 0,
+                                       "prompt_tokens": 0, "completion_tokens": 0,
+                                       "points": 0, "failures": 0}
+
+    # -- call records ----------------------------------------------------
+
+    def record_call(self, *, account: str, model: str, status: int,
+                    seconds: float, usage: Optional[Dict[str, Any]] = None,
+                    kind: str = "chat", stream: bool = False,
+                    error: str = "", loginid: str = "") -> None:
+        """Append one request to the rolling record list (bounded, thread-safe)."""
+        usage = usage or {}
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        points = int(usage.get("points_consumed") or 0)
+        entry = {
+            "ts": int(time.time()),
+            "account": account,
+            "loginid": loginid,
+            "model": model,
+            "status": status,
+            "ok": 200 <= status < 300,
+            "kind": kind,
+            "stream": bool(stream),
+            "seconds": round(float(seconds), 2),
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "tokens": prompt + completion,
+            "points": points,
+            "error": (error or "")[:300],
+        }
+        with self._calls_lock:
+            self.calls.append(entry)
+            if len(self.calls) > 2000:                 # keep the newest 2000
+                del self.calls[:-2000]
+            self.totals["requests"] += 1
+            self.totals["prompt_tokens"] += prompt
+            self.totals["completion_tokens"] += completion
+            self.totals["tokens"] += prompt + completion
+            self.totals["points"] += points
+            if not entry["ok"]:
+                self.totals["failures"] += 1
+
+    def call_records(self, limit: int = 100, *, status: str = "",
+                     account: str = "") -> Dict[str, Any]:
+        with self._calls_lock:
+            rows = list(self.calls)
+        if status == "ok":
+            rows = [r for r in rows if r["ok"]]
+        elif status == "fail":
+            rows = [r for r in rows if not r["ok"]]
+        if account:
+            rows = [r for r in rows if r["account"] == account
+                    or r["loginid"] == account]
+        rows.reverse()                                # newest first
+        return {"ok": True, "total": len(rows),
+                "rows": rows[:max(1, min(int(limit or 100), 2000))],
+                "totals": dict(self.totals)}
 
     # -- model catalogue -------------------------------------------------
 
@@ -128,6 +212,18 @@ class Handler(BaseHTTPRequestHandler):
     #: Statuses where retrying is pointless (the request itself is wrong).
     FATAL_REQUEST = (400, 404, 422)
 
+    #: 403 sub-types that are *not* the account's fault — see
+    #: :data:`loomy2api.constants.CONTENT_FAULT_MARKERS`.
+    CONTENT_FAULT_MARKERS = C.CONTENT_FAULT_MARKERS
+
+    @classmethod
+    def _content_fault(cls, status: int, data: bytes) -> bool:
+        """True when a 403 came from content inspection, not authentication."""
+        if status != 403:
+            return False
+        body = data[:500].decode("utf-8", "replace")
+        return any(marker in body for marker in cls.CONTENT_FAULT_MARKERS)
+
     def setup(self):                               # noqa: D102
         super().setup()
         self._body_read = False
@@ -177,6 +273,13 @@ class Handler(BaseHTTPRequestHandler):
         ``thinking_seconds`` bounds how long a reasoning-only stream may run.
         A looping model keeps sending reasoning deltas, so this is checked
         between reads, not via the socket timeout.
+
+        ``read1`` rather than ``read``: ``HTTPResponse.read(n)`` is backed by a
+        ``BufferedReader`` and blocks until *n* bytes arrive (or EOF), so a
+        model that emits a token at a time would reach the client in 4 KiB
+        bursts — the "whole sentence appears at once" effect.  ``read1``
+        returns as soon as any data is available, preserving the upstream's
+        token-by-token cadence.
         """
         start = time.time()
         if (not saw_output and thinking_seconds and content_started
@@ -185,6 +288,9 @@ class Handler(BaseHTTPRequestHandler):
         if conn is not None and getattr(conn, "sock", None) is not None:
             conn.sock.settimeout(idle_seconds)
         try:
+            read1 = getattr(resp, "read1", None)
+            if read1 is not None:
+                return read1(4096)
             return resp.read(4096)
         except socket.timeout as exc:
             raise StreamStalled(idle_seconds, "idle") from exc
@@ -366,6 +472,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/panel/points":
                 name = self._query("name")
                 return self._json(200, self.gateway.panel.points({"name": name}))
+            if path == "/api/panel/records":
+                return self._json(200, self.gateway.call_records(
+                    limit=self._query_int("limit", 100),
+                    status=self._query("status"),
+                    account=self._query("account")))
+            if path == "/api/panel/export":
+                return self._json(200, self.gateway.panel.export_accounts())
             if path == "/favicon.ico":
                 return self._error(404, "no favicon")
             return self._error(404, f"未知路径 / unknown path: {self.path}")
@@ -435,6 +548,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/accounts/renew": panel.renew_account,
             "/api/panel/accounts/identity": panel.identity,
             "/api/panel/refresh": lambda _p: panel.refresh(_p),
+            "/api/panel/config": panel.update_config,
+            "/api/panel/export": lambda _p: panel.export_accounts(),
         }
         handler = handlers.get(path)
         if handler is None:
@@ -508,9 +623,10 @@ class Handler(BaseHTTPRequestHandler):
         acc = gw.pool.acquire()
         status, headers, data = gw.models_client.call(
             acc.session, suffix, json.loads(raw.decode("utf-8")) if raw else {})
-        if status >= 400:
-            gw.pool.report_failure(acc, status, data[:200].decode("utf-8", "replace"))
-        else:
+        if status >= 400 and not self._content_fault(status, data):
+            gw.pool.report_failure(acc, status,
+                                   data[:200].decode("utf-8", "replace"))
+        elif status < 400:
             gw.pool.report_success(acc)
         self.send_response(status)
         self.send_header("Content-Type",
@@ -570,10 +686,26 @@ class Handler(BaseHTTPRequestHandler):
                     obj = None
                 usage = (obj or {}).get("usage") or {}
                 gw.pool.report_success(acc, usage)
-                gw.log(f"[call] {acc.name} {model} {time.time() - started:.1f}s "
+                elapsed = time.time() - started
+                gw.record_call(account=acc.name, loginid=acc.loginid, model=model,
+                               status=200, seconds=elapsed, usage=usage,
+                               kind="chat", stream=False)
+                gw.log(f"[call] {acc.name} {model} {elapsed:.1f}s "
                        f"http=200 {human_usage(usage)}")
                 return self._json(200, obj)
             last = (status, data)
+            gw.record_call(account=acc.name, loginid=acc.loginid, model=model,
+                           status=status, seconds=time.time() - started,
+                           kind="chat", stream=False,
+                           error=data[:300].decode("utf-8", "replace"))
+            if self._content_fault(status, data):
+                # the request body was rejected by content inspection: the
+                # account and its session are fine, and every other account
+                # would reject the identical payload too — so stop here.
+                gw.log(f"[call] {acc.name} {model} http={status} → 内容审核拒绝"
+                       f"（账号无问题，不冷却、不换账号）："
+                       f"{data[:200].decode('utf-8', 'replace')}")
+                break
             if status in self.ACCOUNT_FAULT:
                 gw.log(f"[call] {acc.name} {model} http={status} → 账号问题，换账号重试")
                 gw.pool.report_failure(acc, status,
@@ -616,6 +748,11 @@ class Handler(BaseHTTPRequestHandler):
                 return acc, conn, resp
             data = resp.read()
             conn.close()
+            if self._content_fault(resp.status, data):
+                gw.log(f"[{log_tag}] {acc.name} {model} stream http={resp.status}"
+                       f" → 内容审核拒绝（账号无问题，不冷却、不换账号）："
+                       f"{data[:200].decode('utf-8', 'replace')}")
+                return None, None, _ContentRejected(resp.status, data)
             if resp.status in self.ACCOUNT_FAULT:
                 gw.log(f"[{log_tag}] {acc.name} {model} stream http={resp.status}"
                        f" → 账号问题，换账号重试")
@@ -751,6 +888,7 @@ class Handler(BaseHTTPRequestHandler):
                 continue
 
             # cannot retry any more (or content already went out): close cleanly
+            reason = ""
             if not finished:
                 reason = (f"流中断（{stalled.kind}）" if stalled
                           else "上游未发送结束事件")
@@ -767,7 +905,12 @@ class Handler(BaseHTTPRequestHandler):
                        f"{'，已输出部分内容' if saw_content else ''} → 补发终止事件")
                 self._terminate_sse(reason)
             gw.pool.report_success(acc, usage)
-            gw.log(f"[call] {acc.name} {model} {time.time() - started:.1f}s "
+            elapsed = time.time() - started
+            gw.record_call(account=acc.name, loginid=acc.loginid, model=model,
+                           status=200, seconds=elapsed, usage=usage,
+                           kind="chat", stream=True,
+                           error="" if finished else reason)
+            gw.log(f"[call] {acc.name} {model} {elapsed:.1f}s "
                    f"http=200 {human_usage(usage)} stream"
                    + (f" attempt={attempt + 1}" if attempt else "")
                    + (f" dropped={dropped}" if dropped else ""))
@@ -888,10 +1031,23 @@ class Handler(BaseHTTPRequestHandler):
                 obj = json.loads(data.decode("utf-8"))
                 usage = obj.get("usage") or {}
                 gw.pool.report_success(acc, usage)
-                gw.log(f"[messages] {acc.name} {model} {time.time() - started:.1f}s "
+                elapsed = time.time() - started
+                gw.record_call(account=acc.name, loginid=acc.loginid, model=model,
+                               status=200, seconds=elapsed, usage=usage,
+                               kind="messages", stream=False)
+                gw.log(f"[messages] {acc.name} {model} {elapsed:.1f}s "
                        f"http=200 {human_usage(usage)}")
                 return self._json(200, anth.openai_to_anthropic(obj, model))
             last = (status, data)
+            gw.record_call(account=acc.name, loginid=acc.loginid, model=model,
+                           status=status, seconds=time.time() - started,
+                           kind="messages", stream=False,
+                           error=data[:300].decode("utf-8", "replace"))
+            if self._content_fault(status, data):
+                gw.log(f"[messages] {acc.name} {model} http={status} → 内容审核拒绝"
+                       f"（账号无问题，不冷却、不换账号）："
+                       f"{data[:200].decode('utf-8', 'replace')}")
+                break
             if status in self.ACCOUNT_FAULT:
                 gw.pool.report_failure(acc, status,
                                        data[:200].decode("utf-8", "replace"))
@@ -1033,7 +1189,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._terminate_anthropic("upstream stream interrupted",
                                           broken_tool=broken)
             gw.pool.report_success(acc, translator.usage)
-            gw.log(f"[messages] {acc.name} {model} {time.time() - started:.1f}s "
+            elapsed = time.time() - started
+            gw.record_call(account=acc.name, loginid=acc.loginid, model=model,
+                           status=200, seconds=elapsed, usage=translator.usage,
+                           kind="messages", stream=True)
+            gw.log(f"[messages] {acc.name} {model} {elapsed:.1f}s "
                    f"http=200 {human_usage(translator.usage)} stream"
                    + (f" attempt={attempt + 1}" if attempt else ""))
             return

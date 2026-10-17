@@ -66,7 +66,10 @@
   .hint{color:var(--muted);font-size:12px;margin-top:8px}
   details summary{cursor:pointer;color:var(--muted);font-size:12px}
   /* account action modal */
-  #modalMask{position:fixed;inset:0;background:rgba(4,8,16,.62);z-index:8;
+  /* `inset` is Chrome 87+; the Android WebView on some phones is 81, where it
+     is dropped entirely and the overlay lands at the bottom of the document. */
+  #modalMask{position:fixed;top:0;right:0;bottom:0;left:0;
+    background:rgba(4,8,16,.62);z-index:8;
     display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:40px 14px}
   #modalMask.open{display:flex}
   #modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -80,7 +83,68 @@
   #modalBody .ops{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
   #modalBody .ops button{height:32px;padding:0 12px;font-size:12px}
   #modalBody .hint{margin-top:10px}
-  @media (max-width:760px){table{display:block;overflow-x:auto;white-space:nowrap}}
+  /* ---- narrow screens (phones) ------------------------------------------
+     The old rule just made the tables horizontally scrollable, which pushed
+     the action column off-screen — on a 393 px viewport the 668 px table put
+     the manage button at x=642, so taps looked like they did nothing.
+     Below 760 px we render each row as a self-contained card instead. */
+  .mobile-only{display:none}
+  #pointsBody.collapsed{display:none}
+  @media (max-width:760px){
+    .mobile-only{display:inline-block}
+    /* flex `gap` is Chrome 84+; on WebView 81 it is ignored, so the fallback
+       margins below keep spacing (they are harmless where gap does work). */
+    .row > *{margin-right:8px;margin-bottom:8px}
+    .row > *:last-child{margin-right:0}
+    .wrap{padding:14px 12px 40px}
+    header{gap:10px}
+    h1{font-size:18px}
+    h1 span{display:none}
+    .row{gap:8px}
+    .cards{grid-template-columns:1fr 1fr;gap:8px}
+    .card{padding:10px 12px}
+    .card .v{font-size:17px}
+    section{padding:12px;margin-bottom:12px}
+    section h2{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+    section h2>span[style*="float"]{float:none !important;display:flex;gap:8px;width:100%}
+    button,input,select{height:40px;font-size:14px}   /* comfortable tap targets */
+    td .row button{height:34px}
+
+    /* tables → stacked cards */
+    table{display:block;width:100%}
+    thead{display:none}
+    tbody{display:block}
+    tbody tr{display:block;position:relative;
+      border:1px solid var(--line);border-radius:10px;
+      padding:10px 12px;margin-bottom:10px;background:var(--panel2)}
+    tbody tr:hover{background:var(--panel2)}
+    tbody td{display:flex;justify-content:space-between;gap:12px;
+      padding:4px 0;border:none;text-align:right;white-space:normal}
+    tbody td::before{content:attr(data-label);color:var(--muted);
+      font-size:12px;text-align:left;flex:0 0 auto}
+    tbody td:first-child{padding-top:0}
+    tbody td[data-label=""]::before,
+    tbody td.no-label::before{content:none}
+    /* the row itself opens the modal on phones, so the trailing button is
+       redundant — but keep it as an explicit, full-width action */
+    tbody td.act{padding-top:8px;margin-top:4px;border-top:1px solid var(--line)}
+    tbody td.act::before{content:none}
+    tbody td.act button{width:100%;height:38px}
+
+    /* modal becomes a bottom sheet */
+    #modalMask{padding:0;align-items:flex-end}
+    #modal{max-width:none;border-radius:14px 14px 0 0;max-height:88vh;overflow:auto}
+    #modalBody .cards{grid-template-columns:1fr 1fr}
+    #modalBody .ops{gap:8px}
+    #modalBody .ops button{flex:1 1 calc(50% - 4px);height:40px}
+
+    /* fixed toast must not run off the edge */
+    #toast{left:12px;right:12px;bottom:12px}
+    .toast{max-width:none}
+    pre#log{max-height:200px}
+    .grid{grid-template-columns:1fr}
+    #inviteWrap .row{gap:8px}
+  }
 </style>
 </head>
 <body>
@@ -138,8 +202,10 @@
   <section>
     <h2>积分与邀请码 <small id="pointsFor">points &amp; invites</small>
       <select id="pointsAccount" style="margin-left:10px;font-weight:normal"></select>
+      <button id="pointsToggle" class="mobile-only">展开</button>
       <button id="loadPoints" style="float:right">刷新</button>
     </h2>
+    <div id="pointsBody">
     <div class="cards" id="pointCards"></div>
     <div id="inviteWrap" style="margin-top:12px">
       <div class="hint" style="margin-bottom:6px">我的邀请码（每个可用 1 次，好友注册时填写可各得奖励）</div>
@@ -168,6 +234,7 @@
         <tbody id="ledgerRows"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
       </table>
     </details>
+    </div><!-- /pointsBody -->
   </section>
 
   <section>
@@ -258,15 +325,16 @@ function render(state) {
   LAST_STATE = state;
   $('rows').innerHTML = state.accounts.map(a => {
     const id = a.identity || {};
+    // data-label feeds the card layout on phones; the desktop table ignores it
     return '<tr onclick="openAccountModal(\'' + a.name + '\')" style="cursor:pointer">'
-      + '<td><b>' + a.name + '</b><div class="mono">' + (a.source === 'client' ? 'client 导入' : (a.mode === 'session' ? '仅 session' : '手机号+密码')) + '</div></td>'
-      + '<td class="mono">' + (a.loginid_masked || '—') + '</td>'
-      + '<td>' + badge(a) + '</td>'
-      + '<td>' + (a.session_days_left === null ? '—' : a.session_days_left.toFixed(1) + ' 天') + '</td>'
-      + '<td><b>' + num(a.available) + '</b><div class="mono">余额 ' + num(a.balance) + ' + 每日 ' + num(a.daily_balance) + '</div></td>'
-      + '<td>' + a.requests + '</td><td>' + a.points_used + '</td>'
-      + '<td class="mono" title="' + (id.campus_device_id || '') + '">' + (id.devid || '—') + '</td>'
-      + '<td><button onclick="event.stopPropagation();openAccountModal(\'' + a.name + '\')">管理</button></td></tr>';
+      + '<td data-label="账号"><b>' + a.name + '</b><div class="mono">' + (a.source === 'client' ? 'client 导入' : (a.mode === 'session' ? '仅 session' : '手机号+密码')) + '</div></td>'
+      + '<td data-label="手机号" class="mono">' + (a.loginid_masked || '—') + '</td>'
+      + '<td data-label="状态">' + badge(a) + '</td>'
+      + '<td data-label="剩余">' + (a.session_days_left === null ? '—' : a.session_days_left.toFixed(1) + ' 天') + '</td>'
+      + '<td data-label="可用积分"><span><b>' + num(a.available) + '</b><div class="mono">余额 ' + num(a.balance) + ' + 每日 ' + num(a.daily_balance) + '</div></span></td>'
+      + '<td data-label="请求">' + a.requests + '</td><td data-label="扣分">' + a.points_used + '</td>'
+      + '<td data-label="设备" class="mono" title="' + (id.campus_device_id || '') + '">' + (id.devid || '—') + '</td>'
+      + '<td class="act"><button onclick="event.stopPropagation();openAccountModal(\'' + a.name + '\')">管理</button></td></tr>';
   }).join('');
 }
 
@@ -281,6 +349,7 @@ function pickAndLoad(name) {
 }
 
 let LAST_STATE = null;
+let LOAD_RETRIES = 0;
 let MODAL_ACC = '';
 
 function openAccountModal(name) {
@@ -452,9 +521,17 @@ function bindImportFile() {
 async function load(refresh) {
   try {
     const state = await api('/api/panel/state' + (refresh ? '?refresh=1' : ''));
+    LOAD_RETRIES = 0;
     render(state);
   } catch (e) {
     toast('读取状态失败：' + e.message, 'err');
+    // The embedded app opens this page as soon as the process starts; the
+    // Python gateway may still be booting.  Retry a few times instead of
+    // leaving the tables stuck on "加载中…" until the 10 s auto-refresh.
+    if (!refresh && LOAD_RETRIES < 20) {
+      LOAD_RETRIES++;
+      setTimeout(() => load(), 500);
+    }
   }
 }
 
@@ -586,12 +663,12 @@ function renderModels(data) {
     const tag = m.is_default ? ' <span class="badge b-ok">上游默认</span>'
       : (m.default_model ? ' <span class="badge b-ok">本网关默认</span>' : '');
     return '<tr>'
-      + '<td class="mono"><b>' + m.id + '</b>' + tag + '</td>'
-      + '<td>' + m.name + '</td>'
-      + '<td>' + mult + '</td>'
-      + '<td class="mono">' + fmtTokens(m.context_length) + '</td>'
-      + '<td class="mono">' + fmtTokens(m.max_output_tokens) + '</td>'
-      + '<td>' + capChips(m) + '</td>'
+      + '<td data-label="模型 ID" class="mono"><span><b>' + m.id + '</b>' + tag + '</span></td>'
+      + '<td data-label="名称">' + m.name + '</td>'
+      + '<td data-label="倍率">' + mult + '</td>'
+      + '<td data-label="上下文" class="mono">' + fmtTokens(m.context_length) + '</td>'
+      + '<td data-label="最大输出" class="mono">' + fmtTokens(m.max_output_tokens) + '</td>'
+      + '<td data-label="能力">' + capChips(m) + '</td>'
       + '</tr>';
   }).join('');
 }
@@ -665,8 +742,11 @@ function renderPoints(data) {
     const when = r.created_at ? new Date(r.created_at * 1000).toLocaleString('zh-CN') : '—';
     const dir = r.direction === 'debit' ? '<span class="badge b-warn">支出</span>' : '<span class="badge b-ok">收入</span>';
     const pts = r.direction === 'debit' ? '-' + num(r.points) : '+' + num(r.points);
-    return '<tr><td class="mono">' + when + '</td><td>' + num(r.model) + '</td><td>' + dir
-      + '</td><td><b>' + pts + '</b></td><td class="mono">' + num(r.balance_after) + '</td></tr>';
+    return '<tr><td data-label="时间" class="mono">' + when + '</td>'
+      + '<td data-label="模型">' + num(r.model) + '</td>'
+      + '<td data-label="方向">' + dir + '</td>'
+      + '<td data-label="积分"><b>' + pts + '</b></td>'
+      + '<td data-label="余额" class="mono">' + num(r.balance_after) + '</td></tr>';
   }).join('');
 }
 
@@ -766,6 +846,12 @@ $('refresh').onclick = () => load(true).then(loadLog);
 $('loadLog').onclick = loadLog;
 $('loadModels').onclick = () => loadModels(true);
 $('loadPoints').onclick = loadPoints;
+$('pointsToggle').onclick = () => {
+  const body = $('pointsBody');
+  const open = body.classList.toggle('collapsed') === false;
+  $('pointsToggle').textContent = open ? '收起' : '展开';
+  if (open) loadPoints();
+};
 $('pointsAccount').onchange = loadPoints;
 $('applyInvite').onclick = applyInvite;
 $('doOnboarding').onclick = doOnboarding;
@@ -779,6 +865,12 @@ $('saveKey').onclick = () => {
   load(true); loadLog();
 };
 $('apiKey').value = KEY;
+
+// phones: the points/invite block is rarely needed and very tall — start collapsed
+if (window.matchMedia && window.matchMedia('(max-width:760px)').matches) {
+  $('pointsBody').classList.add('collapsed');
+  $('pointsToggle').textContent = '展开';
+}
 
 load(); loadLog(); loadModels(false); loadPoints();
 setInterval(() => { if ($('auto').checked) load(); }, 10000);
