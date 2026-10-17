@@ -30,12 +30,20 @@ class MainActivity : ComponentActivity() {
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
-        if (Build.VERSION.SDK_INT >= 31) {
+        // Battery optimisation is what kills the gateway a few minutes after the
+        // screen turns off on most Chinese ROMs.  Ask once, and only if the
+        // system actually lets us (some ROMs route this to a settings page).
+        if (Build.VERSION.SDK_INT >= 23) {
             val pm = getSystemService(android.os.PowerManager::class.java)
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
                 runCatching {
-                    startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    startActivity(Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                         Uri.parse("package:$packageName")))
+                }.onFailure {
+                    runCatching {
+                        startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                    }
                 }
             }
         }

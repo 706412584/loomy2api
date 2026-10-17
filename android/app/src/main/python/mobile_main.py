@@ -41,8 +41,50 @@ def _copy_asset_dir(mgr, asset_path: str, dest: str) -> None:
                 fin.close()
 
 
+#: Set once the HTTP server thread has been started.  Chaquopy keeps the
+#: interpreter alive across service restarts in the same process, so a second
+#: start_gateway() would otherwise try to bind the port twice and crash.
+_started = {"port": 0, "thread": None}
+_start_lock = threading.Lock()
+
+
+def _is_serving(port: int, timeout: float = 2.0) -> bool:
+    """Cheap liveness probe against our own loopback server."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/health", timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def restart_gateway(port: int = 17991) -> None:
+    """Called by the Android watchdog when /health stops answering.
+
+    The Python objects from the previous attempt are still in memory and cannot
+    be cleanly torn down (the HTTP server thread may be wedged), so we clear the
+    bookkeeping and start a fresh server thread.  The old socket is left to the
+    kernel; if it is still bound the new bind fails, which the caller sees as a
+    continued unhealthy state and retries.
+    """
+    global _started
+    with _start_lock:
+        _started = {"port": 0, "thread": None}
+    print("[mobile_main] restart requested", flush=True)
+    start_gateway(os.getcwd(), port)
+
+
 def start_gateway(files_dir: str, port: int = 17991) -> None:
-    """Start the gateway in a daemon thread; returns immediately."""
+    """Start the gateway in a daemon thread; returns immediately.
+
+    Idempotent: if this process is already serving on ``port`` the call is a
+    no-op, so a service restart (START_STICKY) does not try to bind twice.
+    """
+    with _start_lock:
+        if _started["port"] == port and _is_serving(port):
+            print("[mobile_main] gateway already serving; skip start", flush=True)
+            return
     os.chdir(files_dir)
 
     # 1. unpack the Python package from assets when the APK's copy is newer.
@@ -111,5 +153,9 @@ def start_gateway(files_dir: str, port: int = 17991) -> None:
     # let the panel persist settings back to the same file it read
     cfg["_config_file"] = cfg_path
 
-    t = threading.Thread(target=serve_mod.serve, args=(cfg,), daemon=True)
+    t = threading.Thread(target=serve_mod.serve, args=(cfg,), daemon=True,
+                         name="gateway-http")
     t.start()
+    with _start_lock:
+        _started["port"] = port
+        _started["thread"] = t

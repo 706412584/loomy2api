@@ -88,6 +88,35 @@ class GatewayViewModel : ViewModel() {
         }
     }
 
+    /**
+     * Ask the service to restart the Python HTTP server.  Used when the UI sees
+     * a stuck gateway; the watchdog normally does this on its own.
+     */
+    fun restartGateway() {
+        _ui.update { it.copy(loading = true, error = null) }
+        viewModelScope.launch {
+            val ctx = AssetBridge.appContext
+            if (ctx != null) {
+                GatewayService.start(ctx)
+                runCatching {
+                    // the service exposes the same call the watchdog uses
+                    GatewayService.instance?.let {
+                        com.chaquo.python.Python.getInstance()
+                            .getModule("mobile_main").callAttr("restart_gateway")
+                    }
+                }
+            }
+            val ok = Api.waitUntilReady(60_000)
+            _ui.update { it.copy(loading = false, ready = ok) }
+            if (ok) {
+                toast("网关已重启")
+                refreshAll()
+            } else {
+                toast("重启超时，请查看运行日志")
+            }
+        }
+    }
+
     fun refreshAll() {
         viewModelScope.launch {
             _ui.update { it.copy(loading = true) }
@@ -500,11 +529,18 @@ private fun HomeScreen(vm: GatewayViewModel, ui: UiState) {
                 }
                 Spacer(Modifier.height(14.dp))
                 if (ui.ready) {
-                    OutlinedButton(
-                        onClick = { vm.refreshAll() },
-                        modifier = Modifier.fillMaxWidth().height(46.dp),
-                        shape = RoundedCornerShape(12.dp),
-                    ) { Text("刷新状态") }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { vm.refreshAll() },
+                            modifier = Modifier.weight(1f).height(46.dp),
+                            shape = RoundedCornerShape(12.dp),
+                        ) { Text("刷新状态") }
+                        OutlinedButton(
+                            onClick = { vm.restartGateway() },
+                            modifier = Modifier.weight(1f).height(46.dp),
+                            shape = RoundedCornerShape(12.dp),
+                        ) { Text("重启网关") }
+                    }
                 } else {
                     Button(
                         onClick = { vm.startGateway() },
@@ -512,6 +548,8 @@ private fun HomeScreen(vm: GatewayViewModel, ui: UiState) {
                         shape = RoundedCornerShape(12.dp),
                     ) { Text("启动网关", fontSize = 15.sp) }
                 }
+                Spacer(Modifier.height(10.dp))
+                KeepAliveHint()
             }
         }
 
@@ -553,6 +591,49 @@ private fun HomeScreen(vm: GatewayViewModel, ui: UiState) {
                     Text(ui.error, color = Red, fontSize = 13.sp)
                 }
             }
+        }
+    }
+}
+
+/**
+ * Tells the user whether the OS will let the gateway keep running in the
+ * background.  Without the battery-optimisation exemption most ROMs freeze or
+ * kill the process a few minutes after the screen turns off, which looks like
+ * "the gateway randomly stops".
+ */
+@Composable
+private fun KeepAliveHint() {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val pm = remember {
+        ctx.getSystemService(android.content.Context.POWER_SERVICE)
+                as? android.os.PowerManager
+    }
+    var exempt by remember { mutableStateOf(pm?.isIgnoringBatteryOptimizations(ctx.packageName) == true) }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(
+            if (exempt) Icons.Filled.CheckCircle else Icons.Filled.Warning,
+            null,
+            tint = if (exempt) Green else Amber,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            if (exempt) "已加入电池优化白名单，后台可长期运行"
+            else "未加入电池白名单，息屏后可能被系统冻结",
+            color = if (exempt) Muted else Amber,
+            fontSize = 12.sp,
+            modifier = Modifier.weight(1f),
+        )
+        if (!exempt) {
+            TextButton(onClick = {
+                runCatching {
+                    ctx.startActivity(android.content.Intent(
+                        android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        android.net.Uri.parse("package:${ctx.packageName}")))
+                }
+                exempt = pm?.isIgnoringBatteryOptimizations(ctx.packageName) == true
+            }) { Text("去设置", fontSize = 12.sp) }
         }
     }
 }
