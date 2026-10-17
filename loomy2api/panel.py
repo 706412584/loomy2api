@@ -600,16 +600,15 @@ class Panel:
         payload = payload or {}
         acc = self._pick_account(payload.get("name"))
         gw = self.gw.models_client
-        results = []
-        gained = 0
-        # capture balance before the run so "gained" is a real delta
-        try:
-            balance_before = int(gw.quota(acc.session).get("balance") or 0)
-        except Exception:                                # noqa: BLE001
-            balance_before = None
-        for key, label, _reward in ONBOARDING_TASKS:
-            row: Dict[str, Any] = {"key": key, "name": label,
-                                   "expected": _reward}
+
+        # The eight tasks are independent and idempotent server-side, so submit
+        # them concurrently.  Serially this took ~2 minutes per account (each
+        # call is a round-trip); in parallel it is one round-trip plus the
+        # slowest task.  The upstream tolerates this — the official client also
+        # fires the batch at once.
+        def run_one(task):
+            key, label, reward = task
+            row: Dict[str, Any] = {"key": key, "name": label, "expected": reward}
             try:
                 data = gw.onboarding_complete(acc.session, key)
                 # live shape: {alreadyCompleted: bool, balance: <permanent>}
@@ -618,17 +617,21 @@ class Panel:
                             "balance": data.get("balance")})
             except Exception as exc:                     # noqa: BLE001
                 row.update({"ok": False, "error": str(exc)[:200]})
-            results.append(row)
-        # points actually gained = balance delta across the run
+            return row
+
+        with ThreadPoolExecutor(max_workers=min(8, len(ONBOARDING_TASKS))) as pool:
+            results = list(pool.map(run_one, ONBOARDING_TASKS))
+
+        # "gained" = the jump in the permanent balance reported by the tasks
+        # themselves; avoids two extra quota round-trips.
+        balances = [r["balance"] for r in results
+                    if isinstance(r.get("balance"), (int, float))]
         gained = 0
-        try:
-            balance_now = int(gw.quota(acc.session).get("balance") or 0)
-            if balance_before is not None:
-                gained = max(0, balance_now - balance_before)
-        except Exception:                                # noqa: BLE001
-            pass
+        if len(balances) >= 2:
+            gained = max(0, int(max(balances) - min(balances)))
+
         self.log(f"[panel] {acc.name} 新手任务完成：gained={gained} "
-                 f"ok={sum(1 for r in results if r.get('ok'))}/8")
+                 f"ok={sum(1 for r in results if r.get('ok'))}/{len(ONBOARDING_TASKS)}")
         return {"ok": True, "account": acc.name, "gained": gained,
                 "tasks": results,
                 "points": self.points({"name": acc.name, "ledger": False})}

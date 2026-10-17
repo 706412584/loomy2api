@@ -30,6 +30,9 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -179,8 +182,12 @@ class GatewayViewModel : ViewModel() {
     }
 
     /**
-     * Run [action] for every usable account, one at a time (the upstream
-     * rate-limits bursts), reporting progress as it goes.
+     * Run [action] for every usable account, a few at a time.
+     *
+     * Accounts are independent, so a small amount of concurrency cuts wall
+     * time dramatically (the upstream tolerates it — the official client does
+     * the same).  A transient 5xx is retried once after a short pause; 4xx
+     * responses are reported as-is because retrying cannot help.
      */
     private fun runBatch(label: String, action: suspend (AccountView) -> String) =
         viewModelScope.launch(crashGuard) {
@@ -191,17 +198,49 @@ class GatewayViewModel : ViewModel() {
             }
             _ui.update { it.copy(batchRunning = true,
                 batchMsg = "${label}：0/${accounts.size}") }
+
+            var done = 0
             var okCount = 0
             val failures = mutableListOf<String>()
-            accounts.forEachIndexed { i, acc ->
-                val result = runCatching { action(acc) }.getOrElse { "失败：${it.message}" }
-                if (result.startsWith("失败")) failures += "${acc.name}: $result"
-                else okCount++
-                _ui.update {
-                    it.copy(batchMsg = "${label}：${i + 1}/${accounts.size}"
-                        + (if (failures.isNotEmpty()) " · 失败 ${failures.size}" else ""))
+            val lock = Any()
+
+            suspend fun runOne(acc: AccountView): String {
+                var result = runCatching { action(acc) }
+                    .getOrElse { "失败：${it.message}" }
+                // one retry for transient upstream failures (5xx / timeout)
+                val transient = result.startsWith("失败") &&
+                    (result.contains("5") || result.contains("超时") ||
+                     result.contains("timeout", true))
+                if (transient) {
+                    kotlinx.coroutines.delay(800)
+                    result = runCatching { action(acc) }
+                        .getOrElse { "失败：${it.message}" }
+                }
+                return result
+            }
+
+            kotlinx.coroutines.coroutineScope {
+                accounts.chunked(3).forEach { group ->
+                    group.map { acc ->
+                        async {
+                            val result = runOne(acc)
+                            synchronized(lock) {
+                                done++
+                                if (result.startsWith("失败")) {
+                                    failures += "${acc.name}: $result"
+                                } else {
+                                    okCount++
+                                }
+                                _ui.value = _ui.value.copy(
+                                    batchMsg = "${label}：$done/${accounts.size}"
+                                        + (if (failures.isNotEmpty())
+                                            " · 失败 ${failures.size}" else ""))
+                            }
+                        }
+                    }.awaitAll()
                 }
             }
+
             _ui.update {
                 it.copy(
                     batchRunning = false,
