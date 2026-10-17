@@ -13,6 +13,11 @@ import java.util.concurrent.TimeUnit
 /** Minimal JSON-over-HTTP client for the in-process Python gateway. */
 object Api {
     private val client = OkHttpClient.Builder()
+        // The gateway is in-process: never let a system proxy / VPN (Clash,
+        // v2rayNG, …) intercept loopback traffic.  A TUN-mode proxy answers
+        // our requests with HTTP CONNECT, which the Python handler does not
+        // implement and replies to with 501 — previously a crash.
+        .proxy(java.net.Proxy.NO_PROXY)
         .connectTimeout(3, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)

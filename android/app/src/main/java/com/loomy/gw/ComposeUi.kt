@@ -56,21 +56,35 @@ data class UiState(
     val logPath: String = "",
     val error: String? = null,
     val toast: String? = null,
+    val batchRunning: Boolean = false,
+    val batchMsg: String = "",
 )
 
 class GatewayViewModel : ViewModel() {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
+    /**
+     * Last line of defence.  A gateway that answers an unexpected status (e.g.
+     * HTTP 501 from a half-dead server) used to surface as an uncaught
+     * `ApiException` on the main dispatcher and killed the app.  Every launch
+     * below is individually guarded, but a coroutine can still fail while
+     * resuming; this handler turns that into a toast instead of a crash.
+     */
+    private val crashGuard = kotlinx.coroutines.CoroutineExceptionHandler { _, t ->
+        android.util.Log.e("GatewayViewModel", "uncaught coroutine failure", t)
+        _ui.update { it.copy(loading = false, toast = "操作失败：${t.message ?: t.javaClass.simpleName}") }
+    }
+
     init {
-        viewModelScope.launch {
-            val ok = Api.waitUntilReady()
+        viewModelScope.launch(crashGuard) {
+            val ok = runCatching { Api.waitUntilReady() }.getOrDefault(false)
             _ui.update { it.copy(ready = ok, loading = false,
                 error = if (ok) null else "网关未启动（请点首页的启动按钮）") }
             if (ok) refreshAll()
         }
         // keep the dashboard live while the screen is open
-        viewModelScope.launch {
+        viewModelScope.launch(crashGuard) {
             while (true) {
                 delay(10_000)
                 if (_ui.value.ready) runCatching { loadState() }
@@ -81,8 +95,8 @@ class GatewayViewModel : ViewModel() {
     fun startGateway() {
         _ui.update { it.copy(loading = true, error = null) }
         GatewayService.start(AssetBridge.appContext!!)
-        viewModelScope.launch {
-            val ok = Api.waitUntilReady()
+        viewModelScope.launch(crashGuard) {
+            val ok = runCatching { Api.waitUntilReady() }.getOrDefault(false)
             _ui.update { it.copy(loading = false, ready = ok) }
             if (ok) refreshAll()
         }
@@ -94,7 +108,7 @@ class GatewayViewModel : ViewModel() {
      */
     fun restartGateway() {
         _ui.update { it.copy(loading = true, error = null) }
-        viewModelScope.launch {
+        viewModelScope.launch(crashGuard) {
             val ctx = AssetBridge.appContext
             if (ctx != null) {
                 GatewayService.start(ctx)
@@ -106,7 +120,7 @@ class GatewayViewModel : ViewModel() {
                     }
                 }
             }
-            val ok = Api.waitUntilReady(60_000)
+            val ok = runCatching { Api.waitUntilReady(60_000) }.getOrDefault(false)
             _ui.update { it.copy(loading = false, ready = ok) }
             if (ok) {
                 toast("网关已重启")
@@ -118,7 +132,7 @@ class GatewayViewModel : ViewModel() {
     }
 
     fun refreshAll() {
-        viewModelScope.launch {
+        viewModelScope.launch(crashGuard) {
             _ui.update { it.copy(loading = true) }
             val errors = mutableListOf<String>()
             runCatching { loadState() }.onFailure { errors += "状态: ${it.message}" }
@@ -150,7 +164,7 @@ class GatewayViewModel : ViewModel() {
         _ui.update { it.copy(records = rows, recordTotals = totals) }
     }
 
-    fun refreshQuota() = viewModelScope.launch {
+    fun refreshQuota() = viewModelScope.launch(crashGuard) {
         toast("正在刷新额度…")
         // many accounts × 30 s upstream timeout — the default 120 s is too tight
         runCatching { Api.post("/api/panel/refresh", timeoutSec = 300) }
@@ -158,18 +172,80 @@ class GatewayViewModel : ViewModel() {
             .onFailure { toast("刷新失败：${it.message}") }
     }
 
-    fun refreshModels() = viewModelScope.launch {
+    fun refreshModels() = viewModelScope.launch(crashGuard) {
         toast("正在刷新模型…")
         runCatching { loadModels(refresh = true); toast("模型已刷新") }
             .onFailure { toast("刷新失败：${it.message}") }
     }
 
-    fun refreshRecords() = viewModelScope.launch {
+    /**
+     * Run [action] for every usable account, one at a time (the upstream
+     * rate-limits bursts), reporting progress as it goes.
+     */
+    private fun runBatch(label: String, action: suspend (AccountView) -> String) =
+        viewModelScope.launch(crashGuard) {
+            val accounts = _ui.value.state?.accounts.orEmpty().filter { it.healthy }
+            if (accounts.isEmpty()) {
+                _ui.update { it.copy(batchMsg = "没有可用账号") }
+                return@launch
+            }
+            _ui.update { it.copy(batchRunning = true,
+                batchMsg = "${label}：0/${accounts.size}") }
+            var okCount = 0
+            val failures = mutableListOf<String>()
+            accounts.forEachIndexed { i, acc ->
+                val result = runCatching { action(acc) }.getOrElse { "失败：${it.message}" }
+                if (result.startsWith("失败")) failures += "${acc.name}: $result"
+                else okCount++
+                _ui.update {
+                    it.copy(batchMsg = "${label}：${i + 1}/${accounts.size}"
+                        + (if (failures.isNotEmpty()) " · 失败 ${failures.size}" else ""))
+                }
+            }
+            _ui.update {
+                it.copy(
+                    batchRunning = false,
+                    batchMsg = if (failures.isEmpty())
+                        "${label}完成：$okCount/${accounts.size} 成功"
+                    else "${label}完成：$okCount/${accounts.size} 成功，${failures.size} 失败"
+                        + "\n" + failures.take(3).joinToString("\n"),
+                )
+            }
+            loadState()
+        }
+
+    /** Daily check-in for every healthy account. */
+    fun batchCheckin() = runBatch("一键签到") { acc ->
+        val r = Api.post("/api/panel/points/checkin",
+            JSONObject().put("name", acc.name), timeoutSec = 60)
+        if (!r.optBoolean("ok", true)) {
+            throw IllegalStateException(r.optString("error").ifBlank { "签到失败" })
+        }
+        if (r.optBoolean("already")) "已签到" else "签到成功"
+    }
+
+    /**
+     * Onboarding tasks for every healthy account.  Each account runs eight
+     * sequential upstream calls, so this can take minutes — the button stays
+     * disabled and progress is shown per account.
+     */
+    fun batchOnboarding() = runBatch("一键新手任务") { acc ->
+        val r = Api.post("/api/panel/points/onboarding",
+            JSONObject().put("name", acc.name), timeoutSec = 300)
+        if (!r.optBoolean("ok", true)) {
+            throw IllegalStateException(r.optString("error").ifBlank { "任务失败" })
+        }
+        val tasks = r.optJSONArray("tasks") ?: JSONArray()
+        val ok = (0 until tasks.length()).count { tasks.getJSONObject(it).optBoolean("ok") }
+        "$ok/${tasks.length()}，+${r.optInt("gained")} 分"
+    }
+
+    fun refreshRecords() = viewModelScope.launch(crashGuard) {
         runCatching { loadRecords() }.onFailure { toast("读取失败：${it.message}") }
     }
 
     /** Tail the gateway's own log file (same source as the desktop panel). */
-    fun refreshLog() = viewModelScope.launch {
+    fun refreshLog() = viewModelScope.launch(crashGuard) {
         runCatching {
             val r = Api.get("/api/panel/logs?lines=400")
             val arr = r.optJSONArray("lines") ?: JSONArray()
@@ -358,7 +434,19 @@ class GatewayViewModel : ViewModel() {
     }
 
     fun saveConfig(changes: Map<String, Any>, onDone: (String) -> Unit) =
-        viewModelScope.launch {
+        viewModelScope.launch(crashGuard) {
+            // Setting api_keys enables the gateway's auth gate for the very
+            // request that writes it — authenticate with the *new* key, or the
+            // save itself is rejected with 401.
+            val previousKey = Api.apiKey
+            val newKeys = changes["api_keys"]
+            val newKey = when (newKeys) {
+                is List<*> -> newKeys.firstOrNull()?.toString().orEmpty()
+                is String -> newKeys.split(",").firstOrNull()?.trim().orEmpty()
+                else -> previousKey
+            }
+            if (newKey.isNotEmpty()) Api.apiKey = newKey
+
             runCatching {
                 val body = JSONObject()
                 changes.forEach { (k, v) ->
@@ -370,12 +458,16 @@ class GatewayViewModel : ViewModel() {
                 Api.post("/api/panel/config", body)
                 loadState()
             }.onSuccess { onDone("配置已保存") }
-                .onFailure { onDone("保存失败：${it.message}") }
+                .onFailure {
+                    // roll the in-memory key back if the change was rejected
+                    Api.apiKey = previousKey
+                    onDone("保存失败：${it.message}")
+                }
         }
 
     fun toast(msg: String) {
         _ui.update { it.copy(toast = msg) }
-        viewModelScope.launch {
+        viewModelScope.launch(crashGuard) {
             delay(2500)
             if (_ui.value.toast == msg) _ui.update { it.copy(toast = null) }
         }
@@ -767,17 +859,43 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
 
             item {
                 SectionCard {
-                    Text("积分", color = Muted, fontSize = 13.sp)
+                    Text("批量操作", color = Muted, fontSize = 13.sp)
                     Spacer(Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
+                            onClick = { vm.batchCheckin() },
+                            enabled = !ui.batchRunning,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(10.dp),
+                        ) { Text("一键签到") }
+                        Button(
+                            onClick = { vm.batchOnboarding() },
+                            enabled = !ui.batchRunning,
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(10.dp),
+                        ) { Text("一键新手任务") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
                             onClick = { vm.refreshQuota() },
+                            modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(10.dp),
                         ) { Text("刷新额度") }
                         OutlinedButton(
                             onClick = { vm.refreshModels() },
+                            modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(10.dp),
                         ) { Text("刷新模型") }
+                    }
+                    if (ui.batchRunning || ui.batchMsg.isNotBlank()) {
+                        Spacer(Modifier.height(10.dp))
+                        if (ui.batchRunning) {
+                            LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+                            Spacer(Modifier.height(6.dp))
+                        }
+                        Text(ui.batchMsg, color = if (ui.batchMsg.startsWith("失败")) Red else Muted,
+                            fontSize = 12.sp)
                     }
                 }
             }

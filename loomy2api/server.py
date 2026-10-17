@@ -418,9 +418,25 @@ class Handler(BaseHTTPRequestHandler):
             return value[:4] + "…"
         return f"{value[:8]}…{value[-4:]}(len={len(value)})"
 
+    def _is_loopback(self) -> bool:
+        """True when the request came from this machine (the phone itself)."""
+        try:
+            host = str(self.client_address[0])
+        except Exception:                               # noqa: BLE001
+            return False
+        return host in ("127.0.0.1", "::1", "localhost")
+
     def _authorized(self) -> bool:
         keys = self.gateway.cfg.api_keys
         if not keys:
+            return True
+        # The config endpoint must stay reachable from loopback: it is the only
+        # way to clear or replace a key the user no longer remembers.  Without
+        # this exemption a wrong key locks the UI out permanently — the panel
+        # cannot even read state to show which key is configured.  Loopback
+        # requests cannot come from another device, so this does not weaken the
+        # gate for remote callers.
+        if self.command == "POST" and self._path() == "/api/panel/config" and self._is_loopback():
             return True
         token, source = self._presented_key()
         token = token.strip().strip('"').strip("'")
