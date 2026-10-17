@@ -108,6 +108,27 @@ class Panel:
             "session" if acc.session else "empty")
         return view
 
+    def _resolve_account(self, name: Any) -> Account:
+        """Find an account by name, reloading the pool once on a miss.
+
+        The in-memory pool can lag behind ``accounts.json`` (an external
+        edit, or a request that raced the gateway's startup).  Without this,
+        the first click after such a change answered "no such account" and the
+        second one worked — the reload made the account appear.
+        """
+        wanted = str(name or "").strip()
+        acc = self.pool.get(wanted) if wanted else None
+        if acc is None and wanted:
+            try:
+                self.pool.load()
+            except Exception as exc:                     # noqa: BLE001
+                self.log(f"[panel] 重载账号池失败：{exc}")
+            acc = self.pool.get(wanted)
+        if acc is None:
+            raise PoolError(f"没有名为 {wanted or '(空)'} 的账号 / "
+                            f"no such account: {wanted or '(empty)'}")
+        return acc
+
     def _quota_stale(self, acc: Account) -> bool:
         minutes = float(self.gw.cfg.get("quota_refresh_minutes") or 30)
         return (time.time() - (acc.quota_updated_at or 0)) > minutes * 60
@@ -480,20 +501,37 @@ class Panel:
         returned so the user can write it down.
         """
         name = str(payload.get("name") or "").strip()
-        acc = self.pool.get(name)
-        if acc is None:
-            raise PoolError(f"没有名为 {name} 的账号 / no such account: {name}")
+        acc = self._resolve_account(name)
         password = str(payload.get("password") or "").strip()
         if password:
-            has_letter = any(ch.isalpha() for ch in password)
-            has_digit = any(ch.isdigit() for ch in password)
-            if len(password) < 8 or not (has_letter and has_digit):
-                raise PoolError("密码至少 8 位且需同时包含字母和数字 / "
-                                "password needs 8+ chars with letters and digits")
+            self._validate_password(password)
         pwd = self.pool.set_account_password(acc, password)
         self.log(f"[panel] {acc.name} 已设置登录密码（账号升级为可自动续期）")
         return {"ok": True, "name": acc.name, "password": pwd,
                 "generated": not bool(password), "state": self.state()}
+
+    @staticmethod
+    def _validate_password(password: str) -> None:
+        has_letter = any(ch.isalpha() for ch in password)
+        has_digit = any(ch.isdigit() for ch in password)
+        if len(password) < 8 or not (has_letter and has_digit):
+            raise PoolError("密码至少 8 位且需同时包含字母和数字 / "
+                            "password needs 8+ chars with letters and digits")
+
+    def show_password(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the stored login password for one account.
+
+        Passwords live in ``accounts.json``; the regular state response never
+        carries them (the panel can be bound to 0.0.0.0).  The UI asks for one
+        explicitly when the user taps "显示密码", so the secret only travels on
+        that request.
+        """
+        acc = self._resolve_account(str(payload.get("name") or "").strip())
+        if not acc.password:
+            return {"ok": False, "name": acc.name,
+                    "error": "该账号还没有保存密码"}
+        return {"ok": True, "name": acc.name, "password": acc.password,
+                "password_set_at": acc.password_set_at}
 
     def set_passwords(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """One-click: give every password-less account a generated password.
@@ -503,6 +541,9 @@ class Panel:
         upgraded until it logs in again.
         """
         payload = payload or {}
+        manual = str(payload.get("password") or "").strip()
+        if manual:
+            self._validate_password(manual)
         only = {str(n) for n in (payload.get("names") or [])}
         skipped = [a.name for a in self.pool.accounts if a.enabled and a.has_password]
         targets = [a for a in self.pool.accounts
@@ -511,34 +552,50 @@ class Panel:
         results: list = []
         if targets:
             def upgrade(acc: Account) -> Dict[str, Any]:
+                """Upgrade one account; never raises (the batch must finish)."""
                 if not acc.session_valid:
                     return {"name": acc.name, "ok": False,
                             "error": "没有有效 session，请先续期或验证码登录"}
-                # Do not rotate a password the user already knows: the batch
-                # action is for accounts that have none at all.  The per-account
-                # action can still reset one deliberately.
-                try:
-                    if self.pool.client.password_status(
-                            acc.session, acc.identity or None):
-                        return {"name": acc.name, "ok": False,
-                                "skipped": True,
-                                "error": "上游已有密码，跳过（如需更换请单个重设）"}
-                except Exception:                        # noqa: BLE001
-                    pass                                 # offline: proceed
-                try:
-                    pwd = self.pool.set_account_password(acc)
-                    return {"name": acc.name, "ok": True, "password": pwd}
-                except Exception as exc:                 # noqa: BLE001
-                    return {"name": acc.name, "ok": False, "error": str(exc)[:200]}
+                # A manual password is an explicit request to (re)set it, so
+                # skip the "already has one upstream" guard in that case.
+                if not manual:
+                    try:
+                        if self.pool.client.password_status(
+                                acc.session, acc.identity or None):
+                            return {"name": acc.name, "ok": False,
+                                    "skipped": True,
+                                    "error": "上游已有密码，跳过（如需更换请单个重设）"}
+                    except Exception:                    # noqa: BLE001
+                        pass                             # offline: proceed
+                last: Optional[Exception] = None
+                # Upstream 5xx / timeouts are transient; retry once so one
+                # flaky account does not abort the whole batch.
+                for attempt in range(2):
+                    try:
+                        pwd = self.pool.set_account_password(acc, manual)
+                        return {"name": acc.name, "ok": True, "password": pwd}
+                    except AccountError as exc:
+                        last = exc
+                        transient = exc.retryable or str(exc.code).startswith("HTTP_5")
+                        if attempt == 0 and transient:
+                            time.sleep(0.8)
+                            continue
+                        break
+                    except Exception as exc:             # noqa: BLE001
+                        last = exc
+                        break
+                return {"name": acc.name, "ok": False,
+                        "error": str(last)[:200] if last else "设置失败"}
 
             with ThreadPoolExecutor(max_workers=min(4, len(targets))) as pool:
                 results = list(pool.map(upgrade, targets))
             self.pool.save(force=True)
         ok = sum(1 for r in results if r.get("ok"))
-        self.log(f"[panel] 一键设置密码：成功 {ok}/{len(results)}"
+        failed = sum(1 for r in results if not r.get("ok") and not r.get("skipped"))
+        self.log(f"[panel] 一键设置密码：成功 {ok}/{len(results)}，失败 {failed}"
                  f"（跳过 {len(skipped)} 个已有密码）")
         return {"ok": True, "results": results, "done": ok,
-                "total": len(results), "skipped": skipped,
+                "failed": failed, "total": len(results), "skipped": skipped,
                 "state": self.state()}
 
     def update_account(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -570,9 +627,7 @@ class Panel:
 
     def renew_account(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         name = str(payload.get("name") or "").strip()
-        acc = self.pool.get(name)
-        if acc is None:
-            raise PoolError(f"没有名为 {name} 的账号 / no such account: {name}")
+        acc = self._resolve_account(name)
         result: Dict[str, Any] = {"ok": True, "name": name}
         try:
             self.pool.ensure_session(acc, force=True)
@@ -590,9 +645,7 @@ class Panel:
     def identity(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Inspect (``regenerate: false``) or rebind (``regenerate: true``)."""
         name = str(payload.get("name") or "").strip()
-        acc = self.pool.get(name)
-        if acc is None:
-            raise PoolError(f"没有名为 {name} 的账号 / no such account: {name}")
+        acc = self._resolve_account(name)
         if payload.get("regenerate"):
             self.pool.rebind_identity(name)
             self.log(f"[panel] {name} 已重新绑定设备标识 "

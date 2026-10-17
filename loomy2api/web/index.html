@@ -72,6 +72,23 @@
     background:rgba(4,8,16,.62);z-index:8;
     display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:40px 14px}
   #modalMask.open{display:flex}
+  /* password dialog (same overlay mechanics as the account modal) */
+  #pwdMask{position:fixed;top:0;right:0;bottom:0;left:0;
+    background:rgba(4,8,16,.62);z-index:10;
+    display:none;align-items:flex-start;justify-content:center;overflow:auto;padding:40px 14px}
+  #pwdMask.open{display:flex}
+  #pwdDialog{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    width:100%;max-width:440px;box-shadow:0 18px 60px rgba(0,0,0,.5)}
+  #pwdDialog header{display:flex;align-items:center;justify-content:space-between;
+    padding:14px 16px;border-bottom:1px solid var(--line)}
+  #pwdDialog header h3{margin:0;font-size:15px}
+  #pwdBody{padding:14px 16px}
+  #pwdBody p{margin:0 0 12px;color:var(--muted);font-size:13px;line-height:1.6}
+  #pwdBody .ops{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+  #pwdBody .ops button{height:36px}
+  .pwd-reveal{display:inline-block;margin-top:8px;padding:8px 10px;border-radius:8px;
+    background:#0b0d11;border:1px solid var(--line);font-family:ui-monospace,Consolas,monospace;
+    font-size:13px;color:var(--ok);word-break:break-all}
   #modal{background:var(--panel);border:1px solid var(--line);border-radius:12px;
     width:100%;max-width:520px;box-shadow:0 18px 60px rgba(0,0,0,.5)}
   #modal header{display:flex;align-items:center;justify-content:space-between;
@@ -265,6 +282,13 @@
   </div>
 </div>
 
+<div id="pwdMask" onclick="if(event.target===this)closePwdDialog(true)">
+  <div id="pwdDialog">
+    <header><h3 id="pwdTitle">设置密码</h3><button onclick="closePwdDialog(true)">关闭</button></header>
+    <div id="pwdBody"></div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 let KEY = localStorage.getItem('loomy2api_key') || '';
@@ -392,6 +416,7 @@ function openAccountModal(name) {
     + '<button onclick="modalAct(\'renew\')">续期重登</button>'
     + '<button onclick="modalAct(\'password\')">'
     + (a.permanent ? '重设密码' : '设置密码') + '</button>'
+    + '<button onclick="modalAct(\'showpwd\')">显示密码</button>'
     + '<button onclick="modalAct(\'identity\')">换设备标识</button>'
     + '<button onclick="modalAct(\'toggle\')">' + (a.enabled ? '禁用' : '启用') + '</button>'
     + '<button class="danger" onclick="modalAct(\'remove\')">删除</button>'
@@ -406,6 +431,59 @@ function openAccountModal(name) {
 }
 
 function closeAccountModal() { $('modalMask').classList.remove('open'); }
+
+// ---------------------------------------------------------- password dialog
+
+let PWD_RESOLVE = null;
+
+/**
+ * Ask for a password. Resolves to the typed value ("" = auto-generate) or
+ * null when cancelled.  A real dialog rather than `prompt()` so it also works
+ * in the Android WebView and can explain what will happen.
+ */
+function askPassword(opts) {
+  const o = opts || {};
+  $('pwdTitle').textContent = o.title || '设置密码';
+  $('pwdBody').innerHTML =
+    '<p>' + (o.intro || '') + '</p>'
+    + '<label>登录密码</label>'
+    + '<input id="pwdInput" type="text" autocomplete="new-password" '
+    + 'placeholder="留空 = 自动生成随机强密码">'
+    + '<div class="hint">至少 8 位，需同时包含字母和数字。留空则自动生成。</div>'
+    + '<div class="ops">'
+    + '<button onclick="closePwdDialog(true)">取消</button>'
+    + '<button class="primary" id="pwdOk">' + (o.confirm || '确定') + '</button>'
+    + '</div>';
+  $('pwdMask').classList.add('open');
+  const input = $('pwdInput');
+  input.focus();
+  const finish = (value) => { closePwdDialog(); if (PWD_RESOLVE) { PWD_RESOLVE(value); PWD_RESOLVE = null; } };
+  $('pwdOk').onclick = () => finish(input.value.trim());
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') finish(input.value.trim());
+    if (e.key === 'Escape') finish(null);
+  };
+  return new Promise(resolve => { PWD_RESOLVE = resolve; });
+}
+
+function closePwdDialog(cancelled) {
+  $('pwdMask').classList.remove('open');
+  if (cancelled && PWD_RESOLVE) { PWD_RESOLVE(null); PWD_RESOLVE = null; }
+}
+
+function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text);
+      return;
+    }
+  } catch (e) { /* fall through */ }
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch (e) { /* ignore */ }
+  ta.remove();
+}
 
 function modalMsg(text) { const el = $('modalMsg'); if (el) el.textContent = text; }
 
@@ -432,20 +510,27 @@ async function modalAct(kind) {
       modalMsg('新手任务 ' + okN + '/8 ok，合计到账 ' + (res.gained ?? 0) + ' 积分');
       if (res.points) renderPoints(res.points);
     } else if (kind === 'password') {
-      const pwd = prompt(
-        '给 ' + name + ' 设置登录密码。\n\n'
-        + '留空 = 自动生成一个随机强密码（推荐）。\n'
-        + '设置后账号升级为永久：session 到期会自动用密码重登。',
-        '');
+      const pwd = await askPassword({
+        title: (acc.permanent ? '重设密码' : '设置密码') + ' · ' + name,
+        intro: '设置后账号升级为永久：session 到期会自动用密码重登。',
+        confirm: '设置密码',
+      });
       if (pwd === null) { modalMsg(''); return; }
       modalMsg('正在设置密码…');
       const res = await api('/api/panel/accounts/password', {
-        method: 'POST', body: JSON.stringify({name, password: pwd.trim()})});
+        method: 'POST', body: JSON.stringify({name, password: pwd})});
       modalMsg('✓ 密码已设置：' + res.password
         + (res.generated ? '（自动生成，请保存）' : '')
         + '。账号已升级为永久，session 到期会自动续期。');
       toast(name + ' 已升级为永久账号', 'ok');
       if (res.state) { LAST_STATE = res.state; render(res.state); }
+    } else if (kind === 'showpwd') {
+      modalMsg('正在读取密码…');
+      const res = await api('/api/panel/accounts/password/show', {
+        method: 'POST', body: JSON.stringify({name})});
+      if (!res.ok) { modalMsg(res.error || '没有保存密码'); return; }
+      modalMsg('登录密码：' + res.password + '（已复制到剪贴板）');
+      copyText(res.password);
     } else if (kind === 'remove') {
       if (!confirm('确认删除账号 ' + name + '？')) { modalMsg(''); return; }
       await api('/api/panel/accounts/remove', {
@@ -471,7 +556,9 @@ async function modalAct(kind) {
 }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeAccountModal();
+  if (e.key !== 'Escape') return;
+  if ($('pwdMask').classList.contains('open')) { closePwdDialog(true); return; }
+  closeAccountModal();
 });
 
 let ADD_TAB = 'pwd';
@@ -898,17 +985,24 @@ async function setAllPasswords() {
   if (!LAST_STATE) { toast('账号状态未加载', 'err'); return; }
   const targets = LAST_STATE.accounts.filter(a => a.enabled && !a.permanent);
   if (!targets.length) { toast('所有启用账号都已有密码（永久账号）', 'ok'); return; }
-  if (!confirm('给 ' + targets.length + ' 个无密码账号设置随机强密码？\n\n'
-      + '设置后这些账号将升级为永久：session 到期会自动用密码重登，'
-      + '不再需要短信验证码。\n\n密码会保存到账号文件并随导出一起导出。')) return;
+  const pwd = await askPassword({
+    title: '一键设置密码',
+    intro: '将给 ' + targets.length + ' 个无密码账号设置登录密码。'
+      + '设置后它们升级为永久账号：session 到期会自动用密码重登，不再需要短信验证码。'
+      + '密码会保存到账号文件并随导出一起导出。',
+    confirm: '开始设置',
+  });
+  if (pwd === null) return;                    // cancelled
   const btn = $('setAllPasswords');
   btn.disabled = true; btn.textContent = '设置中…';
   try {
     const res = await api('/api/panel/accounts/passwords', {
-      method: 'POST', body: JSON.stringify({})});
+      method: 'POST', body: JSON.stringify(pwd ? {password: pwd} : {})});
     const ok = (res.results || []).filter(r => r.ok);
-    const bad = (res.results || []).filter(r => !r.ok);
+    const bad = (res.results || []).filter(r => !r.ok && !r.skipped);
+    const skipped = (res.results || []).filter(r => r.skipped);
     let msg = '完成：' + ok.length + '/' + res.total + ' 个账号已升级为永久';
+    if (skipped.length) msg += '；' + skipped.length + ' 个已有密码跳过';
     if (bad.length) msg += '；失败 ' + bad.length + '（' + bad[0].error + '）';
     toast(msg, bad.length ? 'err' : 'ok');
     if (ok.length) {

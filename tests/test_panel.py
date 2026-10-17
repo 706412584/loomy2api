@@ -261,6 +261,69 @@ class TestPanelWrites(PanelHarness, unittest.TestCase):
         self.assertTrue(self.gateway.pool.get("c").permanent)
         self.assertEqual(len(self.gateway.pool.client.passwords), 2)
 
+    def test_batch_set_passwords_with_manual_password(self):
+        self.gateway.pool.add_account("b", loginid="13900000009", session="s2")
+        self.gateway.pool.add_account("c", loginid="13900000010", session="s3")
+        _s, payload = self.post("/api/panel/accounts/passwords",
+                                {"password": "SharedPass123"})
+        self.assertEqual(payload["done"], 2)
+        self.assertEqual(self.gateway.pool.get("b").password, "SharedPass123")
+        self.assertEqual(self.gateway.pool.get("c").password, "SharedPass123")
+        self.assertTrue(self.gateway.pool.get("b").permanent)
+
+    def test_batch_set_passwords_continues_after_one_failure(self):
+        """A single failing account must not abort the batch."""
+        self.gateway.pool.add_account("b", loginid="13900000009", session="s2")
+        self.gateway.pool.add_account("c", loginid="13900000010", session="s3")
+
+        class Client(FakeAccountClient):
+            def set_password(self, session, new_password, identity=None):
+                if session == "s2":
+                    raise AccountError("upstream exploded", code="HTTP_500")
+                super().set_password(session, new_password, identity)
+
+        from loomy2api.account import AccountError
+        self.gateway.pool.client = Client()
+        _s, payload = self.post("/api/panel/accounts/passwords", {})
+        by_name = {r["name"]: r for r in payload["results"]}
+        self.assertFalse(by_name["b"]["ok"])
+        self.assertTrue(by_name["c"]["ok"])
+        self.assertEqual(payload["failed"], 1)
+        self.assertTrue(self.gateway.pool.get("c").permanent)
+
+    def test_batch_set_passwords_rejects_weak_manual_password(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/panel/accounts/passwords", {"password": "short"})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_show_password(self):
+        _s, payload = self.post("/api/panel/accounts/password/show", {"name": "a"})
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["password"], "pw")
+
+    def test_show_password_for_account_without_one(self):
+        self.gateway.pool.add_account("b", loginid="13900000009", session="s2")
+        _s, payload = self.post("/api/panel/accounts/password/show", {"name": "b"})
+        self.assertFalse(payload["ok"])
+        self.assertIn("密码", payload["error"])
+
+    def test_renew_reloads_pool_when_account_is_missing_in_memory(self):
+        """A stale in-memory pool must not answer "no such account"."""
+        # add the account to the file only, then force the in-memory pool to
+        # forget it (simulates an external edit)
+        from tests.support import write_accounts
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "pw",
+             "session": "s1", "userid": "u1",
+             "expireAt": int(time.time()) + 14 * 86400},
+            {"name": "b", "loginid": "13900000009", "password": "pw2",
+             "session": "s2", "userid": "u2",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        self.gateway.pool.remove_account("b")      # in-memory only
+        _s, payload = self.post("/api/panel/accounts/renew", {"name": "b"})
+        self.assertNotIn("no such account", payload.get("error", ""))
+
     def test_batch_set_passwords_skips_known_upstream_password(self):
         """Never rotate a password the user set but the pool doesn't store."""
         self.gateway.pool.add_account("b", loginid="13900000009", session="s2")

@@ -305,23 +305,27 @@ class GatewayViewModel : ViewModel() {
      *
      * Uses the batch endpoint: it skips accounts that already have a password
      * upstream (rotating an unknown password would break the user's own
-     * login), and it runs the upstream calls concurrently.
+     * login), keeps going when one account fails, and runs the upstream calls
+     * concurrently.  [manual] applies the same password to every account;
+     * empty means "generate one per account".
      */
-    fun batchSetPasswords() = viewModelScope.launch(crashGuard) {
+    fun batchSetPasswords(manual: String = "") = viewModelScope.launch(crashGuard) {
         _ui.update { it.copy(batchRunning = true, batchMsg = "一键设置密码：提交中…") }
         try {
-            val r = Api.post("/api/panel/accounts/passwords",
-                JSONObject(), timeoutSec = 300)
+            val body = JSONObject()
+            if (manual.isNotBlank()) body.put("password", manual)
+            val r = Api.post("/api/panel/accounts/passwords", body, timeoutSec = 300)
             val results = r.optJSONArray("results") ?: JSONArray()
             val ok = mutableListOf<String>()
             val bad = mutableListOf<String>()
+            var skipped = 0
             for (i in 0 until results.length()) {
                 val row = results.getJSONObject(i)
                 val name = row.optString("name")
-                if (row.optBoolean("ok")) {
-                    ok += "$name  ${row.optString("password")}"
-                } else {
-                    bad += "$name: ${row.optString("error")}"
+                when {
+                    row.optBoolean("ok") -> ok += "$name  ${row.optString("password")}"
+                    row.optBoolean("skipped") -> skipped++
+                    else -> bad += "$name: ${row.optString("error")}"
                 }
             }
             loadState()
@@ -329,6 +333,7 @@ class GatewayViewModel : ViewModel() {
                 it.copy(
                     batchRunning = false,
                     batchMsg = "一键设置密码：${ok.size}/${results.length()} 成功"
+                        + (if (skipped > 0) "，$skipped 个已有密码跳过" else "")
                         + (if (bad.isNotEmpty()) "\n" + bad.take(3).joinToString("\n") else "")
                         + (if (ok.isNotEmpty())
                             "\n新密码：\n" + ok.take(10).joinToString("\n") else ""),
@@ -340,6 +345,18 @@ class GatewayViewModel : ViewModel() {
                     batchMsg = "一键设置密码失败：${e.message ?: e.javaClass.simpleName}")
             }
         }
+    }
+
+    /** Read the stored login password of one account (for the show button). */
+    suspend fun showPassword(acc: AccountView): String = try {
+        val r = Api.post("/api/panel/accounts/password/show",
+            JSONObject().put("name", acc.name), timeoutSec = 30)
+        if (!r.optBoolean("ok", true)) {
+            throw IllegalStateException(r.optString("error").ifBlank { "没有保存密码" })
+        }
+        "登录密码：${r.optString("password")}"
+    } catch (e: Exception) {
+        "失败：${e.message ?: e.javaClass.simpleName}"
     }
 
     fun refreshRecords() = viewModelScope.launch(crashGuard) {
@@ -909,6 +926,7 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
     var selected by remember { mutableStateOf<AccountView?>(null) }
     var showAdd by remember { mutableStateOf(false) }
     var showImport by remember { mutableStateOf(false) }
+    var showBatchPwd by remember { mutableStateOf(false) }
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     val accounts = ui.state?.accounts.orEmpty()
@@ -992,7 +1010,7 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
                     }
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(
-                        onClick = { vm.batchSetPasswords() },
+                        onClick = { showBatchPwd = true },
                         enabled = !ui.batchRunning,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
@@ -1040,6 +1058,16 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
     }
     if (showImport) {
         ImportDialog(vm, onDismiss = { showImport = false })
+    }
+    if (showBatchPwd) {
+        BatchPasswordDialog(
+            count = accounts.count { it.enabled && !it.permanent },
+            onDismiss = { showBatchPwd = false },
+            onConfirm = { pwd ->
+                showBatchPwd = false
+                vm.batchSetPasswords(pwd)
+            },
+        )
     }
 }
 
@@ -1109,11 +1137,86 @@ private fun ActionLink(text: String, onClick: () -> Unit) {
 
 // ================================================================ dialogs
 
+/**
+ * Confirmation for "一键设置密码": explains the effect and lets the user type
+ * one password for every account (empty = generate one per account).
+ */
+@Composable
+private fun BatchPasswordDialog(
+    count: Int,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit,
+    title: String = "一键设置密码",
+    intro: String = "",
+) {
+    var pwd by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = CardBg,
+        shape = RoundedCornerShape(18.dp),
+        title = { Text(title, fontSize = 19.sp, fontWeight = FontWeight.Bold) },
+        text = {
+            Column {
+                Text(
+                    if (intro.isNotBlank()) intro
+                    else if (count == 0) "所有启用账号都已有密码，无需设置。"
+                    else "将给 $count 个无密码账号设置登录密码。设置后它们升级为永久账号："
+                        + "session 到期会自动用密码重登，不再需要短信验证码。",
+                    fontSize = 13.sp, color = if (count == 0 && intro.isBlank()) Muted else Ink,
+                )
+                if (count > 0) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("密码会保存到账号文件并随导出一起导出。",
+                        fontSize = 12.sp, color = Muted)
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        pwd, { pwd = it },
+                        label = { Text("统一密码（留空 = 自动生成）") },
+                        placeholder = { Text("至少 8 位，含字母和数字") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(pwd.trim()) },
+                enabled = count > 0,
+            ) { Text("开始设置") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
+}
+
 @Composable
 private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () -> Unit) {
     var msg by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
+    var showPwdDialog by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+
+    if (showPwdDialog) {
+        BatchPasswordDialog(
+            count = 1,
+            title = if (acc.permanent) "重设密码" else "设置密码",
+            intro = "为 ${acc.name} 设置登录密码。设置后账号升级为永久："
+                + "session 到期会自动用密码重登。",
+            onDismiss = { showPwdDialog = false },
+            onConfirm = { pwd ->
+                showPwdDialog = false
+                busy = true
+                msg = "正在设置密码…"
+                scope.launch {
+                    try {
+                        msg = vm.setPassword(acc, pwd)
+                    } finally {
+                        busy = false
+                    }
+                }
+            },
+        )
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1158,21 +1261,40 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                         }
                     }
                     OutlinedButton(
-                        onClick = {
-                            if (busy) return@OutlinedButton
-                            busy = true
-                            msg = "正在设置密码…"
-                            scope.launch {
-                                try {
-                                    msg = vm.setPassword(acc, "")
-                                } finally {
-                                    busy = false
-                                }
-                            }
-                        },
+                        onClick = { showPwdDialog = true },
                         enabled = !busy && acc.hasSession,
                         shape = RoundedCornerShape(10.dp),
                     ) { Text(if (acc.permanent) "重设密码" else "设置密码", fontSize = 13.sp) }
+                }
+                if (acc.permanent) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                if (busy) return@OutlinedButton
+                                busy = true
+                                msg = "正在读取密码…"
+                                scope.launch {
+                                    try {
+                                        val text = vm.showPassword(acc)
+                                        msg = text
+                                        if (!text.startsWith("失败")) {
+                                            val pwd = text.substringAfter("登录密码：")
+                                            copyToClipboard(pwd)
+                                            msg = "$text\n（已复制到剪贴板）"
+                                        }
+                                    } finally {
+                                        busy = false
+                                    }
+                                }
+                            },
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                        ) { Text("显示已保存密码（复制）", fontSize = 13.sp) }
+                    }
                 }
 
                 val actions = listOf(
@@ -1945,6 +2067,17 @@ private fun formatTokens(v: Int): String = when {
 
 private fun formatTime(ts: Long): String =
     SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(ts * 1000))
+
+private fun copyToClipboard(text: String) {
+    val ctx = AssetBridge.appContext ?: return
+    try {
+        val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("loomy2api", text))
+    } catch (_: Throwable) {
+        // clipboard access can be denied in the background; the text is still shown
+    }
+}
 
 private fun localIp(): String? {
     return try {
