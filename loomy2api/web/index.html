@@ -203,6 +203,7 @@
     <h2>账号 <small>accounts</small>
       <span style="float:right">
         <button id="showImport">导入账号</button>
+        <button id="exportAccounts">导出账号</button>
         <button class="primary" id="showAdd">＋ 添加账号</button>
       </span>
     </h2>
@@ -1025,6 +1026,40 @@ $('doOnboarding').onclick = doOnboarding;
 $('doCheckin').onclick = doCheckin;
 $('showAdd').onclick = () => openAddModal('pwd');
 $('showImport').onclick = () => openAddModal('import');
+
+/**
+ * Download the account file.  The export contains plaintext sessions and
+ * passwords, so warn once before writing it to disk.
+ */
+async function exportAccounts() {
+  if (!confirm('导出的文件包含明文 session 和登录密码，请妥善保管。\n\n确认导出？')) return;
+  const btn = $('exportAccounts');
+  btn.disabled = true; btn.textContent = '导出中…';
+  try {
+    const res = await api('/api/panel/export');
+    const text = JSON.stringify(res, null, 2);
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate())
+      + '-' + pad(d.getHours()) + pad(d.getMinutes());
+    const blob = new Blob([text], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'loomy2api-accounts-' + stamp + '.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const n = (res.accounts || []).length;
+    toast('已导出 ' + n + ' 个账号', 'ok');
+  } catch (e) {
+    toast('导出失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = '导出账号';
+  }
+}
+$('exportAccounts').onclick = exportAccounts;
 $('setAllPasswords').onclick = setAllPasswords;
 
 async function setAllPasswords() {
