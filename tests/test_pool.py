@@ -96,6 +96,53 @@ class TestPool(unittest.TestCase):
         with self.assertRaises(PoolError):
             pool.acquire()
 
+    def test_acquire_skips_account_whose_renewal_fails(self):
+        """One broken account must not fail the request for the whole pool."""
+        self._write([
+            # session already gone, so the failed login really makes it unusable
+            {"name": "broken", "loginid": "13800000001", "password": "wrong",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "s1", "expireAt": int(time.time()) - 60},
+            {"name": "healthy", "session": "s2",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        pool.get("healthy").available = 1
+
+        class FakeClient:
+            def fill(self, account):
+                from loomy2api.account import AccountError
+                raise AccountError("密码错误", code="220204")
+
+        pool.client = FakeClient()
+        self.assertEqual(pool.acquire().name, "healthy")
+
+    def test_acquire_reports_last_failure_when_all_candidates_fail(self):
+        self._write([
+            {"name": "broken", "loginid": "13800000001", "password": "wrong",
+             "session": "expired", "expireAt": int(time.time()) - 60},
+        ])
+        pool = AccountPool(self.cfg)
+        pool.get("broken").login_blocked_until = time.time() + 300
+        with self.assertRaises(PoolError) as ctx:
+            pool.acquire()
+        self.assertIn("密码登录已暂停", str(ctx.exception))
+
+    def test_daily_strategy_orders_by_daily_balance(self):
+        """``daily`` = spend the expiring grant first (activity balance)."""
+        self._write([
+            {"name": "low_daily", "session": "s1",
+             "expireAt": int(time.time()) + 14 * 86400},
+            {"name": "high_daily", "session": "s2",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        self.cfg["strategy"] = "daily"
+        pool = AccountPool(self.cfg)
+        pool.get("low_daily").daily_balance = 100
+        pool.get("high_daily").daily_balance = 5000
+        pool.get("low_daily").available = 90000   # balance must not win
+        self.assertEqual(pool.acquire().name, "high_daily")
+
     def test_disabled_account_ignored(self):
         self._write([
             {"name": "a", "session": "s1", "expireAt": int(time.time()) + 86400,
@@ -145,7 +192,9 @@ class TestSessionLifecycle(unittest.TestCase):
         from tests.support import write_accounts
 
         write_accounts(self.dir / "accounts.json", [
+            # password already proven, so the only step left is the re-login
             {"name": "a", "loginid": "13800000001", "password": "pw",
+             "passwordVerifiedAt": int(time.time()),
              "session": "stale", "expireAt": int(time.time()) + 3600},   # < 3 days
         ])
         pool = AccountPool(self.cfg)
@@ -166,6 +215,202 @@ class TestSessionLifecycle(unittest.TestCase):
         pool.acquire()
         self.assertEqual(calls, ["a"])
         self.assertEqual(pool.get("a").session, "fresh")
+
+    def test_verification_login_is_not_repeated(self):
+        """The login that proves a password already renews the session."""
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "pw",
+             "session": "stale", "expireAt": int(time.time()) + 3600},
+        ])
+        pool = AccountPool(self.cfg)
+        fills = []
+
+        class FakeClient:
+            def fill(self, account):
+                fills.append(account.name)
+                account.session = "fresh"
+                account.expire_at = int(time.time()) + 14 * 86400
+                return account
+
+            def login_by_password(self, loginid, password, identity=None):
+                return {"session": "verified", "userid": "uid-a"}
+
+        pool.client = FakeClient()
+        acc = pool.acquire()
+        self.assertEqual(fills, [])                # one login, not two
+        self.assertEqual(acc.session, "verified")
+        self.assertTrue(acc.password_verified_at)
+
+    def test_failed_renewal_keeps_working_session(self):
+        """A rejected password must not kill a request the session can serve.
+
+        Regression: an account 2.9 days from expiry was force-renewed, the
+        stored password was wrong, and every request died with
+        ``byPwd failed: 密码错误`` although the session was still valid.
+        """
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "good", "expireAt": int(time.time()) + 2.9 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+
+        class FakeClient:
+            def fill(self, account):
+                from loomy2api.account import AccountError
+                raise AccountError("/login/account/byPwd failed: 密码错误",
+                                   code="220204")
+
+        pool.client = FakeClient()
+        acc = pool.acquire()                       # must not raise
+        self.assertEqual(acc.name, "a")
+        self.assertEqual(acc.session, "good")      # old session still used
+        self.assertFalse(acc.password_verified_at)
+        self.assertTrue(acc.login_blocked_until > time.time())
+
+    def test_login_block_stops_retrying_and_expires(self):
+        """A rejected password is not retried inside the lockout window."""
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "good", "expireAt": int(time.time()) + 2.9 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        attempts = []
+
+        class FakeClient:
+            def fill(self, account):
+                from loomy2api.account import AccountError
+                attempts.append(1)
+                raise AccountError("/login/account/byPwd failed: 密码错误",
+                                   code="220204")
+
+            def login_by_password(self, loginid, password, identity=None):
+                from loomy2api.account import AccountError
+                attempts.append(1)
+                raise AccountError("/login/account/byPwd failed: 密码错误",
+                                   code="220204")
+
+            def password_status(self, session, identity=None):
+                return True                # don't rotate an unknown password
+
+        pool.client = FakeClient()
+        for _ in range(5):
+            pool.acquire()                         # renew window each time
+        self.assertEqual(len(attempts), 1)         # blocked after the first
+        acc = pool.get("a")
+        acc.login_blocked_until = time.time() - 1  # lockout over
+        pool.acquire()
+        self.assertEqual(len(attempts), 2)
+
+    def test_rejected_password_is_repaired_automatically(self):
+        """A wrong stored password is rotated through the live session.
+
+        The session is what ``/userinfo/update/pwd`` needs, so a password
+        rejected by ``byPwd`` can be fixed unattended instead of parking the
+        account until someone notices.
+        """
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "good", "expireAt": int(time.time()) + 2.9 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        rotated = []
+
+        class FakeClient:
+            def fill(self, account):
+                from loomy2api.account import AccountError
+                raise AccountError("/login/account/byPwd failed: 密码错误",
+                                   code="220204")
+
+            def set_password(self, session, new_password, identity=None):
+                assert session == "good"        # uses the live session
+                rotated.append(new_password)
+
+            def login_by_password(self, loginid, password, identity=None):
+                # the new password works and hands back a fresh session
+                return {"session": "fresh", "userid": "uid-a"}
+
+        pool.client = FakeClient()
+        got = pool.acquire()
+
+        self.assertEqual(len(rotated), 1)
+        self.assertEqual(got.password, rotated[0])
+        self.assertNotEqual(got.password, "wrong")
+        self.assertEqual(got.session, "fresh")
+        self.assertTrue(got.password_verified_at)
+        self.assertFalse(got.login_blocked_until)
+        self.assertEqual(got.last_error, "")
+        saved = json.loads((self.dir / "accounts.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["accounts"][0]["password"], rotated[0])
+
+    def test_repair_failure_falls_back_to_session_and_blocks(self):
+        """If the rotation itself fails, keep the session and stop retrying."""
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "good", "expireAt": int(time.time()) + 2.9 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+
+        class FakeClient:
+            def fill(self, account):
+                from loomy2api.account import AccountError
+                raise AccountError("密码错误", code="220204")
+
+            def set_password(self, session, new_password, identity=None):
+                from loomy2api.account import AccountError
+                raise AccountError("update/pwd rejected", code="500")
+
+        pool.client = FakeClient()
+        acc = pool.acquire()
+        self.assertEqual(acc.session, "good")
+        self.assertTrue(acc.login_blocked_until > time.time())
+
+    def test_auto_repair_can_be_disabled(self):
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "good", "expireAt": int(time.time()) + 2.9 * 86400},
+        ])
+        self.cfg["auto_repair_password"] = False
+        pool = AccountPool(self.cfg)
+
+        class FakeClient:
+            def fill(self, account):
+                from loomy2api.account import AccountError
+                raise AccountError("密码错误", code="220204")
+
+            def set_password(self, session, new_password, identity=None):
+                raise AssertionError("must not rotate")
+
+        pool.client = FakeClient()
+        acc = pool.acquire()
+        self.assertEqual(acc.password, "wrong")
+        self.assertEqual(acc.session, "good")
+
+    def test_credential_error_detection(self):
+        from loomy2api.account import AccountError, is_credential_error
+
+        self.assertTrue(is_credential_error(AccountError("x", code="220204")))
+        self.assertTrue(is_credential_error(
+            AccountError("/login/account/byPwd failed: 密码错误次数过多，请10分钟后登录")))
+        self.assertFalse(is_credential_error(AccountError("net", code="NETWORK")))
+        self.assertFalse(is_credential_error(PoolError("nope")))
 
     def test_no_credentials_raises_actionable_error(self):
         from tests.support import write_accounts

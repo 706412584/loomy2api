@@ -26,11 +26,13 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from . import constants as C
-from .account import (Account, AccountClient, AccountError, generate_password)
+from .account import (Account, AccountClient, AccountError, generate_password,
+                      is_credential_error)
 from .upstream import ModelGateway, UpstreamError
 
 __all__ = ["AccountPool", "PoolError"]
@@ -55,8 +57,20 @@ class AccountPool:
         self._thread: Optional[threading.Thread] = None
         self._last_save = 0.0
         self._dirty = False
+        # One login/refresh at a time per account: bootstrap, the keeper and
+        # incoming requests now run concurrently, and two logins for the same
+        # account would invalidate each other's session.
+        self._account_locks: Dict[str, threading.Lock] = {}
+        self._account_locks_guard = threading.Lock()
         self._file = cfg.path("accounts_file", "accounts.json")
         self.load()
+
+    def _account_lock(self, name: str) -> threading.Lock:
+        with self._account_locks_guard:
+            lock = self._account_locks.get(name)
+            if lock is None:
+                lock = self._account_locks[name] = threading.Lock()
+            return lock
 
     # ------------------------------------------------------------ storage
 
@@ -278,6 +292,7 @@ class AccountPool:
                 f"账号 {acc.name} 密码已设置，但用新密码登录验证失败：{exc}。"
                 f"该账号仍不是永久账号，请在面板重试或检查密码规则") from exc
         acc.password_verified_at = int(time.time())
+        acc.login_blocked_until = 0.0
         # A successful login hands back a fresh session; keep it.
         if got.get("session"):
             acc.session = got["session"]
@@ -302,16 +317,49 @@ class AccountPool:
                 acc.loginid, acc.password, acc.identity or None)
         except Exception as exc:                         # noqa: BLE001
             acc.password_verified_at = 0
+            if is_credential_error(exc):
+                acc.login_blocked_until = time.time() + float(
+                    self.cfg.get("login_blocked_seconds") or 600)
             self.log(f"账号 {acc.name} 密码验证失败：{exc}")
             self.save()
             return False
         acc.password_verified_at = int(time.time())
+        acc.login_blocked_until = 0.0
         if got.get("session"):
             acc.session = got["session"]
             acc.userid = got.get("userid") or acc.userid
             acc.obtained_at = int(time.time())
             acc.expire_at = acc.obtained_at + C.SESSION_EXPIRE_SECONDS
         self.save()
+        return True
+
+    def _repair_password(self, acc: Account, *, reason: object) -> bool:
+        """Replace a rejected password while the session is still usable.
+
+        ``/userinfo/update/pwd`` only needs a valid session, so an account
+        whose *stored* password no longer works can be fixed unattended
+        instead of waiting for a human to notice.
+
+        This deliberately bypasses the "don't overwrite an upstream password"
+        guard in :meth:`ensure_password`: that guard protects a password we
+        have never seen, while here we just proved the one we store is
+        rejected.  Returns True only when the new password was set *and*
+        proven by a real login (which also yields a fresh session).
+        """
+        if not bool(self.cfg.get("auto_repair_password", True)):
+            return False
+        if not acc.persist or not acc.loginid or not acc.session_valid:
+            return False
+        self.log(f"账号 {acc.name} 密码被上游拒绝（{reason}），"
+                 f"用现有 session 自动改密")
+        try:
+            self.set_account_password(acc)
+        except Exception as exc:                         # noqa: BLE001
+            # Best effort: a failed repair must never break the request that
+            # triggered it.  The caller falls back to the existing session.
+            self.log(f"账号 {acc.name} 自动改密失败：{exc}")
+            return False
+        self.log(f"账号 {acc.name} 自动改密成功（新密码已写入 accounts.json）")
         return True
 
     def ensure_password(self, acc: Account, *, force: bool = False) -> bool:
@@ -328,6 +376,9 @@ class AccountPool:
             # before spending a rotation on it.
             if self.verify_password(acc):
                 return False
+            # The stored password is rejected.  The session may still be good,
+            # so rotate the password instead of giving up on the account.
+            return self._repair_password(acc, reason="密码验证失败")
         if not acc.session_valid:
             return False
         # Derived accounts (imported from the desktop client) are never written
@@ -363,7 +414,25 @@ class AccountPool:
         1) controls how close to expiry that happens.  Once the password is
         stored the account behaves like a permanent one — every later expiry
         is handled by a password login.
+
+        Serialized per account: bootstrap, the keeper and request-time
+        ``acquire`` can now run at the same time, and two concurrent logins
+        would each invalidate the other's session.
         """
+        with self._account_lock(acc.name):
+            return self._ensure_session_locked(acc, force=force)
+
+    @staticmethod
+    def _login_blocked(acc: Account) -> bool:
+        return acc.login_blocked_until > time.time()
+
+    def _login_block_error(self, acc: Account) -> PoolError:
+        left = max(1, int(acc.login_blocked_until - time.time()))
+        return PoolError(
+            f"账号 {acc.name} 的密码被上游拒绝，密码登录已暂停 {left}s"
+            f"（session 仍有效时不受影响；请在面板重新设置密码）")
+
+    def _ensure_session_locked(self, acc: Account, *, force: bool) -> Account:
         renew_days = float(self.cfg.get("session_renew_before_days") or 3)
         # 0 disables the automatic upgrade (the account then needs an SMS login)
         upgrade_days = float(self.cfg.get("password_set_before_days")
@@ -376,23 +445,78 @@ class AccountPool:
                 # Still too early to burn the upgrade (or it is disabled);
                 # wait until the account is within the configured window.
                 return acc
+            if not force and self._login_blocked(acc):
+                # The stored password was just rejected: retrying now would
+                # only extend the upstream lockout.  The session is still
+                # valid, so keep using it until the block expires.
+                return acc
             needs = True
             self.log(f"账号 {acc.name} session 剩余 {acc.days_left:.1f} 天，提前续期")
         if not needs:
             return acc
+        if not force and self._login_blocked(acc):
+            # An explicit ``force`` (panel "renew", CLI login) is the user's
+            # own decision, so it is allowed through.
+            raise self._login_block_error(acc)
         if not acc.has_password or not acc.password_verified_at:
             # last chance: the session still works, so we can set (or prove)
             # a password now and make every future expiry automatic
             if acc.session_valid:
                 self.ensure_password(acc)
+            # ensure_password may just have proven the password wrong, which
+            # starts the block — do not immediately log in again.  A session
+            # that still works is worth more than the failed renewal.
+            if not force and self._login_blocked(acc):
+                if acc.session_valid:
+                    self.log(f"账号 {acc.name} 沿用现有 session"
+                             f"（剩余 {(acc.days_left or 0):.1f} 天）")
+                    return acc
+                raise self._login_block_error(acc)
+            if (not force and acc.password_verified_at and acc.session_valid
+                    and (acc.days_left is None or acc.days_left >= renew_days)):
+                # The password was just set (or proven) and its verification
+                # login already handed back a fresh session — renewing again
+                # would only invalidate it.
+                return acc
         if not (acc.loginid and acc.password):
             raise PoolError(
                 f"账号 {acc.name} 的 session 不可用且没有账号密码，无法自动重登"
                 f"（请在 accounts.json 补 loginid/password，或用 `loomy2api login` 短信登录）")
-        self.client.fill(acc)
+        try:
+            self.client.fill(acc)
+        except AccountError as exc:
+            # A renewal is an optimisation, not a requirement: as long as the
+            # session we already hold still works, a failed re-login must not
+            # take the request down with it.
+            if is_credential_error(exc):
+                acc.password_verified_at = 0
+                # A rejected password can be replaced through the still-valid
+                # session, which makes the account self-healing again.
+                if self._repair_password(acc, reason=exc):
+                    acc.last_error = ""
+                    self.save()
+                    return acc
+                acc.login_blocked_until = time.time() + float(
+                    self.cfg.get("login_blocked_seconds") or 600)
+                acc.last_error = f"login: {exc}"
+                self.log(f"账号 {acc.name} 密码被上游拒绝（{exc}），"
+                         f"暂停密码登录 {int(acc.login_blocked_until - time.time())}s")
+            else:
+                acc.last_error = f"login: {exc}"
+                self.log(f"账号 {acc.name} 续期失败：{exc}")
+            self.save()
+            if acc.session_valid:
+                self.log(f"账号 {acc.name} 沿用现有 session"
+                         f"（剩余 {(acc.days_left or 0):.1f} 天）")
+                return acc
+            raise PoolError(
+                f"账号 {acc.name} 的 session 已失效且无法重新登录：{exc}"
+                f"（请在面板重新设置密码或短信登录）") from exc
         # a successful password login is the strongest proof the password works
         if acc.has_password:
             acc.password_verified_at = int(time.time())
+        acc.login_blocked_until = 0.0
+        acc.last_error = ""
         self.save()
         self.log(f"账号 {acc.name} 登录成功 userid={acc.userid} "
                  f"session={acc.session[:8]}… 剩余 {(acc.days_left or 0):.1f} 天")
@@ -436,8 +560,50 @@ class AccountPool:
                 if a.enabled and not a.in_cooldown and a.name not in exclude
                 and a.session_valid and a.available != 0]
 
+    def _ordered(self, candidates: Sequence[Account]) -> List[Account]:
+        """Order candidates by the configured strategy (best first)."""
+        strategy = str(self.cfg.get("strategy") or "balance").lower()
+        if strategy == "round_robin":
+            with self._rr_lock:
+                start = self._rr_index % max(1, len(candidates))
+                self._rr_index = (start + 1) % max(1, len(candidates))
+            return list(candidates[start:]) + list(candidates[:start])
+        if strategy == "lru":
+            return sorted(candidates, key=lambda a: a.last_used or 0)
+        if strategy in ("daily", "activity"):
+            # Spend the expiring daily grant first: an unused daily balance is
+            # lost at the cycle reset, while the permanent balance carries over.
+            return sorted(candidates, key=lambda a: (
+                a.daily_balance if a.daily_balance is not None else -1,
+                a.available if a.available is not None else 0,
+                -a.last_used), reverse=True)
+        if strategy == "permanent":
+            # The opposite: drain permanent points first and keep the daily
+            # grant for accounts that are about to reset.
+            return sorted(candidates, key=lambda a: (
+                a.balance if a.balance is not None else -1,
+                -a.last_used), reverse=True)
+        if strategy == "weighted":
+            # Random, but richer accounts are picked more often: spreads load
+            # without letting a low-balance account run dry early. The mobile
+            # UI has offered this option since the strategy list grew.
+            # Weighted-random permutation (Efraimidis–Spirakis), so a failing
+            # top pick can still fall through to the next account.
+            import random as _random
+            return sorted(candidates, key=lambda a: _random.random() **
+                          (1.0 / max(1, a.available if a.available is not None else 1)))
+        # balance
+        return sorted(candidates, key=lambda a: (
+            a.available if a.available is not None else 10**9,
+            -a.last_used), reverse=True)
+
     def acquire(self, exclude: Sequence[str] = ()) -> Account:
-        """Return the next account to use (session guaranteed valid)."""
+        """Return the next usable account whose session is guaranteed valid.
+
+        A candidate whose renewal fails is skipped and the next one is tried:
+        one account with a rejected password must never fail the whole request
+        while the pool still holds healthy accounts.
+        """
         candidates = self.usable(exclude)
         if not candidates:
             # nothing healthy: give single-account setups a chance to self-heal
@@ -447,33 +613,17 @@ class AccountPool:
             candidates = all_enabled
             self.log("没有健康账号，尝试对现有账号续期/重登")
 
-        strategy = str(self.cfg.get("strategy") or "balance").lower()
-        if strategy == "round_robin":
-            with self._rr_lock:
-                acc = candidates[self._rr_index % len(candidates)]
-                self._rr_index = (self._rr_index + 1) % max(1, len(candidates))
-        elif strategy == "lru":
-            acc = min(candidates, key=lambda a: a.last_used or 0)
-        elif strategy in ("daily", "activity"):
-            # Spend the expiring daily grant first: an unused daily balance is
-            # lost at the cycle reset, while the permanent balance carries over.
-            acc = max(candidates, key=lambda a: (
-                a.daily_balance if a.daily_balance is not None else -1,
-                a.available if a.available is not None else 0,
-                -a.last_used))
-        elif strategy == "permanent":
-            # The opposite: drain permanent points first and keep the daily
-            # grant for accounts that are about to reset.
-            acc = max(candidates, key=lambda a: (
-                a.balance if a.balance is not None else -1,
-                -a.last_used))
-        else:  # balance
-            acc = max(candidates, key=lambda a: (a.available if a.available is not None else 10**9,
-                                                 -a.last_used))
-
-        self.ensure_session(acc)
-        acc.last_used = time.time()
-        return acc
+        last: Optional[Exception] = None
+        for acc in self._ordered(candidates):
+            try:
+                self.ensure_session(acc)
+            except (PoolError, AccountError) as exc:
+                last = exc
+                self.log(f"账号 {acc.name} 不可用，换下一个：{exc}")
+                continue
+            acc.last_used = time.time()
+            return acc
+        raise PoolError(f"没有可用账号：{last}" if last else "没有可用账号")
 
     def report_success(self, acc: Account, usage: Optional[Dict] = None) -> None:
         acc.requests += 1
@@ -547,38 +697,57 @@ class AccountPool:
             except Exception as exc:                    # noqa: BLE001
                 self.log(f"账号守护线程异常：{exc}")
 
+    def _maintain(self, acc: Account, upgrade_days: float) -> None:
+        try:
+            if (upgrade_days > 0 and not acc.has_password and acc.session_valid
+                    and acc.days_left is not None
+                    and acc.days_left <= upgrade_days):
+                self.ensure_password(acc)
+            self.ensure_session(acc)
+            self.refresh_quota(acc)
+        except (AccountError, PoolError) as exc:
+            self.log(f"账号 {acc.name} 维护失败：{exc}")
+        except Exception as exc:                        # noqa: BLE001
+            self.log(f"账号 {acc.name} 维护异常：{exc}")
+
     def tick(self) -> None:
         """One maintenance pass: renew sessions, refresh quota.
 
         Password-less accounts are upgraded shortly before their session
         expires (``password_set_before_days``) so they never fall back to
         needing a human-read SMS code.
+
+        Accounts are independent and each step is a network round-trip, so
+        they run concurrently; a pool of N accounts used to take N times the
+        per-account latency (minutes on a phone).
         """
         upgrade_days = float(self.cfg.get("password_set_before_days")
                              if self.cfg.get("password_set_before_days") is not None
                              else 1)
-        for acc in self.accounts:
-            if not acc.enabled:
-                continue
-            try:
-                if (upgrade_days > 0 and not acc.has_password and acc.session_valid
-                        and acc.days_left is not None
-                        and acc.days_left <= upgrade_days):
-                    self.ensure_password(acc)
-                self.ensure_session(acc)
-                self.refresh_quota(acc)
-            except (AccountError, PoolError) as exc:
-                self.log(f"账号 {acc.name} 维护失败：{exc}")
-            except Exception as exc:                    # noqa: BLE001
-                self.log(f"账号 {acc.name} 维护异常：{exc}")
+        targets = [a for a in self.accounts if a.enabled]
+        if not targets:
+            return
+        with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+            list(pool.map(lambda a: self._maintain(a, upgrade_days), targets))
         self.save()
 
     def bootstrap(self) -> None:
-        """Login/Fill any account that has no usable session."""
-        for acc in self.accounts:
-            if acc.enabled and not acc.session_valid:
-                try:
-                    self.ensure_session(acc)
-                except Exception as exc:                # noqa: BLE001
-                    self.log(f"账号 {acc.name} 启动登录失败：{exc}")
+        """Login/Fill any account that has no usable session.
+
+        Concurrent for the same reason as :meth:`tick`: expired sessions in a
+        large pool would otherwise be re-logged in one by one.
+        """
+        targets = [a for a in self.accounts
+                   if a.enabled and not a.session_valid]
+        if not targets:
+            return
+
+        def login(acc: Account) -> None:
+            try:
+                self.ensure_session(acc)
+            except Exception as exc:                    # noqa: BLE001
+                self.log(f"账号 {acc.name} 启动登录失败：{exc}")
+
+        with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+            list(pool.map(login, targets))
         self.save()

@@ -49,6 +49,25 @@ class AccountError(RuntimeError):
         self.retryable = retryable
 
 
+#: Account-service codes meaning "the credentials are wrong / logins are
+#: throttled".  Retrying cannot fix either; only a new password or waiting can.
+CREDENTIAL_ERROR_CODES = frozenset({
+    "0200103",   # 账号鉴权失败 / password rejected
+    "220204",    # 密码错误
+    "220205",    # 密码错误次数过多，请10分钟后登录
+})
+
+
+def is_credential_error(exc: BaseException) -> bool:
+    """True when ``exc`` says the stored password (not the session) is bad."""
+    if not isinstance(exc, AccountError):
+        return False
+    if str(exc.code) in CREDENTIAL_ERROR_CODES:
+        return True
+    text = str(exc)
+    return "密码错误" in text or "鉴权失败" in text
+
+
 # --------------------------------------------------------------------- identity
 
 #: Fields that make up an account identity, i.e. the values a request envelope
@@ -124,6 +143,11 @@ class Account:
 
     # runtime state (never persisted)
     cooldown_until: float = 0.0
+    #: Don't attempt a password login before this time.  Set when the account
+    #: service rejects the stored password (or rate-limits logins): retrying
+    #: inside the window only extends the upstream lockout, while the session
+    #: we already have usually keeps working.
+    login_blocked_until: float = 0.0
     last_used: float = 0.0
     requests: int = 0
     points_used: int = 0

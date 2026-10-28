@@ -43,12 +43,21 @@ DEFAULTS: Dict[str, Any] = {
 
     # account pool --------------------------------------------------------
     "accounts_file": "accounts.json",
-    "strategy": "balance",        # balance | round_robin | lru
+    "strategy": "balance",        # balance | daily | permanent | round_robin | lru | weighted
     "max_retries": 2,             # extra accounts tried on auth/quota errors
     "stream_retries": 2,          # extra attempts when a stream dies mid-flight
     "stream_stall_seconds": 180,  # abort/retry a stream that stalls this long
     "thinking_stall_seconds": 240,  # abort/retry a reasoning loop with no output
     "cooldown_seconds": 300,
+    #: After the account service rejects the stored password (or throttles
+    #: logins), don't attempt another password login for this long.  The
+    #: existing session keeps working meanwhile; retrying only extends the
+    #: upstream lockout ("密码错误次数过多，请10分钟后登录").
+    "login_blocked_seconds": 600,
+    #: When the stored password is rejected but the session still works, set a
+    #: new password through that session automatically (and store it), so the
+    #: account keeps renewing itself without manual intervention.
+    "auto_repair_password": True,
     "session_renew_before_days": 3,
     #: Upgrade a password-less account this many days before its session
     #: expires: set a password through the still-valid session, so it can
