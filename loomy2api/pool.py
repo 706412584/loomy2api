@@ -673,9 +673,19 @@ class AccountPool:
 
     def usable(self, exclude: Sequence[str] = ()) -> List[Account]:
         now = time.time()
-        return [a for a in self.accounts
+        rows = [a for a in self.accounts
                 if a.enabled and not a.in_cooldown and a.name not in exclude
                 and a.session_valid and a.available != 0]
+        if self.daily_only():
+            # Only the daily grant may be spent.  An account whose grant is
+            # used up is skipped entirely, so the permanent balance survives
+            # the cycle reset instead of being drained by routing.
+            return [a for a in rows if (a.daily_balance or 0) > 0]
+        return rows
+
+    def daily_only(self) -> bool:
+        """True when routing must stay inside the daily (activity) grant."""
+        return bool(self.cfg.get("daily_only"))
 
     def _ordered(self, candidates: Sequence[Account]) -> List[Account]:
         """Order candidates by the configured strategy (best first)."""
@@ -722,6 +732,12 @@ class AccountPool:
         while the pool still holds healthy accounts.
         """
         candidates = self.usable(exclude)
+        if not candidates and self.daily_only():
+            # "Only spend the activity balance" is an explicit instruction, so
+            # falling back to permanent points would be worse than failing.
+            raise PoolError(
+                "没有账号还有活动余额（已开启「只用活动余额」；"
+                "关闭它或等待每日额度重置）")
         if not candidates:
             # nothing healthy: give single-account setups a chance to self-heal
             all_enabled = [a for a in self.accounts if a.enabled and a.name not in exclude]
@@ -737,6 +753,9 @@ class AccountPool:
             except (PoolError, AccountError) as exc:
                 last = exc
                 self.log(f"账号 {acc.name} 不可用，换下一个：{exc}")
+                continue
+            if self.daily_only() and not (acc.daily_balance or 0) > 0:
+                last = PoolError(f"账号 {acc.name} 活动余额已用尽")
                 continue
             acc.last_used = time.time()
             return acc

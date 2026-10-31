@@ -199,6 +199,9 @@
           <option value="weighted">加权随机</option>
         </select>
       </label>
+      <label class="row" style="margin:0;color:var(--muted)" title="只使用每日活动额度，绝不消耗永久积分。活动额度用完后请求会失败，等待次日重置。">
+        <input id="dailyOnly" type="checkbox" style="min-width:auto"> 只用活动余额
+      </label>
       <label class="row" style="margin:0;color:var(--muted)">
         <input id="auto" type="checkbox" checked style="min-width:auto"> 自动刷新
       </label>
@@ -382,13 +385,16 @@ function render(state) {
   // reflect the live strategy without clobbering what the user is selecting
   const sel = $('strategy');
   if (document.activeElement !== sel) sel.value = c.strategy || 'balance';
+  const dOnly = $('dailyOnly');
+  if (document.activeElement !== dOnly) dOnly.checked = !!c.daily_only;
   $('cards').innerHTML = [
     ['账号 Accounts', t.accounts + ' <small>/ 可用 ' + t.usable + '</small>'],
     ['可用积分 Available', t.available + (t.unique_accounts !== t.accounts ? ' <small>(去重 ' + t.unique_accounts + ' 号)</small>' : '')],
     ['请求 Requests', t.requests],
     ['已扣分 Points used', t.points_used],
     ['上游 Upstream', '<small class="mono">' + c.upstream + '</small>'],
-    ['策略 / 设备标识', '<small>' + c.strategy + ' / ' + c.identity_mode + '</small>'],
+    ['策略 / 设备标识', '<small>' + c.strategy + (c.daily_only ? ' · 仅活动余额' : '')
+      + ' / ' + c.identity_mode + '</small>'],
   ].map(([k, v]) => '<div class="card"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>').join('');
 
   // the lite build has no SMS registration: hide the entry point entirely
@@ -1371,6 +1377,26 @@ $('strategy').onchange = async () => {
     load(true);          // roll the select back to the live value
   } finally {
     sel.disabled = false;
+  }
+};
+
+/** Only ever spend the daily (activity) grant, never the permanent balance. */
+$('dailyOnly').onchange = async () => {
+  const box = $('dailyOnly');
+  const value = box.checked;
+  box.disabled = true;
+  try {
+    await api('/api/panel/config', {
+      method: 'POST', body: JSON.stringify({daily_only: value})
+    });
+    toast(value ? '已开启「只用活动余额」：额度用尽时会失败，不再消耗永久积分'
+                : '已关闭「只用活动余额」', 'ok');
+    load(true);
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+    load(true);
+  } finally {
+    box.disabled = false;
   }
 };
 

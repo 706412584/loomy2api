@@ -128,6 +128,47 @@ class TestPool(unittest.TestCase):
             pool.acquire()
         self.assertIn("密码登录已暂停", str(ctx.exception))
 
+    def test_daily_only_skips_accounts_without_activity_balance(self):
+        """'Only use the activity balance' must never fall back to permanent."""
+        self._write([
+            {"name": "permanent_only", "session": "s1",
+             "expireAt": int(time.time()) + 14 * 86400},
+            {"name": "has_daily", "session": "s2",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        self.cfg["daily_only"] = True
+        pool = AccountPool(self.cfg)
+        pool.get("permanent_only").available = 90000
+        pool.get("permanent_only").daily_balance = 0
+        pool.get("has_daily").available = 5000
+        pool.get("has_daily").daily_balance = 5000
+        self.assertEqual(pool.acquire().name, "has_daily")
+
+    def test_daily_only_fails_instead_of_spending_permanent(self):
+        self._write([
+            {"name": "rich", "session": "s1", "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        self.cfg["daily_only"] = True
+        pool = AccountPool(self.cfg)
+        pool.get("rich").available = 90000
+        pool.get("rich").daily_balance = 0
+        with self.assertRaises(PoolError) as ctx:
+            pool.acquire()
+        self.assertIn("活动余额", str(ctx.exception))
+        self.assertEqual(pool.get("rich").available, 90000)   # untouched
+
+    def test_daily_only_filters_usable(self):
+        self._write([
+            {"name": "a", "session": "s1", "expireAt": int(time.time()) + 14 * 86400},
+            {"name": "b", "session": "s2", "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        pool.get("a").daily_balance = 0
+        pool.get("b").daily_balance = 5000
+        self.assertEqual(len(pool.usable()), 2)
+        self.cfg["daily_only"] = True
+        self.assertEqual([a.name for a in pool.usable()], ["b"])
+
     def test_daily_strategy_orders_by_daily_balance(self):
         """``daily`` = spend the expiring grant first (activity balance)."""
         self._write([

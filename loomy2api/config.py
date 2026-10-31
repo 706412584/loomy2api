@@ -58,6 +58,11 @@ DEFAULTS: Dict[str, Any] = {
     #: new password through that session automatically (and store it), so the
     #: account keeps renewing itself without manual intervention.
     "auto_repair_password": True,
+    #: Never spend the permanent balance: only accounts that still hold part
+    #: of today's daily grant are routed to.  The grant is lost at the cycle
+    #: reset while the permanent balance carries over, so this maximises what
+    #: is actually used — at the cost of failing once every grant is spent.
+    "daily_only": False,
     "session_renew_before_days": 3,
     #: Upgrade a password-less account this many days before its session
     #: expires: set a password through the still-valid session, so it can

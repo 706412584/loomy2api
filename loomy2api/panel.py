@@ -223,6 +223,7 @@ class Panel:
             "config": {
                 "upstream": self.gw.cfg["upstream"],
                 "strategy": self.gw.cfg.get("strategy"),
+                "daily_only": self.pool.daily_only(),
                 "default_model": self.gw.cfg.get("default_model"),
                 "identity_mode": self.gw.cfg.get("identity_mode"),
                 "models": len(self.gw.catalogue()),
@@ -263,6 +264,7 @@ class Panel:
             "timeout", "max_retries", "cooldown_seconds",
             "session_renew_before_days", "password_set_before_days",
             "quota_refresh_minutes", "sessions_from_client", "identity_mode",
+            "daily_only", "auto_repair_password",
             "fysms_username", "fysms_password", "fysms_keyword",
             "fysms_max_wait",
         }
@@ -288,7 +290,8 @@ class Panel:
                 else:
                     raw = text.split(",")
             changes["api_keys"] = [str(v).strip() for v in (raw or []) if str(v).strip()]
-        for flag in ("log_requests", "sessions_from_client"):
+        for flag in ("log_requests", "sessions_from_client", "daily_only",
+                     "auto_repair_password"):
             if flag in changes:
                 changes[flag] = bool(changes[flag])
         for num_key in ("timeout", "max_retries", "cooldown_seconds",

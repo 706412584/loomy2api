@@ -177,6 +177,14 @@ class TestPanelWrites(PanelHarness, unittest.TestCase):
             self.post("/api/panel/accounts/renew", {"name": "nope"})
         self.assertEqual(ctx.exception.code, 400)
 
+    def test_daily_only_can_be_toggled_from_the_panel(self):
+        _s, payload = self.post("/api/panel/config", {"daily_only": True})
+        self.assertIn("daily_only", payload["changed"])
+        self.assertTrue(payload["state"]["config"]["daily_only"])
+        self.assertTrue(self.gateway.pool.daily_only())
+        _s, payload = self.post("/api/panel/config", {"daily_only": False})
+        self.assertFalse(payload["state"]["config"]["daily_only"])
+
     def test_check_pool_repairs_expired_session(self):
         """A session the pool cannot schedule for renewal gets re-logged in."""
         self.gateway.pool.add_account("b", loginid="13900000009", password="pw")
