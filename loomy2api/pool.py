@@ -765,9 +765,21 @@ class AccountPool:
         acc.requests += 1
         points = (usage or {}).get("points_consumed")
         if isinstance(points, (int, float)):
-            acc.points_used += int(points)
+            spent = int(points)
+            acc.points_used += spent
             if acc.available is not None:
-                acc.available = max(0, int(acc.available) - int(points))
+                acc.available = max(0, int(acc.available) - spent)
+            # Also age the activity grant.  Routing under ``daily_only`` reads
+            # ``daily_balance``; leaving it stale kept picking an account whose
+            # grant was already spent until the next 30-minute refresh, and the
+            # upstream answers those requests with an empty stream.  The daily
+            # grant is consumed first, so only the overflow touches the
+            # permanent balance.
+            if acc.daily_balance is not None:
+                used_daily = min(spent, int(acc.daily_balance))
+                acc.daily_balance = int(acc.daily_balance) - used_daily
+                if acc.balance is not None:
+                    acc.balance = max(0, int(acc.balance) - (spent - used_daily))
         acc.last_error = ""
         self.save()
 

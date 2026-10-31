@@ -219,6 +219,51 @@ class TestPool(unittest.TestCase):
         self.assertEqual(acc.available, 97)
         self.assertEqual(acc.requests, 1)
 
+    def test_report_success_ages_the_daily_grant(self):
+        """``daily_only`` reads ``daily_balance``: it must not stay stale.
+
+        Leaving it untouched kept routing to an account whose grant was spent
+        until the next 30-minute refresh, and the upstream answers those with
+        an empty stream (a silent truncation for the client).
+        """
+        self._write([{"name": "a", "session": "s", "expireAt": int(time.time()) + 9e4}])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        acc.available = 5000
+        acc.daily_balance = 5000
+        acc.balance = 0
+        pool.report_success(acc, {"points_consumed": 30})
+        self.assertEqual(acc.daily_balance, 4970)
+        self.assertEqual(acc.balance, 0)
+        self.assertEqual(acc.available, 4970)
+
+    def test_daily_grant_drains_before_permanent_balance(self):
+        self._write([{"name": "a", "session": "s", "expireAt": int(time.time()) + 9e4}])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        acc.available = 1100          # 100 daily + 1000 permanent
+        acc.daily_balance = 100
+        acc.balance = 1000
+        pool.report_success(acc, {"points_consumed": 150})
+        self.assertEqual(acc.daily_balance, 0)     # grant fully consumed
+        self.assertEqual(acc.balance, 950)         # overflow hits permanent
+        self.assertEqual(acc.available, 950)
+
+    def test_exhausted_grant_drops_out_of_daily_only_routing(self):
+        self._write([
+            {"name": "spent", "session": "s1", "expireAt": int(time.time()) + 9e4},
+            {"name": "fresh", "session": "s2", "expireAt": int(time.time()) + 9e4},
+        ])
+        self.cfg["daily_only"] = True
+        pool = AccountPool(self.cfg)
+        spent, fresh = pool.get("spent"), pool.get("fresh")
+        for a, avail, daily in ((spent, 5000, 100), (fresh, 5000, 5000)):
+            a.available, a.daily_balance, a.balance = avail, daily, 0
+        # burn the small grant; permanent points must NOT keep it eligible
+        pool.report_success(spent, {"points_consumed": 100})
+        self.assertEqual(spent.daily_balance, 0)
+        self.assertEqual(pool.acquire().name, "fresh")
+
 
 class TestSessionLifecycle(unittest.TestCase):
     def setUp(self):

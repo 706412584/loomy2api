@@ -24,7 +24,7 @@ from . import constants as C
 from .config import load_config
 from .account import AccountClient, Account, AccountError
 from .pool import AccountPool, PoolError
-from .server import Gateway, Logger, serve
+from .server import AlreadyRunning, Gateway, Logger, serve
 from .upstream import ModelGateway
 
 
@@ -41,7 +41,11 @@ def _human_quota(acc: Account) -> str:
 def cmd_serve(cfg, args) -> int:
     if args.port:
         cfg["port"] = args.port
-    serve(cfg)
+    try:
+        serve(cfg)
+    except AlreadyRunning as exc:
+        print(f"✗ 启动被拒绝：{exc}", file=sys.stderr)
+        return 3
     return 0
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -19,7 +20,7 @@ from .panel import Panel
 from .pool import AccountPool, PoolError
 from .upstream import ModelGateway, sse_usage, human_usage
 
-__all__ = ["Gateway", "serve"]
+__all__ = ["AlreadyRunning", "Gateway", "InstanceLock", "serve"]
 
 
 class StreamStalled(Exception):
@@ -1284,13 +1285,17 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = (os.name != "nt")
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        # Initialized *before* super(): a failed bind makes socketserver call
+        # server_close() from inside __init__, and server_close() needs these.
+        # Without them the real OSError ("port in use") was swallowed by an
+        # AttributeError that hid why startup failed.
         #: Live client sockets.  ``server_close()`` only closes the listening
         #: socket; an HTTP/1.1 keep-alive connection would keep being served
         #: by the *old* handler thread (and its old Gateway), so a rebind left
         #: clients reading stale state over a socket that never reconnected.
         self._active = set()
         self._active_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
         with self._active_lock:
@@ -1322,6 +1327,188 @@ class Server(ThreadingHTTPServer):
                 pass
 
 
+class AlreadyRunning(RuntimeError):
+    """Another gateway instance holds the single-instance lock."""
+
+
+class InstanceLock:
+    """Cross-process guard against two gateways sharing one account pool.
+
+    A port check is not enough on Windows: ``bind(("0.0.0.0", P))`` and
+    ``bind(("127.0.0.1", P))`` *both succeed* (measured — Windows does not
+    consider a wildcard and a specific address to conflict), so a second
+    ``serve`` silently stole a share of the connections while sharing the same
+    ``accounts.json``.  Two pools logging into the same accounts invalidate
+    each other's sessions, which is what broke client requests mid-stream.
+
+    Where it lives: next to the accounts file, so two checkouts/ports pointing
+    at the same pool still collide, while unrelated deployments do not.
+    """
+
+    #: Byte offset of the locked region.  Kept past the PID text because
+    #: ``msvcrt.locking`` blocks *reads* of the locked range too, and the
+    #: loser needs to read the holder's PID out of the same file.
+    _LOCK_OFFSET = 64
+    #: Held at ``_LOCK_OFFSET`` while the instance runs.
+    _LOCK_BYTE = b"\0"
+
+    #: PID currently holding the lock in *this* process, plus a re-entry depth
+    #: so the Android watchdog can call serve() again while the previous
+    #: instance is still tearing down.  0 = not held here.
+    _held_by_pid = 0
+    _depth = 0
+    _held_lock = threading.Lock()
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._fh = None
+        self._reentrant = False
+
+    def acquire(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Same process holding it?  This is not a second gateway: the Android
+        # watchdog restarts the gateway in place (close the listener, call
+        # serve() again) and the previous thread may not have released yet.
+        # Refusing here would make that restart impossible.
+        if type(self)._held_by_pid == os.getpid():
+            with type(self)._held_lock:
+                type(self)._depth += 1
+            self._reentrant = True
+            return
+
+        self._reentrant = False
+        try:
+            self._fh = open(self.path, "a+b")
+            self._lock()
+        except OSError as exc:
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
+            if exc.errno in (errno.EACCES, errno.EAGAIN,
+                             getattr(errno, "EDEADLK", 0)):
+                raise AlreadyRunning(self.holder()) from exc
+            raise
+        # Written after locking, so the loser can read it (it sits outside the
+        # locked byte).  The file itself is kept: the OS lock dies with the
+        # process, but the text is what tells the next starter who was there.
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write(f"{os.getpid()}\n".encode())
+        self._fh.flush()
+        with type(self)._held_lock:
+            type(self)._held_by_pid = os.getpid()
+            type(self)._depth = 1
+
+    def _lock(self) -> None:
+        if os.name == "nt":
+            import msvcrt
+            self._fh.seek(self._LOCK_OFFSET)
+            self._fh.write(self._LOCK_BYTE)          # the byte must exist
+            self._fh.flush()
+            self._fh.seek(self._LOCK_OFFSET)
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def release(self) -> None:
+        with type(self)._held_lock:
+            if type(self)._held_by_pid == os.getpid():
+                type(self)._depth -= 1
+                if type(self)._depth > 0:
+                    # Still held by another serve() in this process.
+                    self._reentrant = False
+                    return
+                type(self)._held_by_pid = 0
+        self._reentrant = False
+        if self._fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self._fh.seek(self._LOCK_OFFSET)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+
+    def holder(self) -> str:
+        """PID recorded by the current holder, or an empty string.
+
+        Only the first line counts: past it lie the padding byte the lock
+        region needs on Windows.
+        """
+        try:
+            raw = Path(self.path).read_bytes()
+        except OSError:
+            return ""
+        first = raw.split(b"\n", 1)[0].split(b"\0", 1)[0]
+        try:
+            text = first.decode("ascii").strip()
+        except UnicodeDecodeError:
+            return ""
+        return text if text.isdigit() else ""
+
+    def error_message(self) -> str:
+        pid = self.holder()
+        who = f"（PID {pid}）" if pid else ""
+        return (f"已经有一个 loomy2api 网关在运行{who}，同一个账号池只能由一个网关持有"
+                f"：两个实例会互相顶掉 session，表现为客户端请求中途静默中断。\n"
+                f"请先停止它（stop.cmd / 一键停止.bat），或用 --port 换一个端口。"
+                f"\n锁定文件：{self.path}")
+
+
+def listening_pids(port: int) -> "set[int]":
+    """PIDs listening on ``port``, whatever address they bound.
+
+    A bind-probe cannot answer this on Windows: ``bind(("0.0.0.0", P))``
+    succeeds even while another process listens on ``127.0.0.1:P``, so the
+    kernel will not tell us the port is taken.  Enumerating listeners is the
+    only reliable check.
+    """
+    found: "set[int]" = set()
+    try:
+        import subprocess
+        if os.name == "nt":
+            out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if (len(parts) >= 5 and parts[3] == "LISTENING"
+                        and parts[1].endswith(f":{port}")
+                        and parts[4].isdigit()):
+                    found.add(int(parts[4]))
+        else:
+            out = subprocess.run(["ss", "-lptnH"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            for line in out.splitlines():
+                if f":{port} " in line + " " and "pid=" in line:
+                    chunk = line.split("pid=", 1)[1].split(",", 1)[0]
+                    if chunk.isdigit():
+                        found.add(int(chunk))
+    except Exception:                                    # noqa: BLE001
+        pass                                             # diagnostics only
+    return found
+
+
+def error_owner(port: int) -> str:
+    """Best-effort " (PID 1234)" for whoever is listening on ``port``."""
+    pids = sorted(listening_pids(port) - {os.getpid()})
+    return f"（PID {pids[0]}）" if pids else ""
+
+
 def serve(cfg, *, gateway: Optional[Gateway] = None,
           on_server=None) -> Gateway:
     """Run the HTTP server until interrupted.
@@ -1330,10 +1517,45 @@ def serve(cfg, *, gateway: Optional[Gateway] = None,
     embedder (the Android app) can shut it down to rebind on a different
     interface without leaving the old socket in place.
     """
+    lock = InstanceLock(Path(cfg.path("accounts_file", "accounts.json"))
+                        .with_name("gateway.lock"))
+    try:
+        lock.acquire()
+    except AlreadyRunning as exc:
+        raise AlreadyRunning(lock.error_message()) from exc
+
+    try:
+        return _serve_locked(cfg, gateway=gateway, on_server=on_server)
+    finally:
+        lock.release()
+
+
+def _serve_locked(cfg, *, gateway: Optional[Gateway] = None,
+                  on_server=None) -> Gateway:
     gw = gateway or Gateway(cfg)
 
+    # Refuse before binding: the kernel would happily give us 127.0.0.1:P while
+    # another process listens on 0.0.0.0:P, so "bind succeeded" means nothing.
+    port = int(cfg["port"])
+    if port:
+        others = sorted(listening_pids(port) - {os.getpid()})
+        if others:
+            raise AlreadyRunning(
+                f"端口 {port} 已被占用（PID {', '.join(map(str, others))}）。"
+                f"这不一定是同一个账号池：不同绑定地址（0.0.0.0 与 127.0.0.1）"
+                f"可以同时监听，谁收到请求是不确定的。\n"
+                f"请先停止它（stop.cmd / 一键停止.bat），或用 --port 换一个端口。")
+
     handler = type("BoundHandler", (Handler,), {"gateway": gw})
-    httpd = Server((str(cfg["host"]), int(cfg["port"])), handler)
+    try:
+        httpd = Server((str(cfg["host"]), port), handler)
+    except OSError as exc:
+        # Lost a race with something that started between the check and here.
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            raise AlreadyRunning(
+                f"端口 {port} 已被占用{error_owner(port)}，"
+                f"请先停止原来的实例，或用 --port 换一个端口。") from exc
+        raise
     if on_server is not None:
         on_server(httpd)
     # Bind first, then log in expired accounts / fetch the catalogue in the

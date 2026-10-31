@@ -8,18 +8,21 @@ echo    loomy2api - 一键启动
 echo ==============================================
 echo.
 
-REM ---------- 0. 静默停掉占用端口的旧实例 ----------
+REM ---------- 0. 清掉所有占用端口的旧实例 ----------
+REM 注意：这里必须循环杀掉「全部」监听者。Windows 允许 bind(0.0.0.0:P) 与
+REM bind(127.0.0.1:P) 同时成功，所以端口上可能同时挂着两个网关，各自跑一份
+REM 账号池、互相顶掉 session，表现就是客户端请求中途静默中断。原来只保留最后
+REM 一个 PID，正好留下另一个继续捣乱。
 set "PORT=17990"
 set "KILLED="
-for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":%PORT%" ^| findstr "LISTENING" 2^>nul') do set "OLDPID=%%p"
-if defined OLDPID (
-  echo [提示] 停止旧实例 PID %OLDPID% ...
-  taskkill /PID %OLDPID% /F >nul 2>&1
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":%PORT%" ^| findstr "LISTENING" 2^>nul') do (
+  echo [提示] 停止旧实例 PID %%p ...
+  taskkill /PID %%p /F >nul 2>&1
   set "KILLED=1"
 )
 if defined KILLED (
-  ping -n 2 127.0.0.1 >nul
-  echo [提示] 旧实例已停止。
+  ping -n 3 127.0.0.1 >nul
+  call :wait_port_free
 )
 
 REM ---------- 1. 检查 Python ----------

@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -17,7 +20,7 @@ import urllib.request
 from pathlib import Path
 
 from loomy2api.server import Gateway, Handler, Server
-from tests.support import FakeUpstream, make_config, write_accounts
+from tests.support import FakeUpstream, free_port, make_config, write_accounts
 
 
 class _Harness:
@@ -317,6 +320,129 @@ class ServeCallbackTestCase(unittest.TestCase):
         serve(cfg, on_server=on_server)
         self.assertIsNotNone(seen.get("server"))
         self.assertGreater(seen["server"].server_address[1], 0)
+
+
+class InstanceLockTestCase(unittest.TestCase):
+    """Only one gateway may serve an account pool.
+
+    Measured on Windows: ``bind(("0.0.0.0", P))`` and ``bind(("127.0.0.1", P))``
+    both succeed, so a second ``serve`` used to come up alongside the first and
+    the two pools invalidated each other's sessions mid-request.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "gateway.lock"
+
+    def _locked_by_another_process(self, script: str) -> "subprocess.Popen":
+        """Start a child that holds the lock until its stdin closes."""
+        child = subprocess.Popen(
+            [sys.executable, "-c", script, str(self.path)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            cwd=str(Path(__file__).resolve().parent.parent))
+        self.addCleanup(lambda: (child.stdin.close(), child.stdout.close(),
+                                 child.wait(timeout=10)))
+        self.assertEqual(child.stdout.readline().strip(), "locked")
+        return child
+
+    def test_second_lock_is_refused_and_reports_the_holder(self):
+        from loomy2api.server import AlreadyRunning, InstanceLock
+
+        holder = self._locked_by_another_process(
+            "import sys\n"
+            "from pathlib import Path\n"
+            "from loomy2api.server import InstanceLock\n"
+            "lk = InstanceLock(Path(sys.argv[1])); lk.acquire()\n"
+            "print('locked', flush=True)\n"
+            "sys.stdin.read()\n")
+
+        loser = InstanceLock(self.path)
+        with self.assertRaises(AlreadyRunning) as ctx:
+            loser.acquire()
+        # the loser must be able to name the process holding the lock
+        self.assertEqual(loser.holder(), str(holder.pid))
+        self.assertEqual(ctx.exception.args[0], str(holder.pid))
+
+    def test_lock_is_reusable_after_release(self):
+        from loomy2api.server import InstanceLock
+
+        first = InstanceLock(self.path)
+        first.acquire()
+        first.release()
+        second = InstanceLock(self.path)
+        second.acquire()
+        self.assertEqual(second.holder(), str(os.getpid()))
+        second.release()
+
+    def test_same_process_can_reacquire_for_in_place_restart(self):
+        """The Android watchdog restarts the gateway in place.
+
+        ``mobile_main.restart_gateway`` closes the listener and calls ``serve``
+        again from the same process, possibly before the previous thread has
+        released the lock.  A plain cross-process lock would refuse that and
+        the app could never come back.
+        """
+        from loomy2api.server import InstanceLock
+
+        first = InstanceLock(self.path)
+        first.acquire()
+        second = InstanceLock(self.path)          # same pid -> allowed
+        second.acquire()
+        second.release()
+        # still held by the first, so a third in-process acquire is fine ...
+        third = InstanceLock(self.path)
+        third.acquire()
+        third.release()
+        # ... and a different-looking process would still be refused
+        first.release()
+        fourth = InstanceLock(self.path)
+        fourth.acquire()
+        fourth.release()
+
+    def test_holder_ignores_whitespace_and_padding(self):
+        from loomy2api.server import InstanceLock
+
+        lock = InstanceLock(self.path)
+        self.path.write_bytes(b"12345\n\x00\x00\x00")
+        self.assertEqual(lock.holder(), "12345")
+        self.path.write_bytes(b"not-a-pid\n")
+        self.assertEqual(lock.holder(), "")
+
+    def test_serve_refuses_a_busy_port(self):
+        """A second gateway must not silently share a port.
+
+        Two processes on the same port is the failure that broke client
+        requests: the kernel happily lets ``0.0.0.0:P`` and ``127.0.0.1:P``
+        coexist, so the check has to enumerate listeners rather than probe.
+        Needs a real child process — an in-process duplicate is allowed on
+        purpose (the Android watchdog restarts the gateway in place).
+        """
+        from loomy2api.server import AlreadyRunning, serve
+
+        port = free_port()
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import socket,time;"
+             "s=socket.socket();"
+             "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,0);"
+             f"s.bind(('0.0.0.0',{port}));s.listen(5);"
+             "print('bound',flush=True);time.sleep(60)"],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.kill(), holder.stdout.close(),
+                                 holder.wait(timeout=10)))
+        self.assertEqual(holder.stdout.readline().strip(), "bound")
+
+        upstream = FakeUpstream()
+        base = upstream.start()
+        self.addCleanup(upstream.stop)
+        cfg = make_config(Path(self.tmp.name), base)
+        cfg["host"], cfg["port"] = "127.0.0.1", port
+
+        with self.assertRaises(AlreadyRunning) as ctx:
+            serve(cfg)
+        self.assertIn(str(port), str(ctx.exception))
+        self.assertIn(str(holder.pid), str(ctx.exception))
 
 
 class AuthTestCase(_Harness, unittest.TestCase):
