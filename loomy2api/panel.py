@@ -14,6 +14,9 @@ Endpoints
 ``POST /api/panel/accounts/update``   patch loginid / password / enabled
 ``POST /api/panel/accounts/remove``   delete an account
 ``POST /api/panel/accounts/renew``    force re-login + quota refresh
+``POST /api/panel/accounts/check``    health-check the pool, repairing what
+                                      can be repaired (``force`` = re-login
+                                      every account, ``names`` = subset)
 ``POST /api/panel/accounts/identity`` inspect / regenerate the account identity
 ``GET  /api/panel/logs``              tail of the gateway log
 """
@@ -23,9 +26,9 @@ from __future__ import annotations
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import constants as C
 from .account import Account, AccountError
@@ -89,8 +92,18 @@ class Panel:
         self.log = gateway.log
         # Serialize paid SMS-registration batches (see register_sms).
         self._sms_lock = threading.Lock()
+        # Quota refreshes continue after the HTTP response: on a phone a large
+        # pool would otherwise make every panel read wait for N round-trips.
+        self._refresh_pool = ThreadPoolExecutor(max_workers=8,
+                                                thread_name_prefix="quota")
+        self._refreshing: Dict[str, Any] = {}
+        self._refresh_lock = threading.Lock()
 
     # ------------------------------------------------------------ helpers
+
+    def shutdown(self) -> None:
+        """Stop the background quota refresher (called on gateway shutdown)."""
+        self._refresh_pool.shutdown(wait=False, cancel_futures=True)
 
     @property
     def pool(self):
@@ -133,35 +146,56 @@ class Panel:
 
     def _quota_stale(self, acc: Account) -> bool:
         minutes = float(self.gw.cfg.get("quota_refresh_minutes") or 30)
-        return (time.time() - (acc.quota_updated_at or 0)) > minutes * 60
+        # Key off the last *attempt*, not the last success: a failing account
+        # would otherwise look stale forever and be re-probed (and possibly
+        # re-logged in) on every 10 s poll.
+        last = max(acc.quota_updated_at or 0, int(acc.quota_checked_at or 0))
+        return (time.time() - last) > minutes * 60
 
-    def _refresh_all(self, only_stale: bool = True) -> None:
+    def _refresh_all(self, only_stale: bool = True,
+                     *, wait: bool = True) -> None:
         """Refresh quota for the accounts that need it, concurrently.
 
         The upstream call is a network round-trip with a 30 s timeout, so doing
         it serially made a cold panel load take 30 s *per unreachable account*
         (on a phone that reads as "stuck loading accounts").  They are
         independent, so fan them out and wait only as long as the slowest one.
+
+        ``wait=False`` (used by the regular panel reads) only *schedules* the
+        refresh and returns the cached values immediately. An account already
+        being refreshed is not queued twice, so the 10 s UI poll cannot pile
+        up work.
         """
         pending = [a for a in self.pool.accounts
                    if a.session_valid and not (only_stale and not self._quota_stale(a))]
         if not pending:
             return
 
-        def refresh_one(acc: Account) -> None:
-            try:
-                self.pool.refresh_quota(acc)
-            except Exception as exc:                     # noqa: BLE001
-                self.log(f"[panel] 刷新 {acc.name} 额度失败：{exc}")
+        futures = []
+        with self._refresh_lock:
+            for acc in pending:
+                fut = self._refreshing.get(acc.name)
+                if fut is None or fut.done():
+                    fut = self._refresh_pool.submit(self._refresh_one, acc)
+                    self._refreshing[acc.name] = fut
+                futures.append(fut)
 
-        with ThreadPoolExecutor(max_workers=min(8, len(pending))) as pool:
-            list(pool.map(refresh_one, pending))
-        self.pool.save()
+        if wait:
+            wait_futures(futures)
+            self.pool.save()
+
+    def _refresh_one(self, acc: Account) -> None:
+        try:
+            self.pool.refresh_quota(acc)
+            # Persist without blocking: save() is throttled to one write / 5 s.
+            self.pool.save()
+        except Exception as exc:                         # noqa: BLE001
+            self.log(f"[panel] 刷新 {acc.name} 额度失败：{exc}")
 
     # --------------------------------------------------------------- state
 
-    def state(self, *, refresh: bool = False) -> Dict[str, Any]:
-        self._refresh_all(only_stale=not refresh)
+    def state(self, *, refresh: bool = False, wait: bool = True) -> Dict[str, Any]:
+        self._refresh_all(only_stale=not refresh, wait=wait)
         accounts = [self._account_view(a) for a in self.pool.accounts]
 
         # one account can hold two sessions (ours + the client's) — count once
@@ -326,7 +360,8 @@ class Panel:
     # --------------------------------------------------------------- writes
 
     def refresh(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        self._refresh_all(only_stale=False)
+        self._refresh_all(only_stale=False, wait=True)
+        self.pool.save()
         return self.state()
 
     def add_account(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -771,6 +806,31 @@ class Panel:
         self.log(f"[panel] 已删除账号 {name}")
         return {"ok": True, "removed": name, "state": self.state()}
 
+    def check_accounts(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Health-check (and repair) the pool; ``force`` re-logs everyone.
+
+        Without ``force`` only accounts that look broken are touched: an
+        invalid/missing session, an expired one, or one the upstream rejects.
+        ``names`` limits the run to specific accounts.
+        """
+        payload = payload or {}
+        force = bool(payload.get("force"))
+        names = payload.get("names")
+        if isinstance(names, str):
+            names = [names]
+        self.log(f"[panel] 账号池检测开始（force={force}, "
+                 f"{len(names) if names else '全部'}）")
+        results = self.pool.check_all(force=force, names=names)
+        ok = sum(1 for r in results if r.get("ok"))
+        repaired = sum(1 for r in results if r.get("action") == "relogin"
+                       and r.get("ok"))
+        failed = [r for r in results if not r.get("ok")]
+        self.log(f"[panel] 账号池检测完成：正常 {ok}/{len(results)}，"
+                 f"重登修复 {repaired}，异常 {len(failed)}")
+        return {"ok": True, "total": len(results), "healthy": ok,
+                "repaired": repaired, "failed": len(failed),
+                "results": results, "state": self.state()}
+
     def renew_account(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         name = str(payload.get("name") or "").strip()
         acc = self._resolve_account(name)
@@ -980,6 +1040,99 @@ class Panel:
         data = self._with_session(
             acc, lambda s: self.gw.models_client.onboarding_tasks(s))
         return {"ok": True, "account": acc.name, "tasks": data}
+
+    def invite_auto(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Bind an invitation code to every account that has none.
+
+        The pool is self-sufficient: every account owns a long-term code
+        (``maxUses=1000``) plus one-shot codes, so an unbound account takes a
+        spare code from *another* account. Binding is sequential — the upstream
+        counts activations per account, and a parallel burst looks abusive.
+        """
+        payload = payload or {}
+        # ``applied_invitation_code`` is only learned from the points overview
+        # (never from login), so accounts that were never inspected still show
+        # a blank here. Ask the upstream once for the ones we do not know
+        # about instead of risking a double activation.
+        unknown = [a for a in self.pool.accounts
+                   if a.enabled and a.session
+                   and not a.applied_invitation_code and a.activated is None]
+        if unknown:
+            def sync(acc):
+                try:
+                    overview = self.gw.models_client.points_overview(acc.session)
+                    acc.activated = bool(overview.get("activated"))
+                    acc.applied_invitation_code = str(
+                        overview.get("applied_invitation_code") or "")
+                except Exception:                    # noqa: BLE001
+                    # Offline or a transient failure: mark as inspected so the
+                    # next run does not re-query, but leave the code blank —
+                    # the activation call itself is the source of truth.
+                    if acc.activated is None:
+                        acc.activated = False
+
+            with ThreadPoolExecutor(max_workers=min(8, len(unknown))) as pool:
+                list(pool.map(sync, unknown))
+            self.pool.save(force=True)
+
+        accs = [a for a in self.pool.accounts
+                if a.enabled and a.session and not a.applied_invitation_code]
+        if not accs:
+            return {"ok": True, "bound": 0, "skipped": len(self.pool.accounts),
+                    "results": [], "message": "所有账号均已绑定邀请码"}
+
+        def spare_codes() -> List[Tuple[str, str]]:
+            """(code, owner) pairs still usable, donors first."""
+            out: List[Tuple[str, str]] = []
+            for acc in self.pool.accounts:
+                if acc.name in {a.name for a in accs}:
+                    continue                      # never bind to itself
+                if not acc.session:
+                    continue
+                try:
+                    codes = self.gw.models_client.points_overview(acc.session).get(
+                        "invitation_codes") or []
+                except Exception:                  # noqa: BLE001
+                    continue
+                for c in codes:
+                    if (c.get("status") == "active"
+                            and int(c.get("maxUses") or 0) > int(c.get("usedCount") or 0)):
+                        code = str(c.get("inviteCode") or "")
+                        if code:
+                            # Long-term codes last: put them first so one-shot
+                            # spares stay available for later accounts.
+                            out.append((0 if int(c.get("maxUses") or 0) >= 1000 else 1,
+                                        code, acc.name))
+            out.sort(key=lambda t: t[0])
+            return [(code, owner) for _, code, owner in out]
+
+        donors = spare_codes()
+        results: List[Dict[str, Any]] = []
+        donor_idx = 0
+        for acc in accs:
+            if donor_idx >= len(donors):
+                results.append({"account": acc.name, "ok": False,
+                                "error": "池内没有可用邀请码"})
+                continue
+            code, owner = donors[donor_idx]
+            donor_idx += 1
+            try:
+                activated = self.points_activate({"name": acc.name, "code": code})
+                results.append({"account": acc.name, "ok": True, "code": code,
+                                "from": owner,
+                                "already": bool((activated.get("result") or {})
+                                                .get("alreadyActivated"))})
+                self.log(f"[panel] {acc.name} 自动绑定邀请码 {code}（来自 {owner}）")
+            except Exception as exc:                # noqa: BLE001
+                results.append({"account": acc.name, "ok": False,
+                                "code": code, "error": str(exc)[:200]})
+                self.log(f"[panel] {acc.name} 自动绑定邀请码失败：{exc}")
+
+        self.pool.save(force=True)
+        ok = sum(1 for r in results if r.get("ok"))
+        return {"ok": True, "bound": ok, "failed": len(results) - ok,
+                "results": results,
+                "message": f"绑定成功 {ok}/{len(results)}"}
 
     def checkin(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Daily check-in — the mobile client's use of ``points/first-login``.

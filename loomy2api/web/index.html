@@ -189,9 +189,21 @@
       <input id="apiKey" type="password" placeholder="API Key（如需）" style="width:170px">
       <button id="saveKey">保存 Key</button>
       <label class="row" style="margin:0;color:var(--muted)">
+        选号
+        <select id="strategy" style="min-width:130px">
+          <option value="balance">余额均衡</option>
+          <option value="daily">先用活动余额</option>
+          <option value="permanent">先用永久余额</option>
+          <option value="round_robin">顺序轮询</option>
+          <option value="lru">最久未用</option>
+          <option value="weighted">加权随机</option>
+        </select>
+      </label>
+      <label class="row" style="margin:0;color:var(--muted)">
         <input id="auto" type="checkbox" checked style="min-width:auto"> 自动刷新
       </label>
       <button id="setAllPasswords">一键设置密码</button>
+      <button id="checkPool">检测续期</button>
       <button id="showSmsReg" hidden>接码注册</button>
       <button class="primary" id="refresh">刷新额度</button>
     </div>
@@ -254,6 +266,7 @@
       </div>
       <button id="applyInvite">提交邀请码</button>
       <button id="doCheckin">每日签到</button>
+      <button id="doInviteAuto">一键绑定邀请码</button>
       <button class="primary" id="doOnboarding">一键新手任务</button>
     </div>
     <div id="taskResults" style="margin-top:10px;display:none">
@@ -287,7 +300,7 @@
     <div class="hint mono" style="line-height:1.9;margin-top:8px">
       OpenAI: POST /v1/chat/completions · GET /v1/models · POST /v1/embeddings · POST /v1/images/generations<br>
       Anthropic: POST /v1/messages<br>
-      控制面板 API: GET /api/panel/state · POST /api/panel/accounts · /accounts/update · /accounts/remove · /accounts/renew · /accounts/identity · /accounts/password · /accounts/passwords · /refresh
+      控制面板 API: GET /api/panel/state · POST /api/panel/accounts · /accounts/update · /accounts/remove · /accounts/renew · /accounts/check · /accounts/identity · /accounts/password · /accounts/passwords · /refresh
     </div>
   </details>
 </div>
@@ -366,6 +379,9 @@ function num(v) { return (v === null || v === undefined) ? '—' : v; }
 
 function render(state) {
   const t = state.totals, c = state.config;
+  // reflect the live strategy without clobbering what the user is selecting
+  const sel = $('strategy');
+  if (document.activeElement !== sel) sel.value = c.strategy || 'balance';
   $('cards').innerHTML = [
     ['账号 Accounts', t.accounts + ' <small>/ 可用 ' + t.usable + '</small>'],
     ['可用积分 Available', t.available + (t.unique_accounts !== t.accounts ? ' <small>(去重 ' + t.unique_accounts + ' 号)</small>' : '')],
@@ -1026,6 +1042,28 @@ async function doCheckin() {
   }
 }
 
+/** Bind a spare invitation code to every unbound account (pool-wide). */
+async function doInviteAuto() {
+  $('pointsMsg').textContent = '一键绑定邀请码：检查中…';
+  const btn = $('doInviteAuto');
+  btn.disabled = true;
+  try {
+    const res = await api('/api/panel/accounts/invite-auto', {method: 'POST', body: '{}'});
+    $('pointsMsg').textContent = res.message || ('绑定成功 ' + (res.bound ?? 0));
+    if (res.bound > 0) {
+      toast('✓ ' + res.message, 'ok');
+      await load(true);
+    } else {
+      toast(res.message || '所有账号均已绑定', 'ok');
+    }
+  } catch (e) {
+    $('pointsMsg').textContent = '一键绑定邀请码失败：' + e.message;
+    toast('绑定失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function loadLog() {
   try {
     const res = await api('/api/panel/logs?lines=250');
@@ -1063,6 +1101,7 @@ $('pointsAccount').onchange = loadPoints;
 $('applyInvite').onclick = applyInvite;
 $('doOnboarding').onclick = doOnboarding;
 $('doCheckin').onclick = doCheckin;
+$('doInviteAuto').onclick = doInviteAuto;
 $('showAdd').onclick = () => openAddModal('pwd');
 $('showImport').onclick = () => openAddModal('import');
 
@@ -1100,6 +1139,45 @@ async function exportAccounts() {
 }
 $('exportAccounts').onclick = exportAccounts;
 $('setAllPasswords').onclick = setAllPasswords;
+$('checkPool').onclick = checkPool;
+
+async function checkPool() {
+  if (!LAST_STATE) { toast('账号状态未加载', 'err'); return; }
+  const enabled = LAST_STATE.accounts.filter(a => a.enabled);
+  const broken = enabled.filter(a =>
+    !a.session || a.session_days_left === null || a.session_days_left <= 0);
+  let intro = '将逐个检查 ' + enabled.length + ' 个启用账号：读一次额度，'
+    + 'session 失效或缺失的账号会用密码自动重登。'
+    + (broken.length ? '\n\n当前有 ' + broken.length + ' 个账号看起来需要续期。' : '')
+    + '\n\n耗时约 ' + Math.ceil(enabled.length / 8) + ' 秒。';
+  if (!confirm(intro + '\n\n开始检测？')) return;
+  const force = confirm('是否强制所有账号重新登录？\n\n'
+    + '确定 = 全部重登（会替换所有 session）\n'
+    + '取消 = 只修复异常账号');
+  const btn = $('checkPool');
+  btn.disabled = true; btn.textContent = '检测中…';
+  try {
+    const res = await api('/api/panel/accounts/check', {
+      method: 'POST',
+      body: JSON.stringify({force: force}),
+    });
+    const rows = res.results || [];
+    const bad = rows.filter(r => !r.ok);
+    let msg = '检测完成：正常 ' + res.healthy + '/' + res.total;
+    if (res.repaired) msg += '，自动重登修复 ' + res.repaired;
+    if (bad.length) msg += '，仍有 ' + bad.length + ' 个异常';
+    toast(msg, bad.length ? 'err' : 'ok');
+    if (bad.length) {
+      alert('以下账号仍有问题：\n\n' + bad.map(r =>
+        r.name + '  ' + (r.error || '未知错误')).join('\n'));
+    }
+    if (res.state) { LAST_STATE = res.state; render(res.state); }
+  } catch (e) {
+    toast('检测失败：' + e.message, 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = '检测续期';
+  }
+}
 
 async function setAllPasswords() {
   if (!LAST_STATE) { toast('账号状态未加载', 'err'); return; }
@@ -1276,6 +1354,25 @@ $('saveKey').onclick = () => {
   load(true); loadLog();
 };
 $('apiKey').value = KEY;
+
+/** Persist the routing strategy (same whitelist the mobile client uses). */
+$('strategy').onchange = async () => {
+  const value = $('strategy').value;
+  const sel = $('strategy');
+  sel.disabled = true;
+  try {
+    await api('/api/panel/config', {
+      method: 'POST', body: JSON.stringify({strategy: value})
+    });
+    toast('选号策略已切换：' + sel.options[sel.selectedIndex].text, 'ok');
+    load(true);
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+    load(true);          // roll the select back to the live value
+  } finally {
+    sel.disabled = false;
+  }
+};
 
 // phones: the points/invite block is rarely needed and very tall — start collapsed
 if (window.matchMedia && window.matchMedia('(max-width:760px)').matches) {

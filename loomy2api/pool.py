@@ -522,26 +522,46 @@ class AccountPool:
                  f"session={acc.session[:8]}… 剩余 {(acc.days_left or 0):.1f} 天")
         return acc
 
-    def refresh_quota(self, acc: Account) -> Account:
+    def refresh_quota(self, acc: Account, *, relogin: bool = True) -> Account:
         """Refresh one account's points; never raises.
 
         This runs from the panel, the CLI and the background keeper — any of
         which can be offline, behind a dead proxy, or talking to an upstream
         that is simply down. A failed refresh must degrade to "quota unknown",
         not crash the caller (a socket/DNS error is *not* an UpstreamError).
+
+        A session the upstream rejects is re-obtained when possible: the
+        points endpoint answers HTTP 200 with ``code=100002 登录已失效`` for a
+        dead session, so without this the account would sit at "quota unknown"
+        forever while its stored password was perfectly good.
         """
-        if not acc.session:
+        if not acc.session and not (relogin and acc.has_password):
             return acc
+        acc.quota_checked_at = time.time()
         try:
             quota = self.gateway.quota(acc.session)
         except UpstreamError as exc:
-            if exc.status in (401, 403):
-                acc.session, acc.expire_at = "", 0
-                self.log(f"账号 {acc.name} session 被上游拒绝（HTTP {exc.status}）")
-            else:
+            if exc.status not in (401, 403):
                 acc.last_error = f"quota: {exc}"
                 self.log(f"账号 {acc.name} 额度查询失败：{exc}")
-            return acc
+                return acc
+            self.log(f"账号 {acc.name} session 被上游拒绝（HTTP {exc.status}）")
+            if not (relogin and acc.has_password):
+                acc.session, acc.expire_at = "", 0
+                acc.last_error = f"quota: {exc}"
+                return acc
+            acc.session, acc.expire_at = "", 0
+            try:
+                self.ensure_session(acc)
+                quota = self.gateway.quota(acc.session)
+            except (AccountError, PoolError, UpstreamError) as relogin_exc:
+                acc.last_error = f"quota: {exc}; relogin: {relogin_exc}"
+                self.log(f"账号 {acc.name} 额度查询失败，重登也没成功：{relogin_exc}")
+                return acc
+            except Exception as relogin_exc:             # noqa: BLE001
+                acc.last_error = f"quota: {exc}; relogin: {relogin_exc}"
+                self.log(f"账号 {acc.name} 额度查询异常（网络？）：{relogin_exc}")
+                return acc
         except Exception as exc:                        # noqa: BLE001
             acc.last_error = f"quota: {exc}"
             self.log(f"账号 {acc.name} 额度查询异常（网络？）：{exc}")
@@ -550,7 +570,104 @@ class AccountPool:
         acc.daily_balance = quota.get("daily_balance")
         acc.available = quota.get("available")
         acc.quota_updated_at = int(time.time())
+        acc.quota_checked_at = acc.quota_updated_at
+        acc.last_error = ""
         return acc
+
+    # ------------------------------------------------------- health check
+
+    def check_account(self, acc: Account, *, force: bool = False) -> Dict[str, Any]:
+        """Probe one account and repair it when possible.
+
+        Used by the panel's "check the pool" action.  Unlike ``acquire`` this
+        is explicit: the user asked for a verdict, so it never raises and
+        reports every step that was attempted.
+
+        Order matters:
+
+        1. a missing expiry timestamp is treated as "needs a login" — a
+           session without ``expire_at`` cannot be scheduled for renewal, and
+           it is how imported/hand-edited rows end up never renewing;
+        2. a live session gets its quota read (cheap, no side effects);
+        3. if the quota read is rejected (401) or the session is missing, log
+           in again — which also rotates a rejected password when possible;
+        4. finally, read the quota again so the caller gets a real balance.
+        """
+        result: Dict[str, Any] = {
+            "name": acc.name,
+            "ok": False,
+            "action": "none",
+            "before_days": acc.days_left,
+            "error": "",
+        }
+        if not acc.enabled:
+            result["action"] = "skipped"
+            result["error"] = "账号已禁用"
+            return result
+        if not (acc.loginid and acc.password):
+            result["action"] = "skipped"
+            result["error"] = "没有账号密码，无法自动重登（需要短信登录）"
+            return result
+
+        needs_login = force or not acc.session_valid or acc.days_left is None
+        if not needs_login:
+            try:
+                self.gateway.quota(acc.session)
+            except UpstreamError as exc:
+                if exc.status in (401, 403):
+                    needs_login = True
+                    result["error"] = "session 被上游拒绝"
+                else:
+                    result["error"] = f"额度查询失败：{exc}"
+            except Exception as exc:                     # noqa: BLE001
+                result["error"] = f"额度查询异常：{exc}"
+
+        if needs_login:
+            try:
+                self.ensure_session(acc, force=True)
+                result["action"] = "relogin"
+                result["error"] = ""
+            except (AccountError, PoolError) as exc:
+                result["error"] = str(exc)
+                self.save()
+                return result
+        else:
+            result["action"] = "quota"
+
+        self.refresh_quota(acc)
+        result["after_days"] = acc.days_left
+        result["available"] = acc.available
+        result["ok"] = bool(acc.session_valid) and acc.available != 0
+        if not result["ok"] and not result["error"]:
+            result["error"] = "额度为 0" if acc.available == 0 else "session 仍不可用"
+        self.save()
+        return result
+
+    def check_all(self, *, force: bool = False,
+                  names: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+        """Health-check every enabled account, concurrently.
+
+        Each probe is a couple of network round-trips, so a 40-account pool
+        would take minutes serially.  Results keep the pool's order.
+        """
+        wanted = set(names) if names else None
+        targets = [a for a in self.accounts
+                   if a.enabled and (wanted is None or a.name in wanted)]
+        if not targets:
+            return []
+        with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+            results = list(pool.map(
+                lambda a: self._check_guarded(a, force), targets))
+        self.save(force=True)
+        return results
+
+    def _check_guarded(self, acc: Account, force: bool) -> Dict[str, Any]:
+        try:
+            return self.check_account(acc, force=force)
+        except Exception as exc:                         # noqa: BLE001
+            # One account must never abort the batch.
+            return {"name": acc.name, "ok": False, "action": "error",
+                    "error": str(exc)}
 
     # ------------------------------------------------------------ routing
 

@@ -103,6 +103,11 @@ class FakeUpstream:
     def __init__(self):
         self.valid_sessions: Optional[List[str]] = None   # None = accept any
         self.exhausted_sessions: List[str] = []
+        #: When true, ``/points/records`` answers HTTP 200 with the real
+        #: dead-session body (``code=100002 登录已失效``) instead of a 401.
+        #: That is what the upstream actually does, and ignoring it is what
+        #: made the panel report "quota unknown" forever.
+        self.points_session_invalid = False
         #: model-id substring → (status, message); simulates upstream hiccups
         self.reject_with: Dict[str, Any] = {}
         #: model-id substrings the provider's content inspection refuses.  The
@@ -201,6 +206,10 @@ class FakeUpstream:
                 if path.endswith("/models"):
                     return fake._send_json(self, fake.models_payload)
                 if path.endswith("/points/records"):
+                    if fake.points_session_invalid:
+                        return fake._send_json(self, {
+                            "code": "100002", "desc": "登录已失效，请重新登录",
+                            "data": {}})
                     return fake._send_json(self, {
                         "code": "000000", "desc": "成功",
                         "data": dict(fake.quota, list=[])})

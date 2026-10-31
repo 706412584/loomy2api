@@ -148,6 +148,10 @@ class Account:
     #: inside the window only extends the upstream lockout, while the session
     #: we already have usually keeps working.
     login_blocked_until: float = 0.0
+    #: When the quota was last *attempted* (successful or not).  The panel
+    #: polls every 10 s; without this a failing account would be re-probed
+    #: (and possibly re-logged in) on every poll.
+    quota_checked_at: float = 0.0
     last_used: float = 0.0
     requests: int = 0
     points_used: int = 0

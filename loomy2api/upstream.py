@@ -108,7 +108,13 @@ class ModelGateway:
             timeout=30, proxy=str(self.cfg.get("proxy") or ""))
         if status != 200:
             raise UpstreamError(f"/points/records HTTP {status}", status)
-        return json.loads(data.decode("utf-8"))
+        payload = json.loads(data.decode("utf-8"))
+        # A dead session answers HTTP 200 with ``code=100002 登录已失效`` and an
+        # empty ``data``.  Without this check the empty payload parsed into
+        # ``balance=None`` and the panel showed the account as "unknown" for
+        # ever instead of re-logging it in.
+        _check_payload(status, payload, data, "/points/records")
+        return payload
 
     def quota(self, session: str) -> Dict[str, Any]:
         """→ ``{balance, daily_balance, available}``."""

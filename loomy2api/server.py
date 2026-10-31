@@ -198,6 +198,25 @@ class Gateway:
         self.pool.start()
         self.refresh_models()
 
+    def start_background(self) -> None:
+        """Do the slow startup work without blocking the HTTP listener.
+
+        Logging in every expired account and fetching the model catalogue are
+        network round-trips; with a large pool this used to delay binding the
+        port by minutes, so the app looked stuck on "starting the gateway".
+        The listener now binds first and this runs right after it. Requests
+        that arrive early still work: ``pool.acquire`` renews a session on
+        demand, and ``catalogue()`` falls back to the built-in model list until
+        the upstream answers.
+        """
+        def run() -> None:
+            try:
+                self.start()
+            except Exception as exc:                    # noqa: BLE001
+                self.log(f"[warn] 后台启动失败：{exc}")
+
+        threading.Thread(target=run, name="gateway-startup", daemon=True).start()
+
 
 # ------------------------------------------------------------------ handler
 
@@ -488,7 +507,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._accounts()
             if path == "/api/panel/state":
                 refresh = "refresh=1" in (self.path or "")
-                return self._json(200, self.gateway.panel.state(refresh=refresh))
+                # The mobile UI asks for cached data (`async=1`): with a large
+                # pool, waiting for every quota round-trip made the home screen
+                # look stuck. An explicit refresh still waits for fresh values.
+                wait = "async=1" not in (self.path or "")
+                return self._json(200, self.gateway.panel.state(
+                    refresh=refresh, wait=wait))
             if path == "/api/panel/logs":
                 lines = self._query_int("lines", 200)
                 return self._json(200, self.gateway.panel.logs(lines))
@@ -565,6 +589,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/points/onboarding": panel.onboarding,
             "/api/panel/points/onboarding-state": panel.onboarding_state,
             "/api/panel/points/checkin": panel.checkin,
+            "/api/panel/accounts/invite-auto": panel.invite_auto,
             "/api/panel/accounts": panel.add_account,
             "/api/panel/accounts/import": panel.import_accounts,
             "/api/panel/accounts/sms": panel.sms_send,
@@ -577,6 +602,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/fysms/balance": panel.fysms_balance,
             "/api/panel/accounts/remove": panel.remove_account,
             "/api/panel/accounts/renew": panel.renew_account,
+            "/api/panel/accounts/check": panel.check_accounts,
             "/api/panel/accounts/identity": panel.identity,
             "/api/panel/refresh": lambda _p: panel.refresh(_p),
             "/api/panel/config": panel.update_config,
@@ -1305,12 +1331,15 @@ def serve(cfg, *, gateway: Optional[Gateway] = None,
     interface without leaving the old socket in place.
     """
     gw = gateway or Gateway(cfg)
-    gw.start()
 
     handler = type("BoundHandler", (Handler,), {"gateway": gw})
     httpd = Server((str(cfg["host"]), int(cfg["port"])), handler)
     if on_server is not None:
         on_server(httpd)
+    # Bind first, then log in expired accounts / fetch the catalogue in the
+    # background: with a large pool the old synchronous startup kept the port
+    # closed for minutes (the app looked stuck on "starting the gateway").
+    gw.start_background()
     gw.log(f"loomy2api 已启动 / listening → http://{cfg['host']}:{cfg['port']}"
            f"  (OpenAI: /v1/chat/completions · Anthropic: /v1/messages)"
            f"  账号 {len(gw.pool.accounts)} 个，可用 {len(gw.pool.usable())} 个")
@@ -1320,6 +1349,7 @@ def serve(cfg, *, gateway: Optional[Gateway] = None,
         gw.log("收到中断，退出 / interrupted, shutting down")
     finally:
         gw.pool.stop()
+        gw.panel.shutdown()
         gw.pool.flush()
         httpd.server_close()
     return gw

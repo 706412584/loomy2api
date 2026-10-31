@@ -603,6 +603,83 @@ class TestSessionLifecycle(unittest.TestCase):
         self.assertFalse(pool.get("b").permanent)
         self.assertTrue(pool.get("a").public_dict()["permanent"])
 
+    def test_quota_refresh_relogins_on_rejected_session(self):
+        """A 100002 "登录已失效" payload must re-login, not report "unknown"."""
+        from tests.support import write_accounts
+        from loomy2api.upstream import UpstreamError
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "pw",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "dead", "expireAt": int(time.time()) + 11 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        calls = []
+
+        class FakeGateway:
+            def quota(self, session):
+                calls.append(session)
+                if session == "dead":
+                    raise UpstreamError("登录已失效，请重新登录", 401)
+                return {"balance": 100, "daily_balance": 50, "available": 150}
+
+        pool.gateway = FakeGateway()
+        pool.client = type("C", (), {
+            "fill": lambda self, a: (setattr(a, "session", "fresh"),
+                                     setattr(a, "expire_at", int(time.time()) + 14 * 86400),
+                                     a)[-1],
+        })()
+        pool.refresh_quota(acc)
+        self.assertEqual(calls, ["dead", "fresh"])
+        self.assertEqual(acc.available, 150)
+        self.assertTrue(acc.session_valid)
+
+    def test_quota_refresh_does_not_loop_on_failed_relogin(self):
+        from tests.support import write_accounts
+        from loomy2api.upstream import UpstreamError
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "pw",
+             "session": "dead", "expireAt": int(time.time()) + 11 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        calls = []
+
+        class FakeGateway:
+            def quota(self, session):
+                calls.append(session)
+                raise UpstreamError("登录已失效", 401)
+
+        class FakeClient:
+            def fill(self, account):
+                from loomy2api.account import AccountError
+                raise AccountError("密码错误", code="220204")
+
+        pool.gateway = FakeGateway()
+        pool.client = FakeClient()
+        pool.refresh_quota(acc)
+        self.assertEqual(len(calls), 1)              # one retry, not a loop
+        self.assertIn("relogin", acc.last_error)
+
+    def test_points_records_raises_on_business_error(self):
+        """HTTP 200 + code 100002 must not be parsed as a successful empty read."""
+        from tests.support import FakeUpstream
+        from loomy2api.upstream import ModelGateway, UpstreamError
+
+        upstream = FakeUpstream()
+        base = upstream.start()
+        try:
+            upstream.points_session_invalid = True
+            cfg = make_config(self.dir, base)
+            gw = ModelGateway(cfg)
+            with self.assertRaises(UpstreamError) as ctx:
+                gw.quota("whatever")
+            self.assertEqual(ctx.exception.status, 401)
+        finally:
+            upstream.stop()
+
     def test_tick_clears_session_on_401(self):
         from loomy2api.upstream import UpstreamError
         from tests.support import write_accounts

@@ -177,6 +177,56 @@ class TestPanelWrites(PanelHarness, unittest.TestCase):
             self.post("/api/panel/accounts/renew", {"name": "nope"})
         self.assertEqual(ctx.exception.code, 400)
 
+    def test_check_pool_repairs_expired_session(self):
+        """A session the pool cannot schedule for renewal gets re-logged in."""
+        self.gateway.pool.add_account("b", loginid="13900000009", password="pw")
+        acc = self.gateway.pool.get("b")
+        acc.session, acc.expire_at = "stale", 0        # imported without expiry
+        _s, payload = self.post("/api/panel/accounts/check", {})
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual(payload["repaired"], 1)
+        self.assertEqual(payload["failed"], 0)
+        row = next(r for r in payload["results"] if r["name"] == "b")
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["action"], "relogin")
+        self.assertAlmostEqual(acc.days_left, 14, delta=0.1)
+        self.assertIn("b", self.gateway.pool.client.fills)
+
+    def test_check_pool_leaves_healthy_accounts_alone(self):
+        _s, payload = self.post("/api/panel/accounts/check", {})
+        row = payload["results"][0]
+        self.assertEqual(row["action"], "quota")
+        self.assertTrue(row["ok"])
+        self.assertEqual(self.gateway.pool.client.fills, [])
+
+    def test_check_pool_force_relogins_everyone(self):
+        _s, payload = self.post("/api/panel/accounts/check", {"force": True})
+        row = payload["results"][0]
+        self.assertEqual(row["action"], "relogin")
+        self.assertEqual(self.gateway.pool.client.fills, ["a"])
+
+    def test_check_pool_reports_failure_without_aborting(self):
+        self.gateway.pool.add_account("b", loginid="13900000009", password="pw")
+        self.gateway.pool.get("b").session, self.gateway.pool.get("b").expire_at = "", 0
+
+        original = self.gateway.pool.client.fill
+
+        def fill(account):
+            if account.name == "b":
+                from loomy2api.account import AccountError
+                raise AccountError("密码错误", code="220204")
+            return original(account)
+
+        self.gateway.pool.client.fill = fill
+        _s, payload = self.post("/api/panel/accounts/check", {})
+        self.assertEqual(payload["total"], 2)          # batch finished
+        self.assertEqual(payload["healthy"], 1)
+        self.assertEqual(payload["failed"], 1)
+        bad = next(r for r in payload["results"] if r["name"] == "b")
+        self.assertFalse(bad["ok"])
+        self.assertIn("密码错误", bad["error"])
+
     def test_rebind_identity_changes_devid(self):
         before = self.gateway.pool.get("a").identity["devid"]
         _s, payload = self.post("/api/panel/accounts/identity",
