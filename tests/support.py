@@ -117,6 +117,12 @@ class FakeUpstream:
         self.empty_stream_sessions: List[str] = []
         #: model-id substring → (status, message); simulates upstream hiccups
         self.reject_with: Dict[str, Any] = {}
+        #: model-id substring → [status, times]: reject the *first* ``times``
+        #: matching chat calls with ``status``, then succeed.  Simulates the
+        #: upstream's short 502/504 bursts that clear on their own, so a test
+        #: can prove the gateway's retry-with-backoff recovers from them.
+        self.flaky_chat: Dict[str, Any] = {}
+        self._flaky_seen: Dict[str, int] = {}
         #: model-id substrings the provider's content inspection refuses.  The
         #: reply carries the real upstream shape (403 + ``data_inspection_failed``)
         #: because the gateway keys off those fields to tell "the payload was
@@ -245,6 +251,12 @@ class FakeUpstream:
                     for needle, (status, message) in fake.reject_with.items():
                         if needle in str(model):
                             return fake._reject(self, status, message)
+                    for needle, (status, times) in fake.flaky_chat.items():
+                        if needle in str(model):
+                            seen = fake._flaky_seen.get(needle, 0)
+                            if seen < times:
+                                fake._flaky_seen[needle] = seen + 1
+                                return fake._reject(self, status, "upstream flaked")
                     if body.get("stream"):
                         if token in fake.empty_stream_sessions:
                             return self._empty_stream()

@@ -44,8 +44,16 @@ DEFAULTS: Dict[str, Any] = {
     # account pool --------------------------------------------------------
     "accounts_file": "accounts.json",
     "strategy": "balance",        # balance | daily | permanent | round_robin | lru | weighted
-    "max_retries": 2,             # extra accounts tried on auth/quota errors
+    "max_retries": 3,             # extra accounts tried on auth/quota errors
     "stream_retries": 2,          # extra attempts when a stream dies mid-flight
+    #: The upstream's model gateway itself returns 502/504/500 in short bursts
+    #: (a whole minute can be bad, then it clears).  Rotating accounts does not
+    #: help — only waiting does — so a retry after an *upstream* (non-account)
+    #: fault pauses first, otherwise every attempt lands inside the same bad
+    #: window and the 502 is handed straight back to the client.  The pause
+    #: doubles each time, capped at ``upstream_fault_backoff_max``.
+    "upstream_fault_backoff": 0.6,
+    "upstream_fault_backoff_max": 5.0,
     "stream_stall_seconds": 180,  # abort/retry a stream that stalls this long
     "thinking_stall_seconds": 240,  # abort/retry a reasoning loop with no output
     "cooldown_seconds": 300,

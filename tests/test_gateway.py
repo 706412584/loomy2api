@@ -298,6 +298,34 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertEqual(payload["choices"][0]["message"]["content"], "echo:ping")
         self.assertFalse(self.gateway.pool.get("a").session_valid)
 
+    def test_upstream_502_burst_is_retried_with_backoff(self):
+        """A short 502/504 burst must be absorbed, not handed to the client.
+
+        The upstream's own gateway flakes in bursts that clear on their own, so
+        the retry has to *wait* between attempts — rotating accounts alone lands
+        every attempt in the same bad window.  One 502 then success must yield a
+        normal answer.
+        """
+        self.cfg["upstream_fault_backoff"] = 0.01     # keep the test fast
+        self.upstream.flaky_chat = {"fake-model": (502, 1)}
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "fake-model", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertIn(b"hello", body)                 # recovered, not a 502
+        chat_calls = [c for c in self.upstream.calls
+                      if c["path"].endswith("/chat/completions")]
+        self.assertGreaterEqual(len(chat_calls), 2)   # it did retry
+
+    def test_upstream_502_burst_is_retried_non_stream(self):
+        self.cfg["upstream_fault_backoff"] = 0.01
+        self.upstream.flaky_chat = {"fake-model": (502, 1)}
+        status, body, _ = self.post("/v1/chat/completions", {
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "ping"}]})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"],
+                         "echo:ping")
+
     def test_empty_stream_retry_switches_account(self):
         """An empty stream must not be retried on the same account."""
         self.gateway.pool.get("a").available = 1000

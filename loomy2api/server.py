@@ -232,6 +232,10 @@ class Handler(BaseHTTPRequestHandler):
     ACCOUNT_FAULT = (401, 403, 402, 429)
     #: Statuses where retrying is pointless (the request itself is wrong).
     FATAL_REQUEST = (400, 404, 422)
+    #: Statuses that are the upstream's *own* fault, not the account's.  They
+    #: arrive in short bursts, so a retry should pause (back off) rather than
+    #: immediately pick another account and land in the same bad window.
+    UPSTREAM_FAULT = (500, 502, 503, 504)
 
     #: 403 sub-types that are *not* the account's fault — see
     #: :data:`loomy2api.constants.CONTENT_FAULT_MARKERS`.
@@ -244,6 +248,25 @@ class Handler(BaseHTTPRequestHandler):
             return False
         body = data[:500].decode("utf-8", "replace")
         return any(marker in body for marker in cls.CONTENT_FAULT_MARKERS)
+
+    def _upstream_backoff(self, attempt: int) -> float:
+        """Pause before retrying an *upstream* fault (500/502/503/504).
+
+        The upstream's own gateway returns these in short bursts that clear on
+        their own, and a different account does not dodge them, so waiting is
+        the only thing that helps.  The delay doubles per attempt:
+        ``base * 2**attempt`` capped at ``upstream_fault_backoff_max``.
+        """
+        base = float(self.gateway.cfg.get("upstream_fault_backoff") or 0)
+        if base <= 0:
+            return 0.0
+        cap = float(self.gateway.cfg.get("upstream_fault_backoff_max") or base)
+        return min(base * (2 ** attempt), cap)
+
+    @staticmethod
+    def _sleep_backoff(delay: float) -> None:
+        if delay > 0:
+            time.sleep(delay)
 
     def setup(self):                               # noqa: D102
         super().setup()
@@ -734,7 +757,7 @@ class Handler(BaseHTTPRequestHandler):
 
         tried: list = []
         last: Tuple[int, bytes] = (0, b"")
-        for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
+        for attempt in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
                 acc = gw.pool.acquire(exclude=tried)
             except PoolError as exc:
@@ -792,8 +815,16 @@ class Handler(BaseHTTPRequestHandler):
                 gw.log(f"[call] {acc.name} {model} http={status} → 账号问题，换账号重试")
                 gw.pool.report_failure(acc, status,
                                        data[:200].decode("utf-8", "replace"))
+            elif status in self.UPSTREAM_FAULT:
+                # upstream hiccup (502/504/500) — do NOT punish the account for
+                # it, but do wait: another account hits the same bad window.
+                delay = self._upstream_backoff(attempt)
+                gw.log(f"[call] {acc.name} {model} http={status}"
+                       f" → 上游异常，等 {delay:.1f}s 后重试（不冷却该账号）")
+                self._sleep_backoff(delay)
+                continue
             else:
-                # upstream hiccup (502/504/500) — do NOT punish the account for it
+                # upstream hiccup the account is not to blame for
                 gw.log(f"[call] {acc.name} {model} http={status} → 上游异常，换账号重试"
                        f"（不冷却该账号）")
             if status in self.FATAL_REQUEST:            # not an account problem
@@ -824,7 +855,7 @@ class Handler(BaseHTTPRequestHandler):
         tried: list = list(exclude)
         conn = resp = None
 
-        for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
+        for attempt in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
                 acc = gw.pool.acquire(exclude=tried)
             except PoolError as exc:
@@ -874,6 +905,16 @@ class Handler(BaseHTTPRequestHandler):
                        f" → 账号问题，换账号重试")
                 gw.pool.report_failure(acc, resp.status,
                                        data[:200].decode("utf-8", "replace"))
+            elif resp.status in self.UPSTREAM_FAULT:
+                # the upstream's own gateway is flaking, and another account
+                # hits the same bad window — pause before retrying, otherwise
+                # every attempt burns inside the burst and this 502 is served.
+                delay = self._upstream_backoff(attempt)
+                gw.log(f"[{log_tag}] {acc.name} {model} stream http={resp.status}"
+                       f" → 上游异常，等 {delay:.1f}s 后重试（不冷却该账号）")
+                conn = resp = None
+                self._sleep_backoff(delay)
+                continue
             else:
                 gw.log(f"[{log_tag}] {acc.name} {model} stream http={resp.status}"
                        f" → 上游异常，换账号重试（不冷却该账号）")
@@ -1169,7 +1210,7 @@ class Handler(BaseHTTPRequestHandler):
 
         tried: list = []
         last: Tuple[int, bytes] = (0, b"")
-        for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
+        for attempt in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
                 acc = gw.pool.acquire(exclude=tried)
             except PoolError as exc:
@@ -1219,6 +1260,12 @@ class Handler(BaseHTTPRequestHandler):
                 gw.pool.report_failure(acc, status,
                                        data[:200].decode("utf-8", "replace"))
                 gw.log(f"[messages] {acc.name} {model} http={status} → 账号问题，换账号重试")
+            elif status in self.UPSTREAM_FAULT:
+                delay = self._upstream_backoff(attempt)
+                gw.log(f"[messages] {acc.name} {model} http={status}"
+                       f" → 上游异常，等 {delay:.1f}s 后重试（不冷却该账号）")
+                self._sleep_backoff(delay)
+                continue
             else:
                 gw.log(f"[messages] {acc.name} {model} http={status}"
                        f" → 上游异常，换账号重试（不冷却该账号）")
