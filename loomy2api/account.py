@@ -170,6 +170,10 @@ class Account:
     #: polls every 10 s; without this a failing account would be re-probed
     #: (and possibly re-logged in) on every poll.
     quota_checked_at: float = 0.0
+    #: Consecutive 401/403 rejections seen by the *quota* read path.  The
+    #: upstream emits transient ones under burst load; only a run of them means
+    #: the session is really dead.  Reset to 0 on any successful read.
+    quota_auth_faults: int = 0
     last_used: float = 0.0
     requests: int = 0
     points_used: int = 0

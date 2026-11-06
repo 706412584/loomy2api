@@ -742,8 +742,76 @@ class TestSessionLifecycle(unittest.TestCase):
         self.assertFalse(acc.in_cooldown, "background recovery must clear it")
         self.assertEqual(acc.session, "fresh")
 
-    def test_quota_refresh_relogins_on_rejected_session(self):
-        """A 100002 "登录已失效" payload must re-login, not report "unknown"."""
+    def test_transient_401_is_retried_not_relogged_in(self):
+        """A single fake 401 must be absorbed by the retry, not drop the session.
+
+        The upstream emits transient "登录已失效" under burst load while the
+        session is fine; reacting to one kicks off a re-login that invalidates
+        the session a parallel request is still using (the "顶号" storm).
+        """
+        from tests.support import write_accounts
+        from loomy2api.upstream import UpstreamError
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "pw",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "s", "expireAt": int(time.time()) + 11 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        calls = []
+
+        class FakeGateway:
+            def quota(self, session):
+                calls.append(session)
+                if len(calls) == 1:                  # first read blips
+                    raise UpstreamError("登录已失效，请重新登录", 401)
+                return {"balance": 100, "daily_balance": 50, "available": 150}
+
+        pool.gateway = FakeGateway()
+        pool.client = type("C", (), {
+            "fill": lambda self, a: self.fail("re-login must not run"),
+        })()
+        pool.refresh_quota(acc)
+        self.assertEqual(calls, ["s", "s"])          # retried the same session
+        self.assertEqual(acc.available, 150)
+        self.assertEqual(acc.quota_auth_faults, 0)
+        self.assertTrue(acc.session_valid)
+
+    def test_business_error_200_is_retried(self):
+        """A "系统内部错误" arrives as HTTP-200 + a business code (status 200).
+
+        It must be treated as a transient read fault, not a verdict — missing
+        this branch left the retry to cover only 401s and let the error through.
+        """
+        from tests.support import write_accounts
+        from loomy2api.upstream import UpstreamError
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "session": "s",
+             "expireAt": int(time.time()) + 14 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        calls = []
+
+        class FakeGateway:
+            def quota(self, session):
+                calls.append(session)
+                if len(calls) == 1:
+                    # exactly how upstream._check_payload raises for
+                    # "HTTP 200: 系统内部错误"
+                    raise UpstreamError("/points/records HTTP 200: 系统内部错误", 200)
+                return {"balance": 7, "daily_balance": 3, "available": 10}
+
+        pool.gateway = FakeGateway()
+        pool.refresh_quota(acc)
+        self.assertEqual(calls, ["s", "s"])           # retried
+        self.assertEqual(acc.available, 10)
+        self.assertEqual(acc.last_error, "")
+
+    def test_consecutive_401s_relogin_on_rejected_session(self):
+        """A run of 401s is a dead session and must re-login, not report "unknown"."""
         from tests.support import write_accounts
         from loomy2api.upstream import UpstreamError
 
@@ -769,8 +837,11 @@ class TestSessionLifecycle(unittest.TestCase):
                                      setattr(a, "expire_at", int(time.time()) + 14 * 86400),
                                      a)[-1],
         })()
-        pool.refresh_quota(acc)
-        self.assertEqual(calls, ["dead", "fresh"])
+        pool.refresh_quota(acc)                      # 2 rejections → faults=1, no relogin
+        self.assertTrue(acc.session_valid)
+        self.assertEqual(acc.quota_auth_faults, 1)
+        pool.refresh_quota(acc)                      # faults=2 → relogin fires
+        self.assertIn("fresh", calls)
         self.assertEqual(acc.available, 150)
         self.assertTrue(acc.session_valid)
 
@@ -798,8 +869,11 @@ class TestSessionLifecycle(unittest.TestCase):
 
         pool.gateway = FakeGateway()
         pool.client = FakeClient()
-        pool.refresh_quota(acc)
-        self.assertEqual(len(calls), 1)              # one retry, not a loop
+        pool.refresh_quota(acc)                      # retries, no relogin yet
+        self.assertEqual(len(calls), 3)              # 1 + auth_retry_attempts
+        self.assertEqual(acc.quota_auth_faults, 1)
+        pool.refresh_quota(acc)                      # now it tries to re-login
+        self.assertEqual(len(calls), 6)              # one more retry batch
         self.assertIn("relogin", acc.last_error)
 
     def test_points_records_raises_on_business_error(self):
@@ -819,7 +893,13 @@ class TestSessionLifecycle(unittest.TestCase):
         finally:
             upstream.stop()
 
-    def test_tick_clears_session_on_401(self):
+    def test_tick_clears_session_after_repeated_401(self):
+        """A session-less account drops out only after a *run* of 401s, not one.
+
+        The credentials are missing here, so there is no re-login to fall back
+        on — but the same "don't trust a single blip" rule applies: the first
+        tick records a fault, the second confirms it and clears the session.
+        """
         from loomy2api.upstream import UpstreamError
         from tests.support import write_accounts
 
@@ -834,7 +914,9 @@ class TestSessionLifecycle(unittest.TestCase):
 
         pool.gateway = FakeGateway()
         pool.tick()
-        self.assertFalse(pool.get("a").session_valid)
+        self.assertTrue(pool.get("a").session_valid)   # one blip, kept
+        pool.tick()
+        self.assertFalse(pool.get("a").session_valid)  # confirmed, dropped
 
 
 if __name__ == "__main__":

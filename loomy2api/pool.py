@@ -560,7 +560,7 @@ class AccountPool:
             return acc
         acc.quota_checked_at = time.time()
         try:
-            quota = self.gateway.quota(acc.session)
+            quota = self._read_quota_with_retry(acc)
         except UpstreamError as exc:
             if getattr(exc, "banned", False):
                 # The upstream disabled this account.  Re-login cannot help, so
@@ -571,6 +571,18 @@ class AccountPool:
             if exc.status not in (401, 403):
                 acc.last_error = f"quota: {exc}"
                 self.log(f"账号 {acc.name} 额度查询失败：{exc}")
+                return acc
+            # 401/403 that survived the retries.  Under burst load the upstream
+            # also comes back with a *fake* 401 ("登录已失效") while the session
+            # is fine, and reacting to a single one kicks off a re-login that
+            # invalidates the session a parallel request is still using — the
+            # "顶号" login storm.  Demand a run of consecutive faults first.
+            acc.quota_auth_faults = getattr(acc, "quota_auth_faults", 0) + 1
+            need = int(self.cfg.get("quota_auth_faults_before_relogin") or 2)
+            if acc.quota_auth_faults < max(1, need):
+                self.log(f"账号 {acc.name} 额度读取连续 401（{acc.quota_auth_faults}/{need}），"
+                         f"暂不重登")
+                acc.last_error = f"quota: {exc}"
                 return acc
             self.log(f"账号 {acc.name} session 被上游拒绝（HTTP {exc.status}）")
             if not (relogin and acc.has_password):
@@ -610,8 +622,49 @@ class AccountPool:
             acc.ledger_total = int(quota["ledger_total"])
         acc.quota_updated_at = int(time.time())
         acc.quota_checked_at = acc.quota_updated_at
+        acc.quota_auth_faults = 0
         acc.last_error = ""
         return acc
+
+    def _read_quota_with_retry(self, acc: Account) -> Dict[str, Any]:
+        """Read the quota, retrying the *transient* faults the upstream emits.
+
+        A burst of requests makes the upstream answer a plain read with a 401
+        ("登录已失效，请重新登录") or an HTTP-200 business error ("系统内部错误")
+        even though the session is perfectly valid; a single-sample probe comes
+        back clean.  Retry a couple of times before letting the error through,
+        so a blip neither drops the session nor spams the log.  A *ban* is
+        never retried — it is a real verdict, not a blip.
+        """
+        attempts = max(0, int(self.cfg.get("auth_retry_attempts") or 0))
+        pause = float(self.cfg.get("auth_retry_pause") or 0)
+        last: Optional[UpstreamError] = None
+        for i in range(attempts + 1):
+            try:
+                return self.gateway.quota(acc.session)
+            except UpstreamError as exc:
+                if not self._is_transient_read_fault(exc):
+                    raise
+                last = exc
+                if i < attempts and pause:
+                    time.sleep(pause)
+        assert last is not None
+        raise last
+
+    @staticmethod
+    def _is_transient_read_fault(exc: UpstreamError) -> bool:
+        """True for the read faults that clear on a retry.
+
+        Covers a (possibly fake) expired session (401/403), the upstream's own
+        hiccups (5xx), rate-limit/timeout (408/429) — and **200**: a business
+        error delivered with HTTP 200 (e.g. "系统内部错误") carries status 200,
+        because ``_check_payload`` only raises when the envelope *is* an error,
+        so a 200 here means the upstream itself failed, not that we read a value
+        wrong.  A ban is never transient.
+        """
+        if getattr(exc, "banned", False):
+            return False
+        return exc.status in (200, 401, 403, 408, 429, 500, 502, 503, 504)
 
     def mark_banned(self, acc: Account, reason: str = "") -> None:
         """Flag an upstream-disabled (banned) account and take it out of use.

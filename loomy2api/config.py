@@ -54,6 +54,18 @@ DEFAULTS: Dict[str, Any] = {
     #: existing session keeps working meanwhile; retrying only extends the
     #: upstream lockout ("密码错误次数过多，请10分钟后登录").
     "login_blocked_seconds": 600,
+    #: The upstream answers a *read* (points/models) with a transient 401
+    #: ("登录已失效") or "系统内部错误" when a burst of requests hits it — the
+    #: session is fine.  Retry the read this many extra times (with
+    #: ``auth_retry_pause`` between) before believing the session is dead, so a
+    #: single blip does not kick off a re-login (and the "顶号" cascade it
+    #: causes).  Must be >= 1 — see ``quota_auth_faults_before_relogin``.
+    "auth_retry_attempts": 2,
+    "auth_retry_pause": 1.5,
+    #: How many *consecutive* 401s the read path must see before it drops the
+    #: session and re-logs in.  Guards against the burst-invalidated session
+    #: that the retries above cannot absorb.
+    "quota_auth_faults_before_relogin": 2,
     #: When the stored password is rejected but the session still works, set a
     #: new password through that session automatically (and store it), so the
     #: account keeps renewing itself without manual intervention.  Rotating a

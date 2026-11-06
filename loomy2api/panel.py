@@ -950,7 +950,7 @@ class Panel:
         healthy account.
         """
         try:
-            return call(acc.session)
+            return self._call_with_retry(acc, call)
         except UpstreamError as exc:
             if getattr(exc, "banned", False):
                 self.pool.mark_banned(acc, str(exc))
@@ -970,6 +970,30 @@ class Panel:
                 raise PoolError(
                     f"账号 {acc.name} session 失效，密码重登失败：{relogin}") from exc
             return call(acc.session)
+
+    def _call_with_retry(self, acc: Account, call):
+        """Run ``call`` against a possibly-blip session, retrying transient faults.
+
+        The panel's per-account actions (签到 / 新手任务 / 查积分) hit the upstream
+        one account at a time, but it still answers a burst with a fake 401 or
+        "系统内部错误" (see ``AccountPool._read_quota_with_retry``).  Retrying here
+        keeps a blip from forcing a re-login — which is what the caller does on
+        a 401, and which invalidates the session a parallel request is using.
+        """
+        attempts = max(0, int(self.gw.cfg.get("auth_retry_attempts") or 0))
+        pause = float(self.gw.cfg.get("auth_retry_pause") or 0)
+        last: Optional[UpstreamError] = None
+        for i in range(attempts + 1):
+            try:
+                return call(acc.session)
+            except UpstreamError as exc:
+                if not self.pool._is_transient_read_fault(exc):
+                    raise
+                last = exc
+                if i < attempts and pause:
+                    time.sleep(pause)
+        assert last is not None
+        raise last
 
     def points_activate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Submit an invitation code for one account (mutates account state)."""
