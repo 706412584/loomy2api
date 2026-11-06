@@ -18,7 +18,8 @@ from . import constants as C
 from . import anthropic as anth
 from .panel import Panel
 from .pool import AccountPool, PoolError
-from .upstream import ModelGateway, sse_usage, human_usage
+from .upstream import (ModelGateway, business_error_status, human_usage,
+                       sse_usage)
 
 __all__ = ["AlreadyRunning", "Gateway", "InstanceLock", "serve"]
 
@@ -681,6 +682,12 @@ class Handler(BaseHTTPRequestHandler):
         acc = gw.pool.acquire()
         status, headers, data = gw.models_client.call(
             acc.session, suffix, json.loads(raw.decode("utf-8")) if raw else {})
+        if status == 200:
+            # a dead session answers 200 with a JSON envelope on these
+            # endpoints too — surface it as the error it is
+            fault = business_error_status(data)
+            if fault is not None:
+                status = fault
         if status >= 400 and not self._content_fault(status, data):
             gw.pool.report_failure(acc, status,
                                    data[:200].decode("utf-8", "replace"))
@@ -738,6 +745,23 @@ class Handler(BaseHTTPRequestHandler):
             status, _hdrs, data = gw.models_client.call(
                 acc.session, "chat/completions", req, extra)
             if status == 200:
+                # 200 + business envelope = a dead session, not a completion
+                fault = business_error_status(data)
+                if fault is not None:
+                    gw.record_call(account=acc.name, loginid=acc.loginid,
+                                   model=model, status=fault,
+                                   seconds=time.time() - started,
+                                   kind="chat", stream=False,
+                                   error=data[:300].decode("utf-8", "replace"))
+                    gw.log(f"[call] {acc.name} {model} http=200 业务错误 "
+                           f"code={fault} → "
+                           f"{'session 失效，换账号并后台重登' if fault == 401 else '上游异常，换账号重试'}"
+                           f"：{data[:160].decode('utf-8', 'replace')}")
+                    last = (fault, data)
+                    if fault in self.ACCOUNT_FAULT:
+                        gw.pool.report_failure(
+                            acc, fault, data[:200].decode("utf-8", "replace"))
+                    continue
                 try:
                     obj = json.loads(data.decode("utf-8"))
                 except Exception:                       # noqa: BLE001
@@ -782,15 +806,22 @@ class Handler(BaseHTTPRequestHandler):
                                "upstream_error")
 
     def _open_stream(self, req: Dict[str, Any], extra: Optional[Dict[str, str]],
-                     *, log_tag: str) -> Tuple[Optional[Any], Optional[Any], Optional[Any]]:
+                     *, log_tag: str,
+                     exclude: Tuple[str, ...] = (),
+                     ) -> Tuple[Optional[Any], Optional[Any], Optional[Any]]:
         """Acquire an account and open a 200 stream, retrying other accounts.
+
+        ``exclude`` carries accounts the caller already found unusable in an
+        earlier attempt (a dead session, an empty stream): without it the
+        stream retry loop re-picked the same highest-balance account every
+        time.
 
         Returns ``(acc, conn, resp)``; ``acc`` is ``None`` when every attempt
         failed (``resp`` then carries the last error response, if any).
         """
         gw = self.gateway
         model = req.get("model")
-        tried: list = []
+        tried: list = list(exclude)
         conn = resp = None
 
         for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
@@ -803,7 +834,34 @@ class Handler(BaseHTTPRequestHandler):
             conn, resp = gw.models_client.stream(acc.session, "chat/completions",
                                                  req, extra)
             if resp.status == 200:
-                return acc, conn, resp
+                # A dead session still answers 200 — with a JSON business
+                # envelope and no SSE at all.  Returning it as a stream is what
+                # made the gateway retry the same account three times and log
+                # "上游流无输出即结束" instead of failing the account over.
+                ctype = (resp.getheader("Content-Type") or "").lower()
+                if "text/event-stream" in ctype:
+                    return acc, conn, resp
+                data = resp.read()
+                conn.close()
+                fault = business_error_status(data)
+                if fault is None:
+                    # 200 + a non-SSE body (e.g. a JSON completion for a
+                    # streaming request): not something we can relay as a
+                    # stream — treat it as an upstream anomaly.
+                    gw.log(f"[{log_tag}] {acc.name} {model} stream http=200 "
+                           f"但响应不是 SSE（Content-Type={ctype or '?'}），"
+                           f"换账号重试：{data[:160].decode('utf-8', 'replace')}")
+                    conn = resp = _ContentRejected(resp.status, data)
+                    continue
+                gw.log(f"[{log_tag}] {acc.name} {model} stream http=200 "
+                       f"业务错误 code={fault} → "
+                       f"{'session 失效，换账号并后台重登' if fault == 401 else '上游异常，换账号重试'}"
+                       f"：{data[:160].decode('utf-8', 'replace')}")
+                if fault in self.ACCOUNT_FAULT:
+                    gw.pool.report_failure(acc, fault,
+                                           data[:200].decode("utf-8", "replace"))
+                conn = resp = None
+                continue
             data = resp.read()
             conn.close()
             if self._content_fault(resp.status, data):
@@ -835,6 +893,10 @@ class Handler(BaseHTTPRequestHandler):
         stall_seconds = float(gw.cfg.get("stream_stall_seconds") or 180)
         think_seconds = float(gw.cfg.get("thinking_stall_seconds") or 240)
         disable_thinking = bool(req.pop("_no_thinking", False))
+        # accounts this request already found unusable: a stream retry must
+        # land on a different account, otherwise a dead session (or a model
+        # that keeps returning an empty stream) is replayed on every attempt
+        failed_accounts: list = []
 
         for attempt in range(attempts):
             body = dict(req)
@@ -844,8 +906,14 @@ class Handler(BaseHTTPRequestHandler):
                 body["enable_thinking"] = False
                 body["chat_template_kwargs"] = {"enable_thinking": False}
 
-            acc, conn, resp = self._open_stream(body, extra, log_tag="call")
+            acc, conn, resp = self._open_stream(
+                body, extra, log_tag="call", exclude=tuple(failed_accounts))
             if acc is None:
+                if attempt > 0:
+                    # SSE headers already went out on the first attempt; a
+                    # second HTTP response would be appended to the body.
+                    self._terminate_sse("所有账号都失败了 / all accounts failed")
+                    return
                 if resp is None:
                     return self._error(502, "所有账号都失败了 / all accounts failed",
                                        "upstream_error")
@@ -872,6 +940,7 @@ class Handler(BaseHTTPRequestHandler):
 
             saw_content = False          # any text/tool/reasoning forwarded
             saw_output = False           # text or tool (not just reasoning)
+            saw_done = False             # upstream sent [DONE]
             finished = False             # upstream sent finish_reason
             content_started = 0.0        # when the first content block arrived
             stalled: Optional[StreamStalled] = None
@@ -890,6 +959,8 @@ class Handler(BaseHTTPRequestHandler):
                         if out is None:
                             dropped += 1
                             continue
+                        if self._block_is_done(out):
+                            saw_done = True
                         if not saw_content:
                             saw_content = True
                             content_started = time.time()
@@ -908,6 +979,8 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.write(out + b"\n\n")
                         self.wfile.flush()
                         sse_usage(out.split(b"\n", 1)[0].strip(), usage)
+                        if self._block_is_done(out):
+                            saw_done = True
                         if not saw_content:
                             saw_content = True
                             content_started = time.time()
@@ -935,19 +1008,26 @@ class Handler(BaseHTTPRequestHandler):
             can_retry = attempt + 1 < attempts and not saw_content
             if can_retry and stalled is not None:
                 disable_thinking = True
+                failed_accounts.append(acc.name)
                 gw.log(f"[call] {acc.name} {model} 流卡住（{stalled.kind} "
-                       f"{stalled.seconds:.0f}s）且未输出内容 → 第 {attempt + 2} 次重试")
+                       f"{stalled.seconds:.0f}s）且未输出内容 → 第 {attempt + 2} 次重试"
+                       f"（换账号）")
                 buffer = b""
                 continue
-            if can_retry and not finished:
-                gw.log(f"[call] {acc.name} {model} 上游流未产生内容就结束 "
-                       f"→ 第 {attempt + 2} 次重试")
+            if can_retry and not saw_done and not finished:
+                # An empty stream is almost always a dead session answered
+                # with a business error, or a model refusing this account.
+                # Retrying the *same* account just repeats it.
+                failed_accounts.append(acc.name)
+                gw.pool.report_no_output(acc, "上游流无输出即结束")
+                gw.log(f"[call] {acc.name} {model} 上游流无输出即结束 "
+                       f"→ 第 {attempt + 2} 次重试（换账号）")
                 buffer = b""
                 continue
 
             # cannot retry any more (or content already went out): close cleanly
             reason = ""
-            if not finished:
+            if not finished and not saw_done:
                 reason = (f"流中断（{stalled.kind}）" if stalled
                           else "上游未发送结束事件")
                 args_text = self._open_tool_args()
@@ -962,14 +1042,20 @@ class Handler(BaseHTTPRequestHandler):
                 gw.log(f"[call] {acc.name} {model} {reason}"
                        f"{'，已输出部分内容' if saw_content else ''} → 补发终止事件")
                 self._terminate_sse(reason)
-            gw.pool.report_success(acc, usage)
+            if saw_content:
+                gw.pool.report_success(acc, usage)
+            else:
+                # nothing reached the client: this is a failed attempt, not a
+                # successful 0.0s call.  Recording it as success kept a broken
+                # account "healthy" and out of cooldown.
+                gw.pool.report_no_output(acc, reason or "上游流无输出即结束")
             elapsed = time.time() - started
             gw.record_call(account=acc.name, loginid=acc.loginid, model=model,
-                           status=200, seconds=elapsed, usage=usage,
-                           kind="chat", stream=True,
-                           error="" if finished else reason)
+                           status=200 if saw_content else 502, seconds=elapsed,
+                           usage=usage, kind="chat", stream=True,
+                           error="" if finished or saw_done else reason)
             gw.log(f"[call] {acc.name} {model} {elapsed:.1f}s "
-                   f"http=200 {human_usage(usage)} stream"
+                   f"http={'200' if saw_content else '502'} {human_usage(usage)} stream"
                    + (f" attempt={attempt + 1}" if attempt else "")
                    + (f" dropped={dropped}" if dropped else ""))
             return
@@ -1019,6 +1105,13 @@ class Handler(BaseHTTPRequestHandler):
             for choice in obj.get("choices") or []:
                 if choice.get("finish_reason"):
                     return True
+        return False
+
+    def _block_is_done(self, block: bytes) -> bool:
+        """True for the terminal ``data: [DONE]`` block."""
+        for line in block.split(b"\n"):
+            if line.strip() == b"data: [DONE]":
+                return True
         return False
 
     def _block_has_output(self, block: bytes) -> bool:
@@ -1086,6 +1179,22 @@ class Handler(BaseHTTPRequestHandler):
             started = time.time()
             status, _h, data = gw.models_client.call(acc.session, "chat/completions", payload)
             if status == 200:
+                fault = business_error_status(data)
+                if fault is not None:
+                    gw.record_call(account=acc.name, loginid=acc.loginid,
+                                   model=model, status=fault,
+                                   seconds=time.time() - started,
+                                   kind="messages", stream=False,
+                                   error=data[:300].decode("utf-8", "replace"))
+                    gw.log(f"[messages] {acc.name} {model} http=200 业务错误 "
+                           f"code={fault} → "
+                           f"{'session 失效，换账号并后台重登' if fault == 401 else '上游异常，换账号重试'}"
+                           f"：{data[:160].decode('utf-8', 'replace')}")
+                    last = (fault, data)
+                    if fault in self.ACCOUNT_FAULT:
+                        gw.pool.report_failure(
+                            acc, fault, data[:200].decode("utf-8", "replace"))
+                    continue
                 obj = json.loads(data.decode("utf-8"))
                 usage = obj.get("usage") or {}
                 gw.pool.report_success(acc, usage)
@@ -1128,6 +1237,7 @@ class Handler(BaseHTTPRequestHandler):
         stall_seconds = float(gw.cfg.get("stream_stall_seconds") or 180)
         think_seconds = float(gw.cfg.get("thinking_stall_seconds") or 240)
         disable_thinking = bool(payload.pop("_no_thinking", False))
+        failed_accounts: list = []
 
         def emit(event: str, data: Dict[str, Any]) -> None:
             self.wfile.write(
@@ -1141,8 +1251,17 @@ class Handler(BaseHTTPRequestHandler):
                 body["enable_thinking"] = False
                 body["chat_template_kwargs"] = {"enable_thinking": False}
 
-            acc, conn, resp = self._open_stream(body, None, log_tag="messages")
+            acc, conn, resp = self._open_stream(
+                body, None, log_tag="messages", exclude=tuple(failed_accounts))
             if acc is None:
+                if attempt > 0:
+                    # the SSE response is already open; a JSON error appended
+                    # to it would corrupt the stream.  Open the message first
+                    # so the error lands inside a well-formed message.
+                    for event, data in anth.StreamTranslator(model).start():
+                        emit(event, data)
+                    self._terminate_anthropic("all accounts failed")
+                    return
                 if resp is None:
                     return self._json(502, {"type": "error", "error": {
                         "type": "api_error", "message": "all accounts failed"}})
@@ -1166,12 +1285,12 @@ class Handler(BaseHTTPRequestHandler):
             buffer = b""
             saw_content = False
             saw_output = False
+            saw_done = False
             finished = False
+            started_stream = False       # message_start already emitted
             content_started = 0.0
             stalled: Optional[StreamStalled] = None
             try:
-                for event, data in translator.start():
-                    emit(event, data)
                 while True:
                     chunk = self._read_chunk(conn, resp, stall_seconds,
                                              thinking_seconds=think_seconds,
@@ -1186,12 +1305,24 @@ class Handler(BaseHTTPRequestHandler):
                         if not line.startswith(b"data:"):
                             continue
                         text = line[5:].strip()
-                        if not text or text == b"[DONE]":
+                        if not text:
+                            continue
+                        if text == b"[DONE]":
+                            saw_done = True
                             continue
                         try:
                             obj = json.loads(text)
                         except Exception:               # noqa: BLE001
                             continue
+                        # Defer message_start until the upstream actually said
+                        # something: emitting it up front meant a failed
+                        # attempt still sent a complete (empty) message, and a
+                        # retry then produced a second message_start inside the
+                        # same response.
+                        if not started_stream:
+                            for event, data in translator.start():
+                                emit(event, data)
+                            started_stream = True
                         choice = (obj.get("choices") or [{}])[0]
                         delta = choice.get("delta") or {}
                         if not saw_output and (delta.get("content")
@@ -1206,8 +1337,9 @@ class Handler(BaseHTTPRequestHandler):
                                     content_started = time.time()
                                 saw_content = True
                             emit(event, data)
-                for event, data in translator.finish():
-                    emit(event, data)
+                if started_stream:
+                    for event, data in translator.finish():
+                        emit(event, data)
             except StreamStalled as exc:
                 stalled = exc
             except (BrokenPipeError, ConnectionResetError):
@@ -1227,32 +1359,58 @@ class Handler(BaseHTTPRequestHandler):
             retryable = not saw_content and attempt + 1 < attempts
             if retryable and stalled is not None:
                 disable_thinking = True
+                failed_accounts.append(acc.name)
                 gw.log(f"[messages] {acc.name} {model} 流卡住（{stalled.kind} "
-                       f"{stalled.seconds:.0f}s）且无输出 → 第 {attempt + 2} 次重试")
+                       f"{stalled.seconds:.0f}s）且无输出 → 第 {attempt + 2} 次重试"
+                       f"（换账号）")
                 continue
-            if retryable and stalled is None:
+            if retryable and stalled is None and not saw_done and not finished:
+                failed_accounts.append(acc.name)
                 gw.log(f"[messages] {acc.name} {model} 上游流无输出即结束 "
-                       f"→ 第 {attempt + 2} 次重试")
+                       f"→ 第 {attempt + 2} 次重试（换账号）")
                 continue
 
+            reason = ""
+            if stalled is not None and not started_stream:
+                # nothing was emitted yet: open the message so the error event
+                # lands inside a well-formed message
+                for event, data in translator.start():
+                    emit(event, data)
+                started_stream = True
             if stalled is not None:
                 # content already reached the client: end the stream properly.
                 # A half-written tool_use block must not be reported as a
                 # clean end_turn — the client would try to execute a tool
                 # call whose arguments are truncated JSON.
                 broken = translator.truncated_tool()
+                reason = (f"upstream stream interrupted ({stalled.kind})"
+                          + ("，tool 参数截断" if broken else ""))
                 gw.log(f"[messages] {acc.name} {model} 流中断（{stalled.kind} "
                        f"{stalled.seconds:.0f}s）"
                        f"{'，tool 参数截断' if broken else ''} → 补发终止事件")
                 self._terminate_anthropic("upstream stream interrupted",
                                           broken_tool=broken)
-            gw.pool.report_success(acc, translator.usage)
+            elif not started_stream:
+                # every attempt came back empty: the client is holding an SSE
+                # response that will never carry a message.  Open the message
+                # and close it with an error so it retries instead of showing
+                # an empty answer.
+                reason = "upstream stream produced no output"
+                for event, data in translator.start():
+                    emit(event, data)
+                self._terminate_anthropic(reason)
+            if saw_content:
+                gw.pool.report_success(acc, translator.usage)
+            else:
+                gw.pool.report_no_output(acc, reason or "上游流无输出即结束")
             elapsed = time.time() - started
             gw.record_call(account=acc.name, loginid=acc.loginid, model=model,
-                           status=200, seconds=elapsed, usage=translator.usage,
-                           kind="messages", stream=True)
+                           status=200 if saw_content else 502, seconds=elapsed,
+                           usage=translator.usage, kind="messages", stream=True,
+                           error=reason)
             gw.log(f"[messages] {acc.name} {model} {elapsed:.1f}s "
-                   f"http=200 {human_usage(translator.usage)} stream"
+                   f"http={'200' if saw_content else '502'} "
+                   f"{human_usage(translator.usage)} stream"
                    + (f" attempt={attempt + 1}" if attempt else ""))
             return
 

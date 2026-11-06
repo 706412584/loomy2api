@@ -49,6 +49,28 @@ object Api {
      * itself out.
      */
     @Volatile var apiKey: String = ""
+        set(value) {
+            field = value
+            val ctx = AssetBridge.appContext ?: return
+            ctx.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+                .edit().putString(KEY_API_KEY, value).apply()
+        }
+
+    private const val PREFS = "loomy_settings"
+    private const val KEY_API_KEY = "api_key"
+
+    /**
+     * Restore the key persisted by a previous process.
+     *
+     * The key used to live only in memory, so after a restart the UI sent no
+     * key, every panel request answered 401 ("无效的 API Key"), and the UI
+     * could not recover — reading the state is what would have supplied it.
+     */
+    fun loadStoredKey(ctx: android.content.Context) {
+        val stored = ctx.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+            .getString(KEY_API_KEY, "").orEmpty()
+        if (stored.isNotEmpty()) apiKey = stored
+    }
 
     private fun base() = "http://127.0.0.1:${GatewayService.PORT}"
 
@@ -141,10 +163,19 @@ data class AccountView(
     /** null = not queried yet (show 未知, not 未激活). */
     val activated: Boolean? = null,
     val appliedInvitationCode: String = "",
+    /** when the account entered this pool (unix seconds). */
+    val obtainedAt: Long = 0,
+    /** lifetime ledger row count — a fresh number has few, a recycled one thousands. */
+    val ledgerTotal: Int? = null,
+    /** true when registration detected a pre-existing (recycled) number. */
+    val recycled: Boolean? = null,
+    /** true when the upstream disabled this account (banned / suspended). */
+    val banned: Boolean = false,
 ) {
     val statusLabel: String
         get() = when {
             !enabled -> "已禁用"
+            banned -> "已封禁"
             inCooldown -> "冷却中"
             !hasSession -> "无登录态"
             // a stored password means expiry is handled by an automatic login
@@ -182,6 +213,9 @@ data class ConfigView(
     val quotaRefreshMinutes: Int,
     val sessionsFromClient: Boolean,
     val passwordSetBeforeDays: Int,
+    // password automation ("顶号" risk) — off by default on mobile
+    val autoSetPassword: Boolean = false,
+    val autoRepairPassword: Boolean = false,
     // fysms 接码平台: the username is shown, the password never travels here
     val fysmsUsername: String = "",
     val fysmsPasswordSet: Boolean = false,
@@ -241,6 +275,10 @@ fun parseState(o: JSONObject): StateView {
             passwordVerifiedAt = a.optLong("password_verified_at"),
             activated = if (a.isNull("activated")) null else a.optBoolean("activated"),
             appliedInvitationCode = a.optString("applied_invitation_code"),
+            obtainedAt = a.optLong("obtained_at"),
+            ledgerTotal = if (a.isNull("ledger_total")) null else a.optInt("ledger_total"),
+            recycled = if (a.isNull("recycled")) null else a.optBoolean("recycled"),
+            banned = a.optBoolean("banned"),
         )
     }
     val keys = c.optJSONArray("api_keys") ?: JSONArray()
@@ -275,6 +313,8 @@ fun parseState(o: JSONObject): StateView {
             quotaRefreshMinutes = c.optInt("quota_refresh_minutes", 30),
             sessionsFromClient = c.optBoolean("sessions_from_client", true),
             passwordSetBeforeDays = c.optInt("password_set_before_days", 1),
+            autoSetPassword = c.optBoolean("auto_set_password", false),
+            autoRepairPassword = c.optBoolean("auto_repair_password", false),
             fysmsUsername = c.optString("fysms_username"),
             fysmsPasswordSet = c.optBoolean("fysms_password_set"),
             fysmsKeyword = c.optString("fysms_keyword", "讯飞"),

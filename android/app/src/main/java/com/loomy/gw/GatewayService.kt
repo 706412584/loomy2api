@@ -41,9 +41,35 @@ class GatewayService : Service() {
     companion object {
         const val CHANNEL = "gateway"
 
-        /** Deliberately different from the desktop gateway's 17990 so both can
-         *  run side by side (and so adb-forwarded ports never collide). */
-        const val PORT = 17991
+        /**
+         * Listening port.  Mutable because the user can change it in Settings
+         * and because the lite build defaults to a different port so both
+         * builds can run on one phone at the same time.
+         *
+         * Deliberately different from the desktop gateway's 17990.
+         */
+        @Volatile var PORT: Int = 17991
+            private set
+
+        /** Default for this flavor: full 17991, lite 17992 (co-existence). */
+        fun defaultPort(): Int =
+            if (BuildConfig.ENABLE_SMS_REGISTRATION) 17991 else 17992
+
+        private const val PREFS = "loomy_settings"
+        private const val KEY_PORT = "port"
+
+        /** Stored port for this app (full and lite have separate storage). */
+        fun loadPort(context: Context): Int {
+            val stored = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getInt(KEY_PORT, 0)
+            return if (stored in 1024..65535) stored else defaultPort()
+        }
+
+        fun savePort(context: Context, port: Int) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putInt(KEY_PORT, port).apply()
+            PORT = port
+        }
 
         private const val NOTIFICATION_ID = 1
         private const val WAKE_LOCK_TAG = "loomy2api:gateway"
@@ -78,6 +104,28 @@ class GatewayService : Service() {
                 android.util.Log.w("GatewayService", "stop failed", t)
             }
         }
+
+        /**
+         * The gateway's configured API key, read from the live Python config.
+         *
+         * The UI cannot learn it over HTTP when auth is enabled: the panel
+         * endpoints are exactly what the key protects. Keeping a copy in
+         * SharedPreferences covers the normal case, but a key configured by the
+         * CLI/desktop gateway (or before this build was installed) would leave
+         * the app locked out. Python owns the config, so ask it directly.
+         *
+         * Blocking call — invoke from a background dispatcher.
+         */
+        fun readApiKey(ctx: Context): String = try {
+            if (!Python.isStarted()) {
+                Python.start(AndroidPlatform(ctx.applicationContext))
+            }
+            Python.getInstance().getModule("mobile_main").callAttr("current_api_key")
+                .toString().orEmpty()
+        } catch (t: Throwable) {
+            android.util.Log.w("GatewayService", "readApiKey failed", t)
+            ""
+        }
     }
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -91,6 +139,7 @@ class GatewayService : Service() {
     override fun onCreate() {
         super.onCreate()
         AssetBridge.appContext = applicationContext
+        PORT = loadPort(applicationContext)
         createChannel()
 
         // Promote to foreground *first*: startForegroundService must reach
@@ -102,6 +151,7 @@ class GatewayService : Service() {
         acquireWakeLock()
         ensureGatewayRunning()
         startWatchdog()
+        TunnelManager.restoreIfEnabled(applicationContext, PORT)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -138,6 +188,9 @@ class GatewayService : Service() {
 
     override fun onDestroy() {
         stopping = true
+        // Do not leave cloudflared orphaned when the service goes away. The
+        // saved "enabled" flag is kept so a restart reconnects it.
+        TunnelManager.shutdown()
         try { watchdog.shutdownNow() } catch (_: Throwable) {}
         releaseWakeLock()
         try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
@@ -184,6 +237,35 @@ class GatewayService : Service() {
             true
         } catch (t: Throwable) {
             android.util.Log.e("GatewayService", "rebind to $host failed", t)
+            false
+        }
+    }
+
+    /**
+     * Change the listening port and restart the gateway on it.
+     *
+     * The port is persisted per app (full and lite keep separate prefs), so
+     * two builds can run side by side without fighting over one socket.
+     * Returns false when the new port could not be bound — the caller should
+     * then restore the previous value.
+     */
+    fun setPort(port: Int): Boolean {
+        if (port !in 1024..65535) return false
+        val previous = PORT
+        return try {
+            if (!Python.isStarted()) {
+                Python.start(AndroidPlatform(applicationContext))
+            }
+            PORT = port
+            Python.getInstance().getModule("mobile_main")
+                .callAttr("rebind_port", port)
+            savePort(applicationContext, port)
+            // An enabled tunnel points at the old port; restart it.
+            TunnelManager.restartForPort(applicationContext, port)
+            true
+        } catch (t: Throwable) {
+            android.util.Log.e("GatewayService", "setPort($port) failed", t)
+            PORT = previous
             false
         }
     }

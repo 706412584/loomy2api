@@ -66,6 +66,15 @@ CAMPUS_DEVICE_ID_PREFIX = "loomy-campus-"
 #: "metadata":{"provider_name":"alibaba-dashscope"}}}``
 CONTENT_FAULT_MARKERS = ("data_inspection_failed", "内容可能包含敏感信息")
 
+#: The upstream answers HTTP 200 with ``code != 000000`` and one of these
+#: descriptions when the *account itself* has been disabled upstream (banned /
+#: suspended).  Unlike a dead session this is not recoverable by re-login, so
+#: the account must be flagged and taken out of routing instead of being
+#: cooldown-retried every cycle.  Observed shape:
+#: ``{"code":"100xxx","desc":"账号已被停用","data":{}}``
+BANNED_MARKERS = ("账号已被停用", "账号已停用", "该账号已被停用", "账号被封禁",
+                  "账号已被封禁", "账号被禁用", "账号已注销")
+
 #: ``X-Loomy-Request-Purpose`` values understood by the upstream (17 total).
 REQUEST_PURPOSES = (
     "chat.message", "chat.title", "pet.comment", "pet.reward",

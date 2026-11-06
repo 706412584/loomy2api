@@ -689,6 +689,59 @@ class TestSessionLifecycle(unittest.TestCase):
         self.assertFalse(pool.get("b").permanent)
         self.assertTrue(pool.get("a").public_dict()["permanent"])
 
+    def test_auto_set_password_can_be_disabled(self):
+        """Mobile turns it off: a password-less account is left alone."""
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "session": "s",
+             "expireAt": int(time.time()) + 12 * 3600},
+        ])
+        self.cfg["auto_set_password"] = False
+        pool = AccountPool(self.cfg)
+
+        class FakeClient:
+            passwords = []
+
+            def set_password(self, session, new_password, identity=None):
+                self.passwords.append((session, new_password))
+
+        client = FakeClient()
+        pool.client = client
+        pool.tick()
+        self.assertEqual(client.passwords, [])
+        self.assertFalse(pool.get("a").has_password)
+        # the still-valid session is kept rather than failing the account
+        self.assertTrue(pool.get("a").session_valid)
+
+    def test_rejected_session_schedules_background_relogin(self):
+        """A 401 puts the account in cooldown and repairs it out of band."""
+        import time as _time
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "pw",
+             "passwordVerifiedAt": int(_time.time()),
+             "session": "dead", "expireAt": int(_time.time()) + 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+
+        class FakeClient:
+            def fill(self, account):
+                account.session = "fresh"
+                account.expire_at = int(_time.time()) + 14 * 86400
+                return account
+
+        pool.client = FakeClient()
+        pool.gateway = type("G", (), {
+            "quota": lambda self, s: {"balance": 1, "daily_balance": 1,
+                                      "available": 2}})()
+        pool.report_failure(acc, 401, "登录已失效")
+        pool.wait_recovery(5)
+        self.assertFalse(acc.in_cooldown, "background recovery must clear it")
+        self.assertEqual(acc.session, "fresh")
+
     def test_quota_refresh_relogins_on_rejected_session(self):
         """A 100002 "登录已失效" payload must re-login, not report "unknown"."""
         from tests.support import write_accounts

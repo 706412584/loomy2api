@@ -67,6 +67,57 @@ class GatewayViewModel : ViewModel() {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
+    /** Live Cloudflare tunnel state (owned by the foreground service). */
+    val tunnel: StateFlow<TunnelState> = TunnelManager.state
+
+    /**
+     * Start the public tunnel. If the gateway has no API key yet, one is
+     * generated and saved first: a public tunnel without auth exposes both the
+     * model API and the panel endpoints to anyone with the URL.
+     */
+    fun startTunnel(mode: TunnelMode, token: String, domain: String) {
+        val ctx = AssetBridge.appContext ?: return
+        viewModelScope.launch(crashGuard) {
+            // Do not decide on a stale/absent snapshot: right after a restart
+            // the first state read may still be in flight, and generating a key
+            // then would silently replace a key the user already has.
+            if (_ui.value.state == null) {
+                runCatching { loadState() }
+                    .onFailure {
+                        toast("读取网关配置失败：${it.message}")
+                        return@launch
+                    }
+            }
+            val existing = _ui.value.state?.config?.apiKeys.orEmpty()
+            if (existing.isEmpty()) {
+                val key = "sk-" + java.math.BigInteger(
+                    1, java.security.SecureRandom().generateSeed(24)
+                ).toString(36).take(32)
+                val body = JSONObject().put("api_keys", JSONArray(listOf(key)))
+                runCatching { Api.post("/api/panel/config", body) }
+                    .onSuccess {
+                        Api.apiKey = key
+                        loadState()
+                        toast("已自动生成 API Key：$key")
+                    }
+                    .onFailure {
+                        toast("生成 API Key 失败：${it.message}")
+                        return@launch
+                    }
+            }
+            TunnelManager.start(ctx, mode, token, domain, GatewayService.PORT)
+        }
+    }
+
+    fun stopTunnel() {
+        AssetBridge.appContext?.let { TunnelManager.stop(it) }
+    }
+
+    /** Apply a domain edited while the named tunnel is already running. */
+    fun updateTunnelDomain(domain: String) {
+        AssetBridge.appContext?.let { TunnelManager.updateDomain(it, domain) }
+    }
+
     /** Release found by the last update check, ready to download. */
     @Volatile private var pendingRelease: Updater.Release? = null
 
@@ -83,6 +134,17 @@ class GatewayViewModel : ViewModel() {
     }
 
     init {
+        AssetBridge.appContext?.let { Api.loadStoredKey(it) }
+        // A key configured by another entry point (CLI, desktop gateway, or an
+        // older build) is not in SharedPreferences; the gateway process knows
+        // the real value, and the panel endpoints cannot tell us without it.
+        viewModelScope.launch(crashGuard) {
+            val ctx = AssetBridge.appContext ?: return@launch
+            if (runCatching { Api.waitUntilReady() }.getOrDefault(false)) {
+                val key = withContext(Dispatchers.IO) { GatewayService.readApiKey(ctx) }
+                if (key.isNotEmpty() && key != Api.apiKey) Api.apiKey = key
+            }
+        }
         viewModelScope.launch(crashGuard) {
             val ok = runCatching { Api.waitUntilReady() }.getOrDefault(false)
             _ui.update { it.copy(ready = ok, loading = false,
@@ -152,7 +214,15 @@ class GatewayViewModel : ViewModel() {
     }
 
     private suspend fun loadState(refresh: Boolean = false) {
-        val s = parseState(Api.get("/api/panel/state" + if (refresh) "?refresh=1" else ""))
+        // `async=1`: the gateway returns cached quota immediately and refreshes
+        // in the background. Waiting for every account's round-trip is what
+        // made the home screen sit on "starting" for a long time with a large
+        // pool. An explicit refresh still asks for fresh values.
+        val query = when {
+            refresh -> "?refresh=1"
+            else -> "?async=1"
+        }
+        val s = parseState(Api.get("/api/panel/state$query"))
         // keep the client key in sync with the gateway: if the user set keys
         // in the settings tab, every later call needs them (and vice versa)
         val key = s.config.apiKeys.firstOrNull().orEmpty()
@@ -182,6 +252,51 @@ class GatewayViewModel : ViewModel() {
         toast("正在刷新模型…")
         runCatching { loadModels(refresh = true); toast("模型已刷新") }
             .onFailure { toast("刷新失败：${it.message}") }
+    }
+
+    /**
+     * Health-check the pool and repair what is broken ("检测续期").
+     *
+     * Calls the same endpoint as the web panel but deliberately never forces
+     * a full re-login: every forced login invalidates the session on the
+     * account's other devices ("顶号"), which is exactly what left half the
+     * pool dead earlier.  Only accounts with a missing/expired/rejected
+     * session are re-logged in.
+     */
+    fun checkPool() = viewModelScope.launch(crashGuard) {
+        _ui.update { it.copy(batchRunning = true, batchMsg = "检测续期：检查中…") }
+        try {
+            val r = Api.post("/api/panel/accounts/check", JSONObject(),
+                timeoutSec = 600)
+            if (!r.optBoolean("ok", true)) {
+                throw IllegalStateException(r.optString("error").ifBlank { "检测失败" })
+            }
+            val total = r.optInt("total", 0)
+            val healthy = r.optInt("healthy", 0)
+            val repaired = r.optInt("repaired", 0)
+            val failed = r.optInt("failed", 0)
+            val bad = mutableListOf<String>()
+            val results = r.optJSONArray("results") ?: JSONArray()
+            for (i in 0 until results.length()) {
+                val row = results.getJSONObject(i)
+                if (!row.optBoolean("ok", true)) {
+                    bad += row.optString("name") + "：" +
+                        row.optString("error").ifBlank { "未知错误" }
+                }
+            }
+            var msg = "检测完成：正常 $healthy/$total"
+            if (repaired > 0) msg += "，重登修复 $repaired"
+            if (failed > 0) msg += "，仍有 $failed 个异常"
+            if (bad.isNotEmpty()) msg += "\n" + bad.take(5).joinToString("\n")
+            _ui.update { it.copy(batchMsg = msg) }
+            loadState(refresh = true)
+        } catch (e: Exception) {
+            _ui.update {
+                it.copy(batchMsg = "检测续期失败：${e.message ?: e.javaClass.simpleName}")
+            }
+        } finally {
+            _ui.update { it.copy(batchRunning = false) }
+        }
     }
 
     /**
@@ -280,6 +395,37 @@ class GatewayViewModel : ViewModel() {
         val tasks = r.optJSONArray("tasks") ?: JSONArray()
         val ok = (0 until tasks.length()).count { tasks.getJSONObject(it).optBoolean("ok") }
         "$ok/${tasks.length()}，+${r.optInt("gained")} 分"
+    }
+
+    /**
+     * Bind an invitation code to every account that has none.
+     *
+     * One gateway call handles the whole pool: it picks spare codes from other
+     * accounts, so no per-account loop is needed here. Unbound accounts show
+     * up in [AccountView.appliedInviteCode] being blank.
+     */
+    fun batchInviteAuto() = viewModelScope.launch(crashGuard) {
+        _ui.update { it.copy(batchRunning = true, batchMsg = "一键绑定邀请码：检查中…") }
+        try {
+            val r = Api.post("/api/panel/accounts/invite-auto", JSONObject(),
+                timeoutSec = 600)
+            if (!r.optBoolean("ok", true)) {
+                throw IllegalStateException(r.optString("error").ifBlank { "绑定失败" })
+            }
+            val bound = r.optInt("bound", 0)
+            val failed = r.optInt("failed", 0)
+            val msg = if (bound == 0 && failed == 0) {
+                r.optString("message").ifBlank { "所有账号均已绑定邀请码" }
+            } else {
+                "绑定成功 $bound" + (if (failed > 0) "，失败 $failed" else "")
+            }
+            _ui.update { it.copy(batchMsg = msg) }
+            loadState(refresh = true)
+        } catch (e: Exception) {
+            _ui.update { it.copy(batchMsg = "一键绑定邀请码失败：${e.message}") }
+        } finally {
+            _ui.update { it.copy(batchRunning = false) }
+        }
     }
 
     /**
@@ -414,7 +560,8 @@ class GatewayViewModel : ViewModel() {
                     val phone = row.optString("phone").ifBlank { "—" }
                     lines += if (row.optBoolean("ok")) {
                         val pwd = row.optString("password")
-                        "✓ $phone" + (if (pwd.isNotBlank()) "  密码 $pwd" else "")
+                        val tag = if (row.optBoolean("recycled")) "  ⚠回收号(无注册奖励)" else ""
+                        "✓ $phone$tag" + (if (pwd.isNotBlank()) "  密码 $pwd" else "")
                     } else {
                         "✗ $phone  ${row.optString("error")}"
                     }
@@ -700,13 +847,6 @@ class GatewayViewModel : ViewModel() {
         return Updater.install(ctx, file)
     }
 
-    fun updateToken(): String =
-        AssetBridge.appContext?.let { Updater.token(it) } ?: ""
-
-    fun saveUpdateToken(token: String) {
-        AssetBridge.appContext?.let { Updater.saveToken(it, token) }
-    }
-
     fun toast(msg: String) {
         _ui.update { it.copy(toast = msg) }
         viewModelScope.launch(crashGuard) {
@@ -745,13 +885,17 @@ fun LoomyTheme(content: @Composable () -> Unit) {
             onSurface = Ink,
             outline = Line,
         ),
+        // No hard-coded colours here: a TextStyle colour overrides
+        // LocalContentColor, which made the dark Snackbar render dark text on
+        // its dark background ("black on black"). Screens set their own
+        // colours explicitly where they need them.
         typography = Typography(
             titleLarge = androidx.compose.ui.text.TextStyle(
-                fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Ink),
+                fontSize = 22.sp, fontWeight = FontWeight.Bold),
             titleMedium = androidx.compose.ui.text.TextStyle(
-                fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Ink),
-            bodyMedium = androidx.compose.ui.text.TextStyle(fontSize = 14.sp, color = Ink),
-            bodySmall = androidx.compose.ui.text.TextStyle(fontSize = 12.sp, color = Muted),
+                fontSize = 16.sp, fontWeight = FontWeight.SemiBold),
+            bodyMedium = androidx.compose.ui.text.TextStyle(fontSize = 14.sp),
+            bodySmall = androidx.compose.ui.text.TextStyle(fontSize = 12.sp),
         ),
         content = content,
     )
@@ -784,7 +928,16 @@ fun GatewayApp(vm: GatewayViewModel) {
     LoomyTheme {
         Scaffold(
             containerColor = Bg,
-            snackbarHost = { SnackbarHost(snackbar) },
+            snackbarHost = {
+                SnackbarHost(snackbar) { data ->
+                    Snackbar(
+                        snackbarData = data,
+                        containerColor = Ink,
+                        contentColor = Color.White,
+                        actionColor = Color(0xFF93C5FD),
+                    )
+                }
+            },
             bottomBar = {
                 NavigationBar(containerColor = CardBg, tonalElevation = 0.dp) {
                     Tab.entries.forEach { t ->
@@ -908,13 +1061,18 @@ private fun HomeScreen(vm: GatewayViewModel, ui: UiState) {
                 Divider(Modifier.padding(vertical = 10.dp), color = Line)
                 CopyRow("Anthropic Base URL", "http://127.0.0.1:${GatewayService.PORT}")
                 Divider(Modifier.padding(vertical = 10.dp), color = Line)
-                if (s?.config?.host == "0.0.0.0") {
+        if (s?.config?.host == "0.0.0.0") {
                     CopyRow("局域网地址", "http://${localIp() ?: "127.0.0.1"}:${GatewayService.PORT}")
                 } else {
                     Text("局域网地址", color = Muted, fontSize = 13.sp)
                     Spacer(Modifier.height(4.dp))
                     Text("未开启（设置 → 网络与安全 → 允许局域网访问）",
                         color = Muted, fontSize = 13.sp)
+                }
+                val tunnel by vm.tunnel.collectAsState()
+                tunnel.url?.let { url ->
+                    Divider(Modifier.padding(vertical = 10.dp), color = Line)
+                    CopyRow("公网地址", url)
                 }
                 Divider(Modifier.padding(vertical = 10.dp), color = Line)
                 Text("API Key", color = Muted, fontSize = 13.sp)
@@ -1141,11 +1299,24 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
                     }
                     Spacer(Modifier.height(8.dp))
                     OutlinedButton(
+                        onClick = { vm.checkPool() },
+                        enabled = !ui.batchRunning,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                    ) { Text("检测续期（修复失效账号）") }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
                         onClick = { showBatchPwd = true },
                         enabled = !ui.batchRunning,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(10.dp),
                     ) { Text("一键设置密码（升级为永久账号）") }
+                    OutlinedButton(
+                        onClick = { vm.batchInviteAuto() },
+                        enabled = !ui.batchRunning,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                    ) { Text("一键绑定邀请码（未绑定的账号自动补齐）") }
                     // The lite build ships without SMS registration.
                     if (BuildConfig.ENABLE_SMS_REGISTRATION) {
                         Spacer(Modifier.height(8.dp))
@@ -1410,6 +1581,7 @@ private fun AccountCard(acc: AccountView, onClick: () -> Unit,
 private fun StatusChip(acc: AccountView) {
     val (bg, fg) = when {
         !acc.enabled -> Line to Muted
+        acc.banned -> RedSoft to Red
         acc.inCooldown -> AmberSoft to Amber
         !acc.hasSession -> RedSoft to Red
         // a password account renews itself — an imminent expiry is not a risk
@@ -1570,7 +1742,23 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                     MiniStat("已绑定邀请码",
                         acc.appliedInvitationCode.ifBlank { "未绑定" }, Modifier.weight(1f))
                 }
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MiniStat("号龄 / 入池",
+                        (if (acc.recycled == true) "回收号 " else "")
+                        + fmtShortTime(acc.obtainedAt) + " · "
+                        + (acc.ledgerTotal?.let { "$it 条" } ?: "?"),
+                        Modifier.weight(1f))
+                }
                 Spacer(Modifier.height(14.dp))
+
+                if (acc.banned) {
+                    Text(
+                        "该账号已被上游停用（封禁），已停止参与路由。",
+                        color = Red, fontSize = 13.sp,
+                        modifier = Modifier.padding(bottom = 10.dp),
+                    )
+                }
 
                 // password state: an account without one cannot renew itself
                 Row(
@@ -1762,6 +1950,12 @@ private fun MiniStat(label: String, value: String, modifier: Modifier = Modifier
         Text(value, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
             overflow = TextOverflow.Ellipsis)
     }
+}
+
+/** "MM-dd HH:mm" for a unix-seconds timestamp (0/blank → "—"). */
+private fun fmtShortTime(ts: Long): String {
+    if (ts <= 0) return "—"
+    return SimpleDateFormat("MM-dd HH:mm", Locale.US).format(Date(ts * 1000))
 }
 
 @Composable
@@ -2303,11 +2497,16 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
     var pwdDays by remember(cfg) {
         mutableStateOf("${cfg?.passwordSetBeforeDays ?: 1}")
     }
+    var autoSetPwd by remember(cfg) { mutableStateOf(cfg?.autoSetPassword ?: false) }
+    var autoRepairPwd by remember(cfg) { mutableStateOf(cfg?.autoRepairPassword ?: false) }
     var lanEnabled by remember(cfg) { mutableStateOf(cfg?.host == "0.0.0.0") }
     var lanBusy by remember { mutableStateOf(false) }
     var lanMsg by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
-    var updateToken by remember { mutableStateOf(vm.updateToken()) }
+    var port by remember { mutableStateOf(GatewayService.PORT) }
+    var portText by remember { mutableStateOf("${GatewayService.PORT}") }
+    var portBusy by remember { mutableStateOf(false) }
+    var portMsg by remember { mutableStateOf("") }
     var updateMsg by remember { mutableStateOf("") }
     var updateBusy by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -2355,14 +2554,91 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
                     "之后每次到期都能用密码自动重登（永久账号）。",
                 color = Muted, fontSize = 12.sp,
             )
+            Spacer(Modifier.height(12.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("自动设置密码", fontSize = 15.sp)
+                    Text("到期前自动给无密码账号设密码（默认关闭）",
+                        color = Muted, fontSize = 12.sp)
+                }
+                Switch(autoSetPwd, { autoSetPwd = it })
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("密码错误时自动改密", fontSize = 15.sp)
+                    Text("密码被上游拒绝时用现有 session 重设（默认关闭）",
+                        color = Muted, fontSize = 12.sp)
+                }
+                Switch(autoRepairPwd, { autoRepairPwd = it })
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "这两项都会在账号已登录的其他设备上把 session 顶掉（顶号）。" +
+                    "同一账号还在手机客户端登录时建议保持关闭，只在面板里手动设置密码。",
+                color = Muted, fontSize = 11.sp,
+            )
         }
 
         SectionTitle("网络与安全")
         SectionCard {
             Text("监听范围", color = Muted, fontSize = 13.sp)
             Spacer(Modifier.height(8.dp))
-            Text("当前：${cfg?.host ?: "127.0.0.1"}:${GatewayService.PORT}",
+            Text("当前：${cfg?.host ?: "127.0.0.1"}:${port}",
                 fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+            Spacer(Modifier.height(10.dp))
+            Row(verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    portText, { portText = it },
+                    label = { Text("端口") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.weight(1f),
+                )
+                Button(
+                    onClick = {
+                        val want = portText.toIntOrNull()
+                        if (want == null || want !in 1024..65535) {
+                            portMsg = "端口需在 1024–65535 之间"
+                            return@Button
+                        }
+                        if (want == port) { portMsg = "端口未变化"; return@Button }
+                        portBusy = true
+                        portMsg = "正在切换端口…"
+                        scope.launch {
+                            val ok = withContext(Dispatchers.IO) {
+                                GatewayService.instance?.setPort(want) ?: false
+                            }
+                            if (!ok) {
+                                portMsg = "切换失败（端口被占用？）"
+                                portBusy = false
+                                return@launch
+                            }
+                            Api.resetConnections()
+                            val ready = Api.waitUntilReady(30_000)
+                            if (ready) {
+                                port = want
+                                portMsg = "已切换到端口 $want"
+                                vm.refreshAll()
+                            } else {
+                                portMsg = "切换超时，请查看运行日志"
+                            }
+                            portBusy = false
+                        }
+                    },
+                    enabled = !portBusy,
+                    shape = RoundedCornerShape(10.dp),
+                ) { Text("应用端口", fontSize = 13.sp) }
+            }
+            if (portMsg.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Text(portMsg, fontSize = 12.sp,
+                    color = if (portBusy) Muted else Green)
+            }
+            Text("本包默认端口 ${GatewayService.defaultPort()}（正式版 17991 / 精简版 17992）。" +
+                "两个包同时安装时请让它们使用不同端口。",
+                color = Muted, fontSize = 11.sp)
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -2441,6 +2717,11 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
                 singleLine = true, modifier = Modifier.fillMaxWidth())
         }
 
+        SectionTitle("公网穿透")
+        SectionCard {
+            TunnelSettings(vm)
+        }
+
         SectionTitle("其他")
         SectionCard {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2457,42 +2738,26 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             Text("当前版本 ${BuildConfig.VERSION_NAME}（${if (BuildConfig.ENABLE_SMS_REGISTRATION) "接码版" else "精简版"}）",
                 fontSize = 13.sp)
             Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                updateToken, { updateToken = it },
-                label = { Text("GitHub Token（私有仓库需只读 token）") },
-                placeholder = { Text("github_pat_… 仅用于检查/下载更新") },
-                singleLine = true,
-                visualTransformation = PasswordVisualTransformation(),
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = {
-                        vm.saveUpdateToken(updateToken)
-                        updateMsg = "Token 已保存"
-                    },
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(10.dp),
-                ) { Text("保存 Token", fontSize = 13.sp) }
-                Button(
-                    onClick = {
-                        if (updateBusy) return@Button
-                        updateBusy = true
-                        updateMsg = "正在检查…"
-                        scope.launch {
-                            try {
-                                updateMsg = vm.checkUpdate()
-                            } finally {
-                                updateBusy = false
-                            }
+            Button(
+                onClick = {
+                    if (updateBusy) return@Button
+                    updateBusy = true
+                    updateMsg = "正在检查…"
+                    scope.launch {
+                        try {
+                            updateMsg = vm.checkUpdate()
+                        } finally {
+                            updateBusy = false
                         }
-                    },
-                    enabled = !updateBusy,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(10.dp),
-                ) { Text("检查更新", fontSize = 13.sp) }
-            }
+                    }
+                },
+                enabled = !updateBusy,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp),
+            ) { Text("检查更新", fontSize = 13.sp) }
+            Spacer(Modifier.height(6.dp))
+            Text("更新包来自公开仓库 706412584/loomy2api-releases，无需 Token。",
+                color = Muted, fontSize = 11.sp)
             if (updateMsg.contains("发现新版本")) {
                 Spacer(Modifier.height(8.dp))
                 Button(
@@ -2539,6 +2804,8 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
                         "cooldown_seconds" to (cooldown.toIntOrNull() ?: 300),
                         "session_renew_before_days" to (renewDays.toIntOrNull() ?: 3),
                         "password_set_before_days" to (pwdDays.toIntOrNull() ?: 1),
+                        "auto_set_password" to autoSetPwd,
+                        "auto_repair_password" to autoRepairPwd,
                     )) { msg = it }
                 }
             },
@@ -2554,6 +2821,182 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
         Text("Loomy2API for Android · 核心链路移植版", color = Muted, fontSize = 12.sp)
         Text("账号数据与配置保存在应用私有目录，卸载即清除。",
             color = Muted, fontSize = 12.sp)
+    }
+}
+
+@Composable
+private fun TunnelSettings(vm: GatewayViewModel) {
+    val ctx = AssetBridge.appContext
+    val saved = remember { ctx?.let { TunnelManager.loadSettings(it) } ?: TunnelManager.Settings() }
+    val tunnel by vm.tunnel.collectAsState()
+
+    var mode by remember { mutableStateOf(saved.mode) }
+    var token by remember { mutableStateOf(saved.token) }
+    var domain by remember { mutableStateOf(saved.domain) }
+    var tokenVisible by remember { mutableStateOf(false) }
+
+    val busy = tunnel.status == TunnelStatus.STARTING ||
+        tunnel.status == TunnelStatus.RECONNECTING
+    val running = tunnel.status == TunnelStatus.RUNNING
+    // TunnelManager reports the persisted intent, so the switch stays on while
+    // the service is reconnecting after a restart.
+    val enabled = tunnel.enabled
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("公网访问（Cloudflare Tunnel）", fontSize = 15.sp)
+            Text(
+                "通过 cloudflared 把本机网关暴露到公网；无需公网 IP。",
+                color = Muted, fontSize = 12.sp,
+            )
+        }
+        Switch(
+            checked = enabled,
+            // Always allow switching OFF, including mid-reconnect: a tunnel
+            // that never connects must remain cancellable, otherwise a wrong
+            // token leaves the user with no way out.
+            enabled = enabled || !busy,
+            onCheckedChange = { on ->
+                if (!on) {
+                    vm.stopTunnel()
+                } else {
+                    // Only the token is required. Cloudflare's wizard needs the
+                    // tunnel to connect before a Public Hostname can be added,
+                    // so the domain is usually filled in afterwards.
+                    if (mode == TunnelMode.NAMED && token.isBlank()) {
+                        vm.toast("请先填写 Tunnel Token")
+                    } else {
+                        vm.startTunnel(mode, token, domain)
+                    }
+                }
+            },
+        )
+    }
+
+    Spacer(Modifier.height(10.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FilterChip(
+            selected = mode == TunnelMode.QUICK,
+            onClick = { mode = TunnelMode.QUICK },
+            label = { Text("临时公网地址") },
+            enabled = !busy && !running,
+        )
+        FilterChip(
+            selected = mode == TunnelMode.NAMED,
+            onClick = { mode = TunnelMode.NAMED },
+            label = { Text("指定域名") },
+            enabled = !busy && !running,
+        )
+    }
+
+    if (mode == TunnelMode.NAMED) {
+        Spacer(Modifier.height(10.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                token, { token = it },
+                label = { Text("Tunnel Token") },
+                placeholder = { Text("Zero Trust → Tunnels → 安装命令里的 token") },
+                singleLine = true,
+                visualTransformation = if (tokenVisible) androidx.compose.ui.text.input.VisualTransformation.None
+                    else PasswordVisualTransformation(),
+                trailingIcon = {
+                    TextButton(onClick = { tokenVisible = !tokenVisible }) {
+                        Text(if (tokenVisible) "隐藏" else "显示", fontSize = 12.sp)
+                    }
+                },
+                enabled = !busy && !running,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = {
+                    if (token.isBlank()) {
+                        vm.toast("请先填写 Tunnel Token")
+                    } else {
+                        vm.startTunnel(TunnelMode.NAMED, token, domain)
+                    }
+                },
+                enabled = !busy && !running,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.height(56.dp),
+            ) {
+                Text(
+                    when {
+                        running -> "已连接"
+                        busy -> "验证中…"
+                        else -> "验证连接"
+                    },
+                    fontSize = 13.sp,
+                )
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "点「验证连接」会立即用该 token 建立隧道；Cloudflare 向导显示已连接后，" +
+                "即可继续下一步添加域名。",
+            color = Muted, fontSize = 11.sp,
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            domain, { domain = it },
+            label = { Text("公网域名（可稍后填写）") },
+            placeholder = { Text("api.example.com") },
+            singleLine = true,
+            enabled = !busy,
+            trailingIcon = {
+                if (running && domain.isNotBlank() && domain != tunnel.url?.removePrefix("https://")) {
+                    TextButton(onClick = { vm.updateTunnelDomain(domain) }) {
+                        Text("应用", fontSize = 12.sp)
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "首次使用顺序：填 token → 打开开关（状态变为「已连接」，Cloudflare " +
+                "向导即可继续）→ 在 Zero Trust 里给该隧道添加 Public Hostname，指向 " +
+                "http://127.0.0.1:${GatewayService.PORT} → 回到这里填域名。",
+            color = Muted, fontSize = 11.sp,
+        )
+    }
+
+    Spacer(Modifier.height(10.dp))
+    val statusText = when (tunnel.status) {
+        TunnelStatus.IDLE -> "未启动"
+        TunnelStatus.STARTING -> "正在建立隧道…"
+        TunnelStatus.RUNNING -> "已连接"
+        TunnelStatus.RECONNECTING -> "正在重连…"
+        TunnelStatus.ERROR -> "错误"
+    }
+    Text(
+        "状态：$statusText",
+        fontSize = 13.sp,
+        color = when (tunnel.status) {
+            TunnelStatus.RUNNING -> Green
+            TunnelStatus.ERROR -> Red
+            else -> Muted
+        },
+    )
+    tunnel.error?.takeIf { tunnel.status != TunnelStatus.RUNNING }?.let {
+        Spacer(Modifier.height(4.dp))
+        Text(it, fontSize = 11.sp, color = Muted, maxLines = 3, overflow = TextOverflow.Ellipsis)
+    }
+    tunnel.url?.let { url ->
+        Spacer(Modifier.height(8.dp))
+        CopyRow("公网 Base URL", url)
+        Text(
+            "OpenAI: $url/v1 · Anthropic: $url",
+            fontSize = 11.sp, color = Muted,
+        )
+    }
+
+    if (tunnel.status == TunnelStatus.IDLE && !tunnel.enabled) {
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "开启后若尚未设置 API Key，会自动生成一个，避免公网裸奔。",
+            color = Muted, fontSize = 11.sp,
+        )
     }
 }
 

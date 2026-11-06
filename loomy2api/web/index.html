@@ -225,11 +225,11 @@
     <table>
       <thead>
         <tr>
-          <th>名称</th><th>手机号</th><th>状态</th><th>剩余</th>
+          <th>名称</th><th>手机号</th><th>状态</th><th>剩余</th><th>号龄</th>
           <th>可用积分</th><th>请求</th><th>扣分</th><th>设备标识</th><th>操作</th>
         </tr>
       </thead>
-      <tbody id="rows"><tr><td colspan="9" class="muted">加载中…</td></tr></tbody>
+      <tbody id="rows"><tr><td colspan="10" class="muted">加载中…</td></tr></tbody>
     </table>
     <div class="hint" id="poolHint"></div>
   </section>
@@ -269,8 +269,10 @@
       </div>
       <button id="applyInvite">提交邀请码</button>
       <button id="doCheckin">每日签到</button>
+      <button id="doBatchCheckin">一键签到（全池）</button>
       <button id="doInviteAuto">一键绑定邀请码</button>
       <button class="primary" id="doOnboarding">一键新手任务</button>
+      <button class="primary" id="doBatchOnboarding">一键新手任务（全池）</button>
     </div>
     <div id="taskResults" style="margin-top:10px;display:none">
       <table>
@@ -346,9 +348,23 @@ function toast(msg, kind) {
 
 async function api(path, opts) {
   const o = Object.assign({headers: {}}, opts || {});
+  const timeoutMs = o.timeoutMs; delete o.timeoutMs;
   if (KEY) { o.headers['Authorization'] = 'Bearer ' + KEY; }
   if (o.body) { o.headers['Content-Type'] = 'application/json'; }
-  const res = await fetch(path, o);
+  // AbortSignal.timeout() is unavailable in older WebViews (the Android app
+  // serves this page too), so fall back to an AbortController + timer.
+  let timer = null;
+  if (timeoutMs && typeof AbortController !== 'undefined' && !o.signal) {
+    const ctl = new AbortController();
+    o.signal = ctl.signal;
+    timer = setTimeout(() => ctl.abort(), timeoutMs);
+  }
+  let res;
+  try {
+    res = await fetch(path, o);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   let data = null;
   try { data = await res.json(); } catch (e) { data = null; }
   if (!res.ok) {
@@ -360,6 +376,7 @@ async function api(path, opts) {
 
 function badge(a) {
   if (!a.enabled) return '<span class="badge b-off">已禁用</span>';
+  if (a.banned) return '<span class="badge b-bad">已封禁</span>';
   if (a.in_cooldown) return '<span class="badge b-warn">冷却 ' + Math.round(a.cooldown_seconds_left) + 's</span>';
   if (!a.session) return '<span class="badge b-bad">无登录态</span>';
   // a password account is permanent: expiry is handled by an automatic re-login
@@ -376,6 +393,31 @@ function badge(a) {
 function remainingText(a) {
   if (a.permanent) return '<span class="badge b-ok">永久</span>';
   return a.session_days_left === null ? '—' : a.session_days_left.toFixed(1) + ' 天';
+}
+
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  const p = (n) => (n < 10 ? '0' : '') + n;
+  return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+/**
+ * Age column.  The upstream exposes no real "account created at", so we show
+ * the two things we do have: when the account entered this pool (obtained_at)
+ * and its lifetime ledger row count (ledger_total) — a fresh number has a
+ * handful of rows, a recycled one has thousands.  Only the deterministic
+ * "recycled" flag (set at registration time from a real ``alreadyProcessed``)
+ * gets a badge; the row count is shown raw for the user to judge, because a
+ * threshold on it would misjudge busy-but-genuine accounts.
+ */
+function ageCell(a) {
+  const rows = (a.ledger_total === null || a.ledger_total === undefined)
+    ? '?' : a.ledger_total;
+  const recycled = a.recycled === true
+    ? '<span class="badge b-warn">回收号</span> ' : '';
+  return recycled + '<div class="mono" title="入池时间 / 账本行数">'
+    + fmtTime(a.obtained_at) + ' · ' + rows + ' 条</div>';
 }
 
 function num(v) { return (v === null || v === undefined) ? '—' : v; }
@@ -406,7 +448,7 @@ function render(state) {
     + (c.auth_required ? ' · 面板已开启 API Key 校验' : ' · 面板未设 API Key（仅本机使用）');
 
   if (!state.accounts.length) {
-    $('rows').innerHTML = '<tr><td colspan="9" class="muted">还没有账号，用下面的表单添加</td></tr>';
+    $('rows').innerHTML = '<tr><td colspan="10" class="muted">还没有账号，用下面的表单添加</td></tr>';
     return;
   }
   fillAccountPicker(state);
@@ -427,6 +469,7 @@ function render(state) {
       + '<td data-label="手机号" class="mono">' + (a.loginid_masked || '—') + '</td>'
       + '<td data-label="状态">' + badge(a) + '</td>'
       + '<td data-label="剩余">' + remainingText(a) + '</td>'
+      + '<td data-label="号龄">' + ageCell(a) + '</td>'
       + '<td data-label="可用积分"><span><b>' + num(a.available) + '</b><div class="mono">余额 ' + num(a.balance) + ' + 每日 ' + num(a.daily_balance) + '</div></span></td>'
       + '<td data-label="请求">' + a.requests + '</td><td data-label="扣分">' + a.points_used + '</td>'
       + '<td data-label="设备" class="mono" title="' + (id.campus_device_id || '') + '">' + (id.devid || '—') + '</td>'
@@ -483,6 +526,11 @@ function openAccountModal(name) {
               + '到期可能无法自动续期。请点「重设密码」再试一次。</div>'
             : '<div class="hint" style="color:var(--warn)">该账号还没有登录密码：session 到期后需要重新短信登录。'
               + '现在设置密码即可升级为永久账号。</div>'))
+    + (a.banned
+        ? '<div class="hint" style="color:var(--bad)">该账号已被上游停用（封禁），已停止参与路由。'
+          + (a.last_error ? '<br><small class="mono">' + a.last_error + '</small>' : '')
+          + '</div>'
+        : '')
     + '<div class="ops">'
     + '<button class="primary" onclick="modalAct(\'points\')">查积分</button>'
     + '<button onclick="modalAct(\'checkin\')">每日签到</button>'
@@ -1070,6 +1118,86 @@ async function doInviteAuto() {
   }
 }
 
+/**
+ * Run [action] for every healthy account, three at a time — the mirror of the
+ * Android client's runBatch().  Accounts are independent, so a little
+ * concurrency cuts wall time sharply (the upstream tolerates it; the official
+ * client does the same).  A transient failure (5xx / timeout) is retried once;
+ * anything else is reported as-is.  The two batch buttons below reuse it.
+ */
+async function runBatchPool(label, action) {
+  const accounts = ((LAST_STATE && LAST_STATE.accounts) || []).filter(
+    a => a.enabled && a.session && !a.in_cooldown);
+  if (!accounts.length) {
+    $('pointsMsg').textContent = '没有可用账号';
+    toast('没有可用账号', 'err');
+    return;
+  }
+  const btns = [$('doBatchCheckin'), $('doBatchOnboarding'), $('doInviteAuto')];
+  btns.forEach(b => b && (b.disabled = true));
+
+  let done = 0, ok = 0;
+  const failures = [];
+  const setMsg = () => {
+    $('pointsMsg').textContent = label + '：' + done + '/' + accounts.length
+      + (failures.length ? ' · 失败 ' + failures.length : '');
+  };
+  setMsg();
+
+  async function runOne(acc) {
+    let result;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try { await action(acc); result = 'ok'; break; }
+      catch (e) {
+        result = '失败：' + e.message;
+        const transient = /5\d\d|超时|timeout|429/i.test(String(e.message));
+        if (attempt === 0 && transient) { await new Promise(r => setTimeout(r, 800)); continue; }
+      }
+    }
+    return result;
+  }
+
+  // chunked(3): await each group of three before starting the next
+  for (let i = 0; i < accounts.length; i += 3) {
+    const group = accounts.slice(i, i + 3);
+    await Promise.all(group.map(async acc => {
+      const result = await runOne(acc);
+      done++;
+      if (result === 'ok') ok++; else failures.push(acc.name + ': ' + result);
+      setMsg();
+    }));
+  }
+
+  btns.forEach(b => b && (b.disabled = false));
+  const summary = failures.length
+    ? label + '完成：' + ok + '/' + accounts.length + ' 成功，' + failures.length
+      + ' 失败\n' + failures.slice(0, 3).join('\n')
+    : label + '完成：' + ok + '/' + accounts.length + ' 成功';
+  $('pointsMsg').textContent = summary;
+  toast(summary.split('\n')[0], failures.length ? 'err' : 'ok');
+  await load(true);
+}
+
+/** Daily check-in for every healthy account (Android "一键签到"). */
+function doBatchCheckin() {
+  return runBatchPool('一键签到', async acc => {
+    const res = await api('/api/panel/points/checkin', {
+      method: 'POST', body: JSON.stringify({name: acc.name}), timeoutMs: 60000,
+    });
+    if (res.ok === false) throw new Error(res.error || '签到失败');
+  });
+}
+
+/** Onboarding tasks for every healthy account (Android "一键新手任务"). */
+function doBatchOnboarding() {
+  return runBatchPool('一键新手任务', async acc => {
+    const res = await api('/api/panel/points/onboarding', {
+      method: 'POST', body: JSON.stringify({name: acc.name}), timeoutMs: 300000,
+    });
+    if (res.ok === false) throw new Error(res.error || '任务失败');
+  });
+}
+
 async function loadLog() {
   try {
     const res = await api('/api/panel/logs?lines=250');
@@ -1107,6 +1235,8 @@ $('pointsAccount').onchange = loadPoints;
 $('applyInvite').onclick = applyInvite;
 $('doOnboarding').onclick = doOnboarding;
 $('doCheckin').onclick = doCheckin;
+$('doBatchCheckin').onclick = doBatchCheckin;
+$('doBatchOnboarding').onclick = doBatchOnboarding;
 $('doInviteAuto').onclick = doInviteAuto;
 $('showAdd').onclick = () => openAddModal('pwd');
 $('showImport').onclick = () => openAddModal('import');
@@ -1168,11 +1298,17 @@ async function checkPool() {
       body: JSON.stringify({force: force}),
     });
     const rows = res.results || [];
-    const bad = rows.filter(r => !r.ok);
+    const banned = rows.filter(r => r.action === 'banned');
+    const bad = rows.filter(r => !r.ok && r.action !== 'banned');
     let msg = '检测完成：正常 ' + res.healthy + '/' + res.total;
     if (res.repaired) msg += '，自动重登修复 ' + res.repaired;
+    if (banned.length) msg += '，封禁 ' + banned.length;
     if (bad.length) msg += '，仍有 ' + bad.length + ' 个异常';
-    toast(msg, bad.length ? 'err' : 'ok');
+    toast(msg, (bad.length || banned.length) ? 'err' : 'ok');
+    if (banned.length) {
+      alert('以下账号已被上游停用（封禁），已停止参与路由：\n\n'
+        + banned.map(r => r.name).join('\n'));
+    }
     if (bad.length) {
       alert('以下账号仍有问题：\n\n' + bad.map(r =>
         r.name + '  ' + (r.error || '未知错误')).join('\n'));

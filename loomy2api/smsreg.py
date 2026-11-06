@@ -121,7 +121,29 @@ def register_one(gw, client: FysmsClient, *,
     # the upstream sometimes rejects the first request right after login
     time.sleep(0.6)
 
-    # 6. upgrade to a permanent account (set + prove the password)
+    # 6. tell a fresh number from a recycled one.  ``points/first-login`` is
+    # the one-time reward call: a fresh account answers with the 15000 signup
+    # bonus, while a number that was already a Loomy account before we bought
+    # it answers ``alreadyProcessed`` (someone else claimed it) and yields
+    # nothing.  Run it here so the batch result marks the dud numbers instead
+    # of the user discovering the zero balance hours later.  It also claims
+    # the bonus for genuinely fresh numbers, so a later ``checkin`` is just a
+    # re-read.
+    row["stage"] = "first_login"
+    first_login_data: Optional[Dict[str, Any]] = None
+    try:
+        dev = (acc.identity or {}).get("campus_device_id") or ""
+        first_login_data = gw.models_client.points_first_login(acc.session, dev)
+        recycled = bool(first_login_data.get("alreadyProcessed"))
+        acc.recycled = recycled
+        row["recycled"] = recycled
+        if recycled:
+            row["recycled_note"] = "回收号：新手奖励已被领取（无 15000 永久）"
+            _log(gw, f"{phone} 判定为回收号（alreadyProcessed），无注册奖励")
+    except Exception as exc:                         # noqa: BLE001
+        row["first_login_error"] = str(exc)[:160]
+
+    # 7. upgrade to a permanent account (set + prove the password)
     row["stage"] = "set_password"
     try:
         row["password"] = pool.set_account_password(acc, password)
@@ -130,18 +152,21 @@ def register_one(gw, client: FysmsClient, *,
         row["password_error"] = str(exc)[:200]
         _log(gw, f"{phone} 自动设置密码失败：{exc}")
 
-    # 7. quota / daily check-in / onboarding
+    # 8. quota / daily check-in / onboarding
     try:
         pool.refresh_quota(acc)
     except Exception:                                # noqa: BLE001
         pass
     if checkin:
-        try:
-            dev = (acc.identity or {}).get("campus_device_id") or ""
-            data = gw.models_client.points_first_login(acc.session, dev)
-            row["checkin"] = not bool(data.get("alreadyProcessed"))
-        except Exception as exc:                     # noqa: BLE001
-            row["checkin_error"] = str(exc)[:160]
+        if first_login_data is not None:
+            row["checkin"] = not bool(first_login_data.get("alreadyProcessed"))
+        else:
+            try:
+                dev = (acc.identity or {}).get("campus_device_id") or ""
+                data = gw.models_client.points_first_login(acc.session, dev)
+                row["checkin"] = not bool(data.get("alreadyProcessed"))
+            except Exception as exc:                 # noqa: BLE001
+                row["checkin_error"] = str(exc)[:160]
     if onboarding:
         done = 0
         for key in ("first_message", "pick_skill", "generate_ppt", "set_schedule",
@@ -157,7 +182,8 @@ def register_one(gw, client: FysmsClient, *,
     row["stage"] = "done"
     pool.save(force=True)
     _log(gw, f"{phone} 注册成功"
-              f"{'（永久账号）' if row.get('permanent') else '（未设密码）'}")
+              f"{'（永久账号）' if row.get('permanent') else '（未设密码）'}"
+              f"{'（回收号，无注册奖励）' if row.get('recycled') else ''}")
     return row
 
 

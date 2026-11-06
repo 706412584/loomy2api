@@ -134,6 +134,24 @@ class Account:
     activated: Optional[bool] = None
     applied_invitation_code: str = ""
 
+    #: Total lifetime ledger rows reported by ``/points/records`` — a cheap
+    #: proxy for how old/busy the account is.  A freshly registered number has
+    #: a handful of rows; a recycled number that already belonged to someone
+    #: else has thousands.  ``None`` until the quota has been read once.
+    ledger_total: Optional[int] = None
+    #: ``True`` when this phone number was already an existing Loomy account
+    #: before we registered it.  Detected at registration time: the one-time
+    #: reward call answers ``alreadyProcessed`` (someone else already claimed
+    #: it).  ``None`` = unknown (account added before this check existed, or
+    #: imported via session).
+    recycled: Optional[bool] = None
+    #: ``True`` when the upstream reported the account itself as disabled
+    #: (banned / suspended) — see ``constants.BANNED_MARKERS``.  Not recoverable
+    #: by re-login, so the account is flagged and dropped from routing.
+    banned: bool = False
+    #: unix seconds when the ban was first observed.
+    banned_at: int = 0
+
     # quota cache (filled from /points/records)
     balance: Optional[int] = None
     daily_balance: Optional[int] = None
@@ -218,6 +236,12 @@ class Account:
                        else None),
             applied_invitation_code=str(raw.get("appliedInvitationCode")
                                         or raw.get("applied_invitation_code") or ""),
+            ledger_total=(int(raw["ledgerTotal"]) if raw.get("ledgerTotal") is not None
+                          else (int(raw["ledger_total"]) if raw.get("ledger_total") is not None
+                                else None)),
+            recycled=(raw.get("recycled") if isinstance(raw.get("recycled"), bool) else None),
+            banned=raw.get("banned") is True,
+            banned_at=int(raw.get("bannedAt") or raw.get("banned_at") or 0),
             available=(int(raw["available"]) if raw.get("available") is not None else None),
             balance=(int(raw["balance"]) if raw.get("balance") is not None else None),
             daily_balance=(int(raw["dailyBalance"])
@@ -265,6 +289,14 @@ class Account:
             out["activated"] = bool(self.activated)
         if self.applied_invitation_code:
             out["appliedInvitationCode"] = self.applied_invitation_code
+        if self.ledger_total is not None:
+            out["ledgerTotal"] = self.ledger_total
+        if self.recycled is not None:
+            out["recycled"] = bool(self.recycled)
+        if self.banned:
+            out["banned"] = True
+            if self.banned_at:
+                out["bannedAt"] = self.banned_at
         return out
 
     def identity_view(self) -> Dict[str, Any]:
@@ -311,6 +343,11 @@ class Account:
             "last_error": self.last_error,
             "activated": self.activated,
             "applied_invitation_code": self.applied_invitation_code,
+            "obtained_at": self.obtained_at,
+            "ledger_total": self.ledger_total,
+            "recycled": self.recycled,
+            "banned": self.banned,
+            "banned_at": self.banned_at,
             "identity": self.identity_view(),
         }
         return out

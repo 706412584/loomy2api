@@ -13,35 +13,24 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Update check against the project's GitHub releases.
+ * Update check against the public release repository.
  *
- * The repository is private, so the release API needs a token.  It is *not*
- * baked into the APK (that would leak it to anyone who unzips it); the user
- * pastes a fine-grained token in Settings and it is stored in app-private
- * storage.  Without a token the check simply reports "not configured".
+ * The source repository is private, so the APKs are published to a separate
+ * public repo (`loomy2api-releases`).  That keeps the updater token-free: any
+ * installed copy can query the latest release and download the matching APK.
  */
 object Updater {
-    /** Release assets are named `loomy2api-<flavor>-<version>.apk`. */
-    private const val API = "https://api.github.com/repos/706412584/loomy2api/releases/latest"
+    /** Public repo holding only release assets. */
+    private const val REPO = "706412584/loomy2api-releases"
+    private const val API = "https://api.github.com/repos/$REPO/releases/latest"
 
     data class Release(
         val tag: String,
         val notes: String,
-        /** GitHub API asset URL (needs the token) — redirects to a signed URL. */
+        /** Public download URL — no credentials needed. */
         val apkUrl: String,
         val apkName: String,
     )
-
-    fun token(ctx: Context): String =
-        runCatching { File(ctx.filesDir, "github_token").readText().trim() }
-            .getOrDefault("")
-
-    fun saveToken(ctx: Context, token: String) {
-        runCatching {
-            val f = File(ctx.filesDir, "github_token")
-            if (token.isBlank()) f.delete() else f.writeText(token.trim())
-        }
-    }
 
     /** Which asset belongs to this build: `full` or `lite`. */
     private fun flavor(): String =
@@ -52,12 +41,9 @@ object Updater {
      * Returns the release only when it is newer, else null.
      */
     suspend fun check(ctx: Context): Pair<Release?, String> = withContext(Dispatchers.IO) {
-        val token = token(ctx)
-        if (token.isBlank()) return@withContext null to "未配置 GitHub Token"
         val conn = (URL(API).openConnection() as HttpURLConnection).apply {
             connectTimeout = 10_000
             readTimeout = 15_000
-            setRequestProperty("Authorization", "Bearer $token")
             setRequestProperty("Accept", "application/vnd.github+json")
             setRequestProperty("User-Agent", "loomy2api-android")
         }
@@ -82,9 +68,8 @@ object Updater {
                 val a = assets.getJSONObject(i)
                 val n = a.optString("name")
                 if (n.startsWith("loomy2api-$wanted") && n.endsWith(".apk")) {
-                    // The repo is private: browser_download_url needs a session
-                    // cookie, while the API asset URL accepts the bearer token.
-                    url = a.optString("url")
+                    // Public repo: the plain download URL needs no auth.
+                    url = a.optString("browser_download_url")
                     name = n
                     break
                 }
@@ -114,16 +99,12 @@ object Updater {
     suspend fun download(ctx: Context, release: Release,
                          onProgress: (Int) -> Unit = {}): Pair<File?, String> =
         withContext(Dispatchers.IO) {
-            val token = token(ctx)
             val dir = File(ctx.cacheDir, "updates").apply { mkdirs() }
             val out = File(dir, release.apkName)
-            // The asset API answers 302 to a short-lived signed URL.  Do not
-            // forward the token there — and do follow the redirect.
             val conn = (URL(release.apkUrl).openConnection() as HttpURLConnection).apply {
                 instanceFollowRedirects = true
                 connectTimeout = 15_000
                 readTimeout = 60_000
-                setRequestProperty("Authorization", "Bearer $token")
                 setRequestProperty("Accept", "application/octet-stream")
                 setRequestProperty("User-Agent", "loomy2api-android")
             }

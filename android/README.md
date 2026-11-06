@@ -50,6 +50,45 @@ local testing, not for distribution.
 - The old WebView panel is still available as `PanelActivity` (not the launcher
   entry point).
 
+## Public tunnel (Cloudflare)
+
+Settings → 公网穿透 exposes the gateway through Cloudflare Tunnel, so the API
+is reachable from anywhere without a public IP or router port-forwarding.
+
+- **临时公网地址 (quick)**: starts `cloudflared tunnel --url
+  http://127.0.0.1:<port>` and shows the generated
+  `https://*.trycloudflare.com` URL. The URL changes on every start.
+- **指定域名 (named)**: runs `cloudflared tunnel run --token …`. Create the
+  tunnel in Cloudflare Zero Trust, add a Public Hostname pointing at
+  `http://127.0.0.1:<port>`, then paste the token and the hostname here.
+- Enabling the tunnel with no API key configured generates one automatically;
+  without it the public URL would expose both the model API and the panel.
+- The choice is persisted. `GatewayService` reconnects the tunnel after a
+  process restart or reboot.
+
+### The cloudflared binary
+
+The APK ships a cross-compiled `cloudflared` as
+`app/src/main/jniLibs/arm64-v8a/libcloudflared.so` (arm64-v8a only, ~29 MB;
+the APK grows by ~10 MB compressed). It lives in `jniLibs` because Android 10+
+refuses to execute files in app-private storage — the installer extracts it to
+`nativeLibraryDir`, which is executable. `useLegacyPackaging = true` in
+`build.gradle.kts` is required for that extraction.
+
+The stock Linux release does **not** work: cloudflared's edge discovery uses
+SRV lookups, and Go's SRV resolver always reads `/etc/resolv.conf`, which
+Android does not provide. The Android build uses cgo for ordinary lookups, and
+`TunnelManager` resolves the edge hosts through Android's resolver and passes
+them as `--edge <ip>:7844`.
+
+Rebuild it with:
+
+```bash
+NDK=/path/to/android-ndk ./tools/build-cloudflared.sh
+```
+
+cloudflared is Apache-2.0 licensed; see `tools/cloudflared-LICENSE.txt`.
+
 ## Notes
 
 - The gateway binds to loopback by default. To reach it from another device on

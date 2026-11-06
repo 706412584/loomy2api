@@ -84,7 +84,8 @@ class PanelActivity : Activity() {
     }
 
     companion object {
-        private const val BASE_URL = "http://127.0.0.1:${GatewayService.PORT}"
+        private val BASE_URL: String
+            get() = "http://127.0.0.1:${GatewayService.PORT}"
         private const val RETRY_MS = 250L
         private const val MAX_ATTEMPTS = 120      // ~30 s, generous for a cold start
     }

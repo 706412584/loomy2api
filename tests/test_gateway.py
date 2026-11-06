@@ -270,6 +270,92 @@ class GatewayTestCase(_Harness, unittest.TestCase):
             "messages": [{"role": "user", "content": "hi"}]})
         self.assertIn("hello", body.decode("utf-8"))
 
+    def test_dead_session_200_json_rotates_to_healthy_account(self):
+        """A dead session answers 200 + JSON (code 100002), not 401.
+
+        It must be treated as an account failure and the request retried on a
+        healthy account — not parsed as an empty SSE stream.
+        """
+        self.gateway.pool.get("a").available = 1000      # picked first
+        self.gateway.pool.get("b").available = 10
+        self.upstream.dead_sessions_200 = ["s1"]
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "fake-model", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertIn("hello", body.decode("utf-8"))
+        acc_a = self.gateway.pool.get("a")
+        self.assertFalse(acc_a.session_valid)
+        self.assertTrue(acc_a.in_cooldown)
+
+    def test_dead_session_200_json_rotates_non_stream(self):
+        self.gateway.pool.get("a").available = 1000
+        self.gateway.pool.get("b").available = 10
+        self.upstream.dead_sessions_200 = ["s1"]
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "ping"}]})
+        payload = json.loads(body)
+        self.assertEqual(payload["choices"][0]["message"]["content"], "echo:ping")
+        self.assertFalse(self.gateway.pool.get("a").session_valid)
+
+    def test_empty_stream_retry_switches_account(self):
+        """An empty stream must not be retried on the same account."""
+        self.gateway.pool.get("a").available = 1000
+        self.gateway.pool.get("b").available = 10
+        self.upstream.empty_stream_sessions = ["s1"]
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "fake-model", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertIn("hello", body.decode("utf-8"))
+        # both accounts were contacted, i.e. the retry moved on
+        tokens = [c["token"] for c in self.upstream.calls
+                  if c["path"].endswith("/chat/completions")]
+        self.assertIn("s2", tokens)
+
+    def test_empty_stream_is_not_recorded_as_success(self):
+        self.upstream.empty_stream_sessions = ["s1", "s2"]
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "fake-model", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]})
+        for acc in self.gateway.pool.accounts:
+            self.assertGreater(acc.failures, 0)
+        # the client still gets a terminal event, not a silent truncation
+        # (an empty stream is not an account fault, so no cooldown)
+        self.assertIn(b"[DONE]", body)
+        self.assertIn(b'"finish_reason": "error"', body)
+        for acc in self.gateway.pool.accounts:
+            self.assertFalse(acc.in_cooldown)
+
+    def test_messages_retry_does_not_repeat_message_start(self):
+        """One response must carry exactly one message_start.
+
+        The translator used to be started before the upstream said anything,
+        so each failed attempt emitted a complete empty message and the retry
+        opened a second one inside the same response.
+        """
+        self.upstream.empty_stream_sessions = ["s1"]
+        self.gateway.pool.get("a").available = 1000
+        self.gateway.pool.get("b").available = 10
+        _s, body, _ = self.post("/v1/messages", {
+            "model": "fake-model", "stream": True, "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}]})
+        names = [e for e, _ in self.sse(body)]
+        self.assertEqual(names.count("message_start"), 1)
+        self.assertEqual(names.count("message_stop"), 1)
+        self.assertIn("content_block_delta", names)
+
+    def test_messages_all_empty_streams_close_with_one_error(self):
+        """No attempt produced output: one message_start, an error, one stop."""
+        self.upstream.empty_stream_sessions = ["s1", "s2"]
+        _s, body, _ = self.post("/v1/messages", {
+            "model": "fake-model", "stream": True, "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}]})
+        events = self.sse(body)
+        names = [e for e, _ in events]
+        self.assertEqual(names.count("message_start"), 1)
+        self.assertEqual(names.count("message_stop"), 1)
+        self.assertIn("error", names)
+
     def test_bad_json_returns_400(self):
         request = urllib.request.Request(self.base + "/v1/chat/completions",
                                          data=b"{not json",

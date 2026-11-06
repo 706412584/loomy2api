@@ -8,14 +8,19 @@ import uuid
 from typing import Any, Dict, Optional, Tuple
 
 from .httpc import json_body, open_stream, request as http_request
+from . import constants as C
 
-__all__ = ["ModelGateway", "UpstreamError", "build_model_headers"]
+__all__ = ["ModelGateway", "UpstreamError", "build_model_headers",
+           "business_error_status"]
 
 
 class UpstreamError(RuntimeError):
-    def __init__(self, message: str, status: int = 0):
+    def __init__(self, message: str, status: int = 0, *, banned: bool = False):
         super().__init__(message)
         self.status = status
+        #: ``True`` when the upstream says the account itself is disabled
+        #: (banned / suspended) — not recoverable by re-login.
+        self.banned = banned
 
 
 #: The model gateway answers HTTP 200 with a business code when the session is
@@ -42,7 +47,54 @@ def _check_payload(status: int, payload: Dict[str, Any], data: bytes,
     text = desc or data[:200].decode("utf-8", "replace")
     if any(marker in text for marker in SESSION_EXPIRED_MARKERS):
         raise UpstreamError(f"{path} HTTP {status}: {text}", 401)
+    # An upstream-disabled (banned) account is not a transient failure: mark it
+    # with a distinct status so callers can flag it instead of cooling down and
+    # retrying it forever.
+    if any(marker in text for marker in C.BANNED_MARKERS):
+        raise UpstreamError(f"{path} HTTP {status}: {text}", 403,
+                            banned=True)
     raise UpstreamError(f"{path} HTTP {status}: {text}", status)
+
+
+def business_error_status(data: bytes) -> Optional[int]:
+    """Classify an HTTP-200 body that is really an upstream error.
+
+    The model gateway answers ``200`` with a JSON business envelope
+    (``{"code": "100002", "desc": "登录已失效，请重新登录", "data": {}}``) when
+    the session is dead.  A streaming caller that treats that as SSE reads no
+    ``data:`` lines, reports an "empty stream" and retries the same account
+    forever; a non-stream caller would hand the error envelope to the client
+    as a successful completion.
+
+    Returns ``401`` for a dead session, ``502`` for any other business error,
+    and ``None`` when the body looks like a normal payload.
+    """
+    if not data or data[:1] not in (b"{", b"["):
+        return None
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except Exception:                                   # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    # a real completion / catalogue / points payload, not an error envelope
+    if payload.get("choices") or payload.get("object") is not None:
+        return None
+    if payload.get("error"):
+        # OpenAI-shaped error delivered with HTTP 200
+        text = json.dumps(payload.get("error"), ensure_ascii=False)
+        return 401 if any(m in text for m in SESSION_EXPIRED_MARKERS) else 502
+    code = str(payload.get("code") if payload.get("code") is not None else "")
+    desc = str(payload.get("desc") or payload.get("message") or "")
+    if code in ("", "000000", "None") and desc in ("", "成功", "success", "ok"):
+        return None
+    text = desc or f"code={code}"
+    if any(marker in text for marker in SESSION_EXPIRED_MARKERS):
+        return 401
+    # an upstream-disabled (banned) account: an account fault, not a payload one
+    if any(marker in text for marker in C.BANNED_MARKERS):
+        return 403
+    return 502
 
 
 def build_model_headers(session: str, *, version: str = "",
@@ -117,13 +169,19 @@ class ModelGateway:
         return payload
 
     def quota(self, session: str) -> Dict[str, Any]:
-        """→ ``{balance, daily_balance, available}``."""
+        """→ ``{balance, daily_balance, available, ledger_total}``.
+
+        ``ledger_total`` is the lifetime ledger row count the upstream reports
+        alongside the balances — a cheap age proxy for telling a fresh number
+        from a recycled one (see :attr:`Account.ledger_total`).
+        """
         payload = self.points_records(session, page_size=1)
         data = payload.get("data") or {}
         return {
             "balance": data.get("balance"),
             "daily_balance": data.get("dailyBalance"),
             "available": data.get("availableBalance"),
+            "ledger_total": data.get("total"),
         }
 
     def points_overview(self, session: str) -> Dict[str, Any]:

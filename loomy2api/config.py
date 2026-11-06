@@ -56,8 +56,14 @@ DEFAULTS: Dict[str, Any] = {
     "login_blocked_seconds": 600,
     #: When the stored password is rejected but the session still works, set a
     #: new password through that session automatically (and store it), so the
-    #: account keeps renewing itself without manual intervention.
+    #: account keeps renewing itself without manual intervention.  Rotating a
+    #: password while someone else is logged in with the same account kicks
+    #: that session ("顶号") — the mobile build defaults this to off.
     "auto_repair_password": True,
+    #: Give password-less accounts a random password shortly before their
+    #: session expires.  Same "顶号" trade-off as above; also defaults to off
+    #: on mobile, where the account list is shared with the phone's own client.
+    "auto_set_password": True,
     #: Never spend the permanent balance: only accounts that still hold part
     #: of today's daily grant are routed to.  The grant is lost at the cycle
     #: reset while the permanent balance carries over, so this maximises what

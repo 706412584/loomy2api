@@ -62,6 +62,12 @@ class AccountPool:
         # account would invalidate each other's session.
         self._account_locks: Dict[str, threading.Lock] = {}
         self._account_locks_guard = threading.Lock()
+        #: Accounts with a background re-login in flight (see
+        #: :meth:`schedule_recovery`), so a burst of failed requests does not
+        #: start a burst of logins that invalidate each other.
+        self._recovering: set = set()
+        self._recovering_lock = threading.Lock()
+        self._recovery_threads: List[threading.Thread] = []
         self._file = cfg.path("accounts_file", "accounts.json")
         self.load()
 
@@ -368,7 +374,13 @@ class AccountPool:
         Called by the keeper shortly before a session expires: without a
         password the account would need an SMS code to come back, which the
         gateway cannot do unattended.  Returns True when a password was set.
+
+        Guarded by ``auto_set_password``: setting *and* proving the password
+        each cost a login, which logs the same account out on every other
+        device.  ``force`` (panel action) bypasses the guard.
         """
+        if not force and not self.auto_set_password():
+            return False
         if acc.has_password and not force:
             if acc.password_verified_at:
                 return False
@@ -460,8 +472,11 @@ class AccountPool:
             raise self._login_block_error(acc)
         if not acc.has_password or not acc.password_verified_at:
             # last chance: the session still works, so we can set (or prove)
-            # a password now and make every future expiry automatic
-            if acc.session_valid:
+            # a password now and make every future expiry automatic.  Both
+            # setting and proving cost a login that kicks other devices, so
+            # this only runs when password automation is enabled (an explicit
+            # ``force`` from the panel is the user's own decision).
+            if acc.session_valid and (force or self.auto_set_password()):
                 self.ensure_password(acc)
             # ensure_password may just have proven the password wrong, which
             # starts the block — do not immediately log in again.  A session
@@ -479,6 +494,12 @@ class AccountPool:
                 # would only invalidate it.
                 return acc
         if not (acc.loginid and acc.password):
+            if not force and acc.session_valid:
+                # No stored password (and automation may be off on purpose):
+                # the session is still good, so keeping it beats failing.
+                self.log(f"账号 {acc.name} 没有保存密码，沿用现有 session"
+                         f"（剩余 {(acc.days_left or 0):.1f} 天）")
+                return acc
             raise PoolError(
                 f"账号 {acc.name} 的 session 不可用且没有账号密码，无法自动重登"
                 f"（请在 accounts.json 补 loginid/password，或用 `loomy2api login` 短信登录）")
@@ -541,6 +562,12 @@ class AccountPool:
         try:
             quota = self.gateway.quota(acc.session)
         except UpstreamError as exc:
+            if getattr(exc, "banned", False):
+                # The upstream disabled this account.  Re-login cannot help, so
+                # flag it and stop retrying it every cycle (which only spammed
+                # the log); the flag also renders in the panel's status column.
+                self.mark_banned(acc, str(exc))
+                return acc
             if exc.status not in (401, 403):
                 acc.last_error = f"quota: {exc}"
                 self.log(f"账号 {acc.name} 额度查询失败：{exc}")
@@ -554,7 +581,17 @@ class AccountPool:
             try:
                 self.ensure_session(acc)
                 quota = self.gateway.quota(acc.session)
-            except (AccountError, PoolError, UpstreamError) as relogin_exc:
+            except UpstreamError as relogin_exc:
+                if getattr(relogin_exc, "banned", False):
+                    # the session was just unusable, but a fresh login succeeds
+                    # and *then* the quota read reveals the ban — flag it here
+                    # too, otherwise it stays in the "session expired" cycle.
+                    self.mark_banned(acc, str(relogin_exc))
+                    return acc
+                acc.last_error = f"quota: {exc}; relogin: {relogin_exc}"
+                self.log(f"账号 {acc.name} 额度查询失败，重登也没成功：{relogin_exc}")
+                return acc
+            except (AccountError, PoolError) as relogin_exc:
                 acc.last_error = f"quota: {exc}; relogin: {relogin_exc}"
                 self.log(f"账号 {acc.name} 额度查询失败，重登也没成功：{relogin_exc}")
                 return acc
@@ -569,10 +606,28 @@ class AccountPool:
         acc.balance = quota.get("balance")
         acc.daily_balance = quota.get("daily_balance")
         acc.available = quota.get("available")
+        if quota.get("ledger_total") is not None:
+            acc.ledger_total = int(quota["ledger_total"])
         acc.quota_updated_at = int(time.time())
         acc.quota_checked_at = acc.quota_updated_at
         acc.last_error = ""
         return acc
+
+    def mark_banned(self, acc: Account, reason: str = "") -> None:
+        """Flag an upstream-disabled (banned) account and take it out of use.
+
+        Only logs/persists on the first observation so the 30-minute quota
+        poll does not spam the log with the same line.
+        """
+        first = not acc.banned
+        acc.banned = True
+        if not acc.banned_at:
+            acc.banned_at = int(time.time())
+        acc.last_error = reason or acc.last_error
+        if first:
+            self.log(f"账号 {acc.name} 被上游停用，已标记为封禁并停止使用"
+                     f"（{acc.last_error}）")
+            self.save(force=True)
 
     # ------------------------------------------------------- health check
 
@@ -604,6 +659,11 @@ class AccountPool:
             result["action"] = "skipped"
             result["error"] = "账号已禁用"
             return result
+        if acc.banned:
+            # already flagged upstream-disabled — report without a round-trip
+            result["action"] = "banned"
+            result["error"] = acc.last_error or "已被上游停用（封禁）"
+            return result
         if not (acc.loginid and acc.password):
             result["action"] = "skipped"
             result["error"] = "没有账号密码，无法自动重登（需要短信登录）"
@@ -614,6 +674,14 @@ class AccountPool:
             try:
                 self.gateway.quota(acc.session)
             except UpstreamError as exc:
+                if getattr(exc, "banned", False):
+                    # re-login cannot undo an upstream ban — report it plainly
+                    self.mark_banned(acc, str(exc))
+                    result["action"] = "banned"
+                    result["error"] = str(exc)
+                    result["ok"] = False
+                    self.save(force=True)
+                    return result
                 if exc.status in (401, 403):
                     needs_login = True
                     result["error"] = "session 被上游拒绝"
@@ -674,7 +742,8 @@ class AccountPool:
     def usable(self, exclude: Sequence[str] = ()) -> List[Account]:
         now = time.time()
         rows = [a for a in self.accounts
-                if a.enabled and not a.in_cooldown and a.name not in exclude
+                if a.enabled and not a.banned and not a.in_cooldown
+                and a.name not in exclude
                 and a.session_valid and a.available != 0]
         if self.daily_only():
             # Only the daily grant may be spent.  An account whose grant is
@@ -686,6 +755,14 @@ class AccountPool:
     def daily_only(self) -> bool:
         """True when routing must stay inside the daily (activity) grant."""
         return bool(self.cfg.get("daily_only"))
+
+    def auto_set_password(self) -> bool:
+        """True when the keeper may give password-less accounts one.
+
+        Disabled on mobile by default: rotating a password logs the same
+        account out on any other device ("顶号").
+        """
+        return bool(self.cfg.get("auto_set_password", True))
 
     def _ordered(self, candidates: Sequence[Account]) -> List[Account]:
         """Order candidates by the configured strategy (best first)."""
@@ -799,6 +876,11 @@ class AccountPool:
     def report_failure(self, acc: Account, status: int, reason: str = "") -> None:
         acc.failures += 1
         acc.last_error = reason or f"HTTP {status}"
+        if any(marker in (reason or "") for marker in C.BANNED_MARKERS):
+            # the chat endpoint says the account itself is disabled — flag it
+            # and drop it from routing instead of cooling down forever
+            self.mark_banned(acc, acc.last_error)
+            return
         if self.is_content_rejection(status, reason):
             # the payload was rejected, not the credentials — keep the session
             # and leave the account usable for the next (different) request
@@ -812,6 +894,67 @@ class AccountPool:
         acc.cooldown(cooldown, acc.last_error)
         self.log(f"账号 {acc.name} 失败 HTTP {status} → 冷却 {cooldown:.0f}s（{acc.last_error}）")
         self.save()
+        if status in (401, 403) and acc.has_password:
+            # Repair out of band: the request that hit this must move on to
+            # another account immediately, and a burst of failures must not
+            # turn into a burst of concurrent logins (they invalidate each
+            # other's session).
+            self.schedule_recovery(acc)
+
+    def report_no_output(self, acc: Account, reason: str = "上游流无输出") -> None:
+        """Record an empty upstream stream without cooling the account down.
+
+        Unlike a rejected session, "the stream ended without a token" is often
+        a model-side hiccup: the request should move to another account, but
+        benching this one for the whole cooldown window would shrink the pool
+        for a failure it may not have caused.
+        """
+        acc.failures += 1
+        acc.last_error = reason
+        self.save()
+
+    def schedule_recovery(self, acc: Account) -> None:
+        """Re-login a dead-session account in the background.
+
+        The keeper only wakes every ``quota_refresh_minutes`` (30 by default),
+        so without this a rejected session stays unusable — and keeps being
+        retried as an "empty stream" — for up to half an hour.  Recovery is
+        deliberately asynchronous: the caller is mid-request and must not wait
+        for two upstream round-trips.
+        """
+        if not acc.has_password or not acc.persist:
+            return
+        with self._recovering_lock:
+            if acc.name in self._recovering:
+                return
+            self._recovering.add(acc.name)
+
+        def run() -> None:
+            try:
+                self.ensure_session(acc, force=True)
+                self.refresh_quota(acc)
+                acc.cooldown_until = 0.0
+                acc.last_error = ""
+                self.log(f"账号 {acc.name} 后台重登成功，已恢复可用")
+            except (PoolError, AccountError, UpstreamError) as exc:
+                self.log(f"账号 {acc.name} 后台重登失败：{exc}")
+            except Exception as exc:                    # noqa: BLE001
+                self.log(f"账号 {acc.name} 后台重登异常：{exc}")
+            finally:
+                with self._recovering_lock:
+                    self._recovering.discard(acc.name)
+                self.save(force=True)
+
+        thread = threading.Thread(target=run, name=f"recover-{acc.name}",
+                                  daemon=True)
+        self._recovery_threads = [t for t in self._recovery_threads if t.is_alive()]
+        self._recovery_threads.append(thread)
+        thread.start()
+
+    def wait_recovery(self, timeout: float = 10.0) -> None:
+        """Block until background re-logins finish (tests / clean shutdown)."""
+        for thread in list(self._recovery_threads):
+            thread.join(timeout)
 
     def snapshot(self) -> Dict:
         return {
@@ -847,7 +990,8 @@ class AccountPool:
 
     def _maintain(self, acc: Account, upgrade_days: float) -> None:
         try:
-            if (upgrade_days > 0 and not acc.has_password and acc.session_valid
+            if (upgrade_days > 0 and self.auto_set_password()
+                    and not acc.has_password and acc.session_valid
                     and acc.days_left is not None
                     and acc.days_left <= upgrade_days):
                 self.ensure_password(acc)

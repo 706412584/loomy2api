@@ -50,6 +50,16 @@ _start_lock = threading.Lock()
 #: Serialises whole start/rebind operations: the watchdog, the service start
 #: and the UI's LAN toggle can otherwise race and bind the port twice.
 _op_lock = threading.Lock()
+#: The live config of the running gateway (set by start_gateway). Lets the
+#: Android UI read the configured API key without an authenticated HTTP call —
+#: chicken and egg: the panel endpoints need the key to tell you the key.
+_gateway_cfg = {}
+
+
+def current_api_key() -> str:
+    """First configured gateway API key, or "" when auth is disabled."""
+    keys = (_gateway_cfg.get("cfg") or {}).get("api_keys") or []
+    return str(keys[0]) if keys else ""
 
 
 def _is_serving(port: int, timeout: float = 2.0) -> bool:
@@ -89,6 +99,27 @@ def restart_gateway(port: int = 17991) -> None:
                 print(f"[mobile_main] old server close failed: {exc}", flush=True)
         print("[mobile_main] restart requested", flush=True)
         start_gateway(os.getcwd(), port)
+
+
+def rebind_port(port: int) -> None:
+    """Restart the gateway on a new port (settings → 端口).
+
+    Persists ``port`` to config.json so a process restart keeps it, then
+    rebinds.  The old listener is closed by restart_gateway.
+    """
+    import json
+    cfg_path = os.path.join(os.getcwd(), "config.json")
+    try:
+        stored = {}
+        if os.path.exists(cfg_path):
+            with open(cfg_path, encoding="utf-8") as f:
+                stored = json.load(f)
+        stored["port"] = int(port)
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(stored, f)
+    except Exception as exc:
+        print(f"[mobile_main] config write failed: {exc}", flush=True)
+    restart_gateway(int(port))
 
 
 def bind_host(host: str, port: int = 17991) -> None:
@@ -162,21 +193,34 @@ def start_gateway(files_dir: str, port: int = 17991) -> None:
     #    misleading stale value on disk)
     cfg_path = os.path.join(files_dir, "config.json")
     import json
+    # Password automation defaults to OFF on mobile.  Rotating a password
+    # through the still-valid session logs the same account out everywhere
+    # else ("顶号"), and on a phone the account list is usually shared with
+    # the user's own client.  Only fill the keys in when they are absent, so
+    # an explicit choice made in Settings is never overwritten.
+    mobile_defaults = {"auto_set_password": False, "auto_repair_password": False}
     if os.path.exists(cfg_path):
         try:
             with open(cfg_path, encoding="utf-8") as f:
                 stored = json.load(f)
         except Exception:
             stored = {}
+        changed = False
         if stored.get("port") != port:
             stored["port"] = port
+            changed = True
+        for key, value in mobile_defaults.items():
+            if key not in stored:
+                stored[key] = value
+                changed = True
+        if changed:
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(stored, f)
     else:
         stored = {}
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump({"host": "127.0.0.1", "port": port, "proxy": "",
-                       "sessions_from_client": False}, f)
+                       "sessions_from_client": False, **mobile_defaults}, f)
 
     # Bind 0.0.0.0 when the user enabled LAN access in the app's settings.
     # This used to be forced to loopback here, which silently ignored the
@@ -203,6 +247,7 @@ def start_gateway(files_dir: str, port: int = 17991) -> None:
         os.path.join(pkg_dir, "smsreg.py"))
     # let the panel persist settings back to the same file it read
     cfg["_config_file"] = cfg_path
+    _gateway_cfg["cfg"] = cfg
 
     bound = {}
     bound_event = threading.Event()

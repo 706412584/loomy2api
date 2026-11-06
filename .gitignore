@@ -53,3 +53,14 @@ _bulk_reg.log
 _bulk_tasks.log
 _bulk_new.jsonl
 _new_accounts.txt
+
+# local account exports / state dumps — these hold PLAINTEXT sessions and
+# passwords, so they must never be committed
+desktop_export.json
+import_res.json
+phone_import.json
+check_res.json
+pstate*.json
+ph*.json
+_up*.png
+gateway.lock

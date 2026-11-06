@@ -108,6 +108,13 @@ class FakeUpstream:
         #: That is what the upstream actually does, and ignoring it is what
         #: made the panel report "quota unknown" forever.
         self.points_session_invalid = False
+        #: Sessions the upstream answers with **HTTP 200 + a JSON business
+        #: envelope** (``code=100002 登录已失效``) instead of an SSE stream.
+        #: That is what the real gateway does for a dead session, and treating
+        #: it as a stream is what produced the endless "empty stream" retries.
+        self.dead_sessions_200: List[str] = []
+        #: Sessions whose stream answers 200 + SSE but sends no data at all.
+        self.empty_stream_sessions: List[str] = []
         #: model-id substring → (status, message); simulates upstream hiccups
         self.reject_with: Dict[str, Any] = {}
         #: model-id substrings the provider's content inspection refuses.  The
@@ -224,6 +231,11 @@ class FakeUpstream:
                     return fake._reject(self, 401, "invalid session")
                 if token in fake.exhausted_sessions:
                     return fake._reject(self, 402, "insufficient points")
+                if token in fake.dead_sessions_200:
+                    # real upstream shape: HTTP 200, JSON body, no SSE
+                    return fake._send_json(self, {
+                        "code": "100002", "desc": "登录已失效，请重新登录",
+                        "data": {}})
 
                 if path.endswith("/chat/completions"):
                     model = body.get("model", "fake-model")
@@ -234,6 +246,8 @@ class FakeUpstream:
                         if needle in str(model):
                             return fake._reject(self, status, message)
                     if body.get("stream"):
+                        if token in fake.empty_stream_sessions:
+                            return self._empty_stream()
                         return self._stream(model)
                     return fake._send_json(self, {
                         "id": "chatcmpl-fake", "object": "chat.completion",
@@ -250,6 +264,14 @@ class FakeUpstream:
                 if path.endswith("/embeddings"):
                     return fake._send_json(self, {"data": [{"index": 0, "embedding": [0.1]}]})
                 return fake._reject(self, 404, "not found")
+
+            def _empty_stream(self) -> None:
+                """SSE headers, then EOF without a single event."""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.flush()
 
             def _stream(self, model: str) -> None:
                 self.send_response(200)

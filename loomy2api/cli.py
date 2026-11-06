@@ -64,6 +64,8 @@ def cmd_accounts(cfg, args) -> int:
         state = "正常"
         if not acc.enabled:
             state = "已禁用"
+        elif acc.banned:
+            state = "已封禁"
         elif acc.in_cooldown:
             state = f"冷却 {acc.cooldown_until - time.time():.0f}s"
         elif not acc.session_valid:

@@ -14,8 +14,8 @@ android {
         applicationId = "com.loomy.gw"
         minSdk = 26
         targetSdk = 34
-        versionCode = 26
-        versionName = "2.7.0"
+        versionCode = 28
+        versionName = "2.7.2"
 
         ndk {
             // Chaquopy needs abiFilters; arm64 covers modern phones
@@ -101,6 +101,15 @@ android {
     }
     packaging {
         resources.excludes += setOf("META-INF/*.kotlin_module")
+        jniLibs {
+            // cloudflared ships as jniLibs/arm64-v8a/libcloudflared.so. It is a
+            // real executable, not a JNI library: Android only allows executing
+            // files from the extracted nativeLibraryDir, so the APK must store
+            // (and install) it uncompressed like a normal .so.
+            useLegacyPackaging = true
+            // Go binaries break when the NDK strip removes their build info.
+            keepDebugSymbols += "**/libcloudflared.so"
+        }
     }
 }
 

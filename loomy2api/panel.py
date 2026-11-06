@@ -166,8 +166,11 @@ class Panel:
         being refreshed is not queued twice, so the 10 s UI poll cannot pile
         up work.
         """
+        # A flagged (banned) account is left alone: the upstream has disabled
+        # it, so re-reading its quota only re-confirms the ban and logs noise.
         pending = [a for a in self.pool.accounts
-                   if a.session_valid and not (only_stale and not self._quota_stale(a))]
+                   if a.session_valid and not a.banned
+                   and not (only_stale and not self._quota_stale(a))]
         if not pending:
             return
 
@@ -239,6 +242,8 @@ class Panel:
                 "cooldown_seconds": self.gw.cfg.get("cooldown_seconds"),
                 "session_renew_before_days": self.gw.cfg.get("session_renew_before_days"),
                 "password_set_before_days": self.gw.cfg.get("password_set_before_days"),
+                "auto_set_password": bool(self.gw.cfg.get("auto_set_password", True)),
+                "auto_repair_password": bool(self.gw.cfg.get("auto_repair_password", True)),
                 "sessions_from_client": bool(self.gw.cfg.get("sessions_from_client", True)),
                 # fysms 接码: expose the username and whether a password is
                 # stored — never the password itself.
@@ -264,7 +269,7 @@ class Panel:
             "timeout", "max_retries", "cooldown_seconds",
             "session_renew_before_days", "password_set_before_days",
             "quota_refresh_minutes", "sessions_from_client", "identity_mode",
-            "daily_only", "auto_repair_password",
+            "daily_only", "auto_repair_password", "auto_set_password",
             "fysms_username", "fysms_password", "fysms_keyword",
             "fysms_max_wait",
         }
@@ -291,7 +296,7 @@ class Panel:
                     raw = text.split(",")
             changes["api_keys"] = [str(v).strip() for v in (raw or []) if str(v).strip()]
         for flag in ("log_requests", "sessions_from_client", "daily_only",
-                     "auto_repair_password"):
+                     "auto_repair_password", "auto_set_password"):
             if flag in changes:
                 changes[flag] = bool(changes[flag])
         for num_key in ("timeout", "max_retries", "cooldown_seconds",
@@ -947,6 +952,9 @@ class Panel:
         try:
             return call(acc.session)
         except UpstreamError as exc:
+            if getattr(exc, "banned", False):
+                self.pool.mark_banned(acc, str(exc))
+                raise PoolError(f"账号 {acc.name} 已被上游停用（封禁）") from exc
             if exc.status != 401:
                 raise
             if not acc.has_password:
