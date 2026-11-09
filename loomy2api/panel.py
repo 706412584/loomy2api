@@ -240,6 +240,11 @@ class Panel:
                 "timeout": self.gw.cfg.get("timeout"),
                 "max_retries": self.gw.cfg.get("max_retries"),
                 "cooldown_seconds": self.gw.cfg.get("cooldown_seconds"),
+                # stream watchdog: seconds without ANY upstream byte before a
+                # stream is aborted (a long reasoning model is not a stall).
+                "stream_progress_stall_seconds": self.gw.cfg.get(
+                    "stream_progress_stall_seconds"),
+                "stream_stall_seconds": self.gw.cfg.get("stream_stall_seconds"),
                 "session_renew_before_days": self.gw.cfg.get("session_renew_before_days"),
                 "password_set_before_days": self.gw.cfg.get("password_set_before_days"),
                 "auto_set_password": bool(self.gw.cfg.get("auto_set_password", True)),
@@ -267,6 +272,7 @@ class Panel:
         editable = {
             "strategy", "default_model", "api_keys", "proxy", "log_requests",
             "timeout", "max_retries", "cooldown_seconds",
+            "stream_progress_stall_seconds", "stream_stall_seconds",
             "session_renew_before_days", "password_set_before_days",
             "quota_refresh_minutes", "sessions_from_client", "identity_mode",
             "daily_only", "auto_repair_password", "auto_set_password",
@@ -300,6 +306,7 @@ class Panel:
             if flag in changes:
                 changes[flag] = bool(changes[flag])
         for num_key in ("timeout", "max_retries", "cooldown_seconds",
+                        "stream_progress_stall_seconds", "stream_stall_seconds",
                         "session_renew_before_days", "password_set_before_days",
                         "quota_refresh_minutes", "fysms_max_wait"):
             if num_key in changes:
@@ -307,6 +314,11 @@ class Panel:
                     changes[num_key] = int(changes[num_key])
                 except (TypeError, ValueError):
                     raise PoolError(f"{num_key} 必须是整数") from None
+        # A stall guard below the platform's own timeouts would reintroduce the
+        # bug this key exists to fix, so keep it sane.
+        for guard in ("stream_progress_stall_seconds", "stream_stall_seconds"):
+            if guard in changes and changes[guard] < 30:
+                raise PoolError(f"{guard} 至少 30 秒 / must be at least 30s")
 
         self.gw.cfg.update(changes)
         self._write_config(changes)
@@ -761,13 +773,33 @@ class Panel:
             max_wait = 120
         max_wait = max(30, min(max_wait, 300))
 
-        from .smsreg import register_batch
+        # Invitation donors: existing accounts whose spare codes the new
+        # numbers get bound to.  Capped at five because each bound pair costs
+        # an upstream activation round-trip per new number.
+        raw_targets = payload.get("invite_targets") or []
+        if not isinstance(raw_targets, list):
+            raise PoolError("invite_targets 必须是账号名数组")
+        invite_targets = [str(t).strip() for t in raw_targets if str(t or "").strip()]
+        if len(invite_targets) > 5:
+            raise PoolError("最多选择 5 个绑定邀请码的账号 / at most 5 inviters")
+
+        from .fysms import CODE_PRICE
+        from .smsreg import collect_invite_codes, register_batch
+
+        # Resolve the deliverable codes *before* spending: if none of the
+        # selected accounts can hand out a code, fail now instead of buying
+        # numbers that then cannot be bound.
+        if invite_targets and not collect_invite_codes(self.gw, invite_targets):
+            raise PoolError("所选账号都没有可用邀请码，请重新选择 / "
+                            "none of the selected accounts has a spare invite code")
 
         if not self._sms_lock.acquire(blocking=False):
             raise PoolError("已有接码注册任务在进行 / another SMS batch is running")
         try:
             self.log(f"[panel] 接码注册开始：{count} 个（标题 {keyword}，"
-                     f"每号约 1.6 元）")
+                     f"每号约 {CODE_PRICE} 元）"
+                     + (f"，随机绑定邀请码（{len(invite_targets)} 个候选账号）"
+                        if invite_targets else ""))
             summary = register_batch(
                 self.gw, count,
                 username=username, password=password,
@@ -775,6 +807,7 @@ class Panel:
                 account_password=manual,
                 checkin=bool(payload.get("checkin")),
                 onboarding=bool(payload.get("onboarding")),
+                invite_targets=invite_targets,
             )
             self._remember_fysms(username, password)
         finally:

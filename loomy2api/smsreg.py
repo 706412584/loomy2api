@@ -6,14 +6,16 @@
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 from .account import Account, AccountError
-from .fysms import DEFAULT_KEYWORD, FysmsClient, FysmsError, extract_code
+from .fysms import DEFAULT_KEYWORD, FYSMS_API, FysmsClient, extract_code
 from .pool import PoolError
 
-__all__ = ["register_one", "register_batch", "fysms_status"]
+__all__ = ["register_one", "register_batch", "fysms_status",
+           "usable_invite_codes", "collect_invite_codes"]
 
 
 def _log(gw, message: str) -> None:
@@ -23,9 +25,68 @@ def _log(gw, message: str) -> None:
         pass
 
 
+def usable_invite_codes(gw, donor: Account) -> List[Dict[str, Any]]:
+    """The invitation codes ``donor`` can still hand out.
+
+    A code is usable while it is ``active`` and has uses left.  The pool is
+    self-sufficient: every account owns one long-term code (``maxUses=1000``)
+    plus an assortment of one-shot spares, so a freshly registered number can
+    always be bound to *some* existing account's code.
+    """
+    overview = gw.models_client.points_overview(donor.session)
+    out: List[Dict[str, Any]] = []
+    for c in overview.get("invitation_codes") or []:
+        code = str(c.get("inviteCode") or "")
+        if not code or str(c.get("status") or "") != "active":
+            continue
+        max_uses = int(c.get("maxUses") or 0)
+        used = int(c.get("usedCount") or 0)
+        if max_uses > used:
+            out.append({"code": code, "max_uses": max_uses, "used": used,
+                        "remaining": max_uses - used,
+                        "long_term": max_uses >= 1000})
+    return out
+
+
+def collect_invite_codes(gw, targets: List[str]) -> List[tuple]:
+    """(code, owner) pairs the given pool accounts can still hand out.
+
+    Called *before* any number is bought: a selection whose donors have no
+    usable code should be visible up front, not discovered after ``count``
+    numbers have already been paid for.
+    """
+    out: List[tuple] = []
+    for name in targets or []:
+        donor = gw.pool.get(str(name))
+        if donor is None or not donor.session:
+            continue
+        try:
+            for c in usable_invite_codes(gw, donor):
+                out.append((c["code"], donor.name))
+        except Exception:                            # noqa: BLE001
+            continue
+    return out
+
+
+def _apply_code(gw, acc: Account, code: str, owner: str) -> Dict[str, Any]:
+    """Submit ``code`` for ``acc`` and record the outcome on the account."""
+    dev = (acc.identity or {}).get("campus_device_id") or ""
+    try:
+        data = gw.models_client.points_activate(acc.session, dev, code)
+    except Exception as exc:                         # noqa: BLE001
+        return {"ok": False, "code": code, "from": owner, "error": str(exc)[:160]}
+    acc.activated = bool(data.get("activated", True))
+    acc.applied_invitation_code = str(data.get("appliedInvitationCode") or code)
+    return {"ok": True, "code": code, "from": owner,
+            "already": bool(data.get("alreadyActivated")),
+            "invitee_reward": data.get("inviteeReward"),
+            "inviter_reward": data.get("inviterReward"),
+            "permanent_balance": data.get("permanentBalance")}
+
+
 def fysms_status(username: str, password: str, base: str = "") -> Dict[str, Any]:
     """Login + balance only (no number taken, no money spent)."""
-    client = FysmsClient(username, password, base=base or "https://h5.fysms.cc")
+    client = FysmsClient(username, password, base=base or FYSMS_API)
     uid = client.login()
     balance = client.balance()
     return {"ok": True, "userid": uid, "balance": balance}
@@ -44,9 +105,9 @@ def register_one(gw, client: FysmsClient, *,
     row: Dict[str, Any] = {"ok": False, "phone": "", "stage": "take_number"}
     pool = gw.pool
 
-    # 1. number (costs one code)
+    # 1. number (the platform freezes one code's fee until a code arrives)
     try:
-        phone = client.get_phone()
+        phone = client.get_phone(keyword)
     except Exception as exc:                         # noqa: BLE001
         row.update(error=f"取号失败：{exc}")
         return row
@@ -74,12 +135,12 @@ def register_one(gw, client: FysmsClient, *,
         row["sms_error"] = str(exc)[:200]
     if not sms:
         row["stage"] = "timeout"
-        # The fee is charged when a code is actually returned, so a timeout
-        # costs nothing.  The platform auto-releases the number after 18
-        # polls; blacklisting is optional housekeeping on top of that.
+        # The fee is only charged when a code is actually returned, so a
+        # timeout costs nothing; ``blacklist`` here submits the order's release
+        # request, which refunds the frozen amount.
         row["blacklisted"] = client.blacklist(phone)
         row.update(error="超时未收到短信（未扣码费）" +
-                         ("，号码已拉黑" if row["blacklisted"] else "，号码已自动释放"))
+                         ("，订单已提交释放" if row["blacklisted"] else "，订单将自动过期"))
         return row
     row["sms"] = sms[:120]
     code = extract_code(sms)
@@ -191,19 +252,37 @@ def register_batch(gw, count: int, *, username: str, password: str,
                    keyword: str = DEFAULT_KEYWORD, max_wait: int = 150,
                    account_password: str = "",
                    checkin: bool = False, onboarding: bool = False,
+                   invite_targets: Optional[List[str]] = None,
                    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None
                    ) -> Dict[str, Any]:
-    """Register ``count`` accounts sequentially. Stops early when money runs out."""
+    """Register ``count`` accounts sequentially. Stops early when money runs out.
+
+    ``invite_targets`` names existing pool accounts whose spare invitation
+    codes the freshly registered numbers are bound to (one chosen at random
+    per new account, ~5000 permanent points for each side).
+    """
     client = FysmsClient(username, password,
-                         base=str(gw.cfg.get("fysms_base") or "https://h5.fysms.cc"))
+                         base=str(gw.cfg.get("fysms_base") or FYSMS_API))
     client.login()
     balance = client.balance()
+
+    # Resolve the deliverable codes once, before spending anything: a bad
+    # selection (donor with no spare code) should be reported up front rather
+    # than after ``count`` numbers have been bought.
+    targets = [str(t) for t in (invite_targets or []) if str(t or "").strip()][:5]
+    executed = collect_invite_codes(gw, targets)
 
     results: List[Dict[str, Any]] = []
     for index in range(max(1, int(count))):
         row = register_one(gw, client, keyword=keyword, max_wait=max_wait,
                            password=account_password,
                            checkin=checkin, onboarding=onboarding)
+        if row.get("ok") and executed:
+            acc = gw.pool.get(row.get("phone") or "")
+            if acc is not None:
+                code, owner = random.choice(executed)
+                row["invite"] = _apply_code(gw, acc, code, owner)
+                gw.pool.save(force=True)
         row["index"] = index + 1
         row["total"] = count
         results.append(row)
@@ -215,6 +294,8 @@ def register_batch(gw, count: int, *, username: str, password: str,
         # a missing number means the account balance is gone — stop spending
         if not row.get("phone") and "余额不足" in str(row.get("error") or ""):
             break
+        # a code that never arrived means the order was released and refunded;
+        # keep going on the next number rather than aborting the batch
 
     ok = [r for r in results if r.get("ok")]
     try:
@@ -234,5 +315,7 @@ def register_batch(gw, count: int, *, username: str, password: str,
         # The platform only charges when a code is returned, so this is the
         # real cost of the batch (not count × price).
         "charged": charged,
+        "invite_targets": targets,
+        "invite_codes": len(executed),
         "results": results,
     }

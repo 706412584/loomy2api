@@ -191,19 +191,35 @@ def cmd_fysms_balance(cfg, args) -> int:
     return 0
 
 
+def _invite_note(row) -> str:
+    """One-line summary of the invitation binding for a progress row."""
+    inv = row.get("invite")
+    if not isinstance(inv, dict):
+        return ""
+    if inv.get("ok"):
+        return (f"\n    邀请码 {inv.get('code')}（来自 {inv.get('from')}）"
+                f" +{inv.get('invitee_reward') or 0} 永久积分")
+    return f"\n    邀请码绑定失败：{inv.get('error')}"
+
+
 def cmd_register_sms(cfg, args) -> int:
     """fysms 接码注册（收费操作，必须 --yes 确认）。"""
+    from .fysms import CODE_PRICE
     from .server import Gateway
     from .smsreg import register_batch
 
     if not args.yes:
-        print(f"接码注册在成功取到验证码时扣费（1.6 元/个，首次 65%），"
+        print(f"接码注册在成功取到验证码时扣费（{CODE_PRICE} 元/个，关键词通道），"
               f"本次最多 {args.count} 个；没收到短信不扣费。确认请加 --yes")
         return 1
     username = args.username or cfg.get("fysms_username") or ""
     password = args.password or cfg.get("fysms_password") or ""
     if not username or not password:
         print("请先用 --username/--password 或在 config.json 里配置 fysms 账号")
+        return 1
+    invite_targets = [t for t in (args.invite or []) if str(t or "").strip()]
+    if len(invite_targets) > 5:
+        print(f"最多选择 5 个绑定邀请码的账号（收到 {len(invite_targets)} 个）")
         return 1
     gw = Gateway(cfg)
     try:
@@ -212,10 +228,12 @@ def cmd_register_sms(cfg, args) -> int:
             keyword=args.keyword, max_wait=args.wait,
             account_password=args.account_password,
             checkin=args.checkin, onboarding=args.onboarding,
+            invite_targets=invite_targets,
             on_progress=lambda row: print(
                 f"[{row['index']}/{row['total']}] {row.get('phone') or '—'} "
                 f"{'✓ ' + str(row.get('name')) if row.get('ok') else '✗ ' + str(row.get('error'))}"
-                + (f"  密码 {row['password']}" if row.get("password") else "")),
+                + (f"  密码 {row['password']}" if row.get("password") else "")
+                + _invite_note(row)),
         )
     except Exception as exc:                         # noqa: BLE001
         print(f"接码注册失败：{exc}")
@@ -366,6 +384,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--account-password", default="", help="统一登录密码（留空=随机生成）")
     p.add_argument("--checkin", action="store_true", help="注册后顺手签到")
     p.add_argument("--onboarding", action="store_true", help="注册后跑新手任务")
+    p.add_argument("--invite", action="append", default=[], metavar="账号",
+                   help="从这些已有账号里随机选一个，用它的邀请码绑定新号（最多 5 个）")
     p.add_argument("-y", "--yes", action="store_true", help="确认会产生费用")
     p.set_defaults(func=cmd_register_sms)
 

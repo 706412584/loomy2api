@@ -44,7 +44,11 @@ DEFAULTS: Dict[str, Any] = {
     # account pool --------------------------------------------------------
     "accounts_file": "accounts.json",
     "strategy": "balance",        # balance | daily | permanent | round_robin | lru | weighted
-    "max_retries": 3,             # extra accounts tried on auth/quota errors
+    #: Retries for a request-level upstream failure (a bad window is ~6 s in
+    #: practice).  With the backoff below, 5 tries wait 0.5+1+2+4 = 7.5 s
+    #: before giving up, which rides out an observed burst; the per-request
+    #: cost is only paid when the upstream is actually failing.
+    "max_retries": 4,             # extra attempts on upstream/auth/quota errors
     "stream_retries": 2,          # extra attempts when a stream dies mid-flight
     #: The upstream's model gateway itself returns 502/504/500 in short bursts
     #: (a whole minute can be bad, then it clears).  Rotating accounts does not
@@ -52,10 +56,17 @@ DEFAULTS: Dict[str, Any] = {
     #: fault pauses first, otherwise every attempt lands inside the same bad
     #: window and the 502 is handed straight back to the client.  The pause
     #: doubles each time, capped at ``upstream_fault_backoff_max``.
-    "upstream_fault_backoff": 0.6,
-    "upstream_fault_backoff_max": 5.0,
-    "stream_stall_seconds": 180,  # abort/retry a stream that stalls this long
-    "thinking_stall_seconds": 240,  # abort/retry a reasoning loop with no output
+    "upstream_fault_backoff": 0.5,
+    "upstream_fault_backoff_max": 4.0,
+    #: Abort a stream that makes **no progress at all** — not one SSE byte —
+    #: for this long.  This is the real stall guard: a reasoning model that
+    #: keeps streaming deltas (even pure ``reasoning_content`` with no answer
+    #: yet) is making progress and must NOT be killed.  The old rule capped
+    #: reasoning-only time at 240s, which cut GLM-5.3-Flash off mid-think and
+    #: reached the client as "upstream stream interrupted".
+    "stream_progress_stall_seconds": 600,
+    #: Fallback for the value above (older configs only carry this one).
+    "stream_stall_seconds": 180,
     "cooldown_seconds": 300,
     #: After the account service rejects the stored password (or throttles
     #: logins), don't attempt another password login for this long.  The

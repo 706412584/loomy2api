@@ -202,6 +202,11 @@
       <label class="row" style="margin:0;color:var(--muted)" title="只使用每日活动额度，绝不消耗永久积分。活动额度用完后请求会失败，等待次日重置。">
         <input id="dailyOnly" type="checkbox" style="min-width:auto"> 只用活动余额
       </label>
+      <label class="row" style="margin:0;color:var(--muted)"
+             title="流式响应「毫无进展」多少秒后放弃。只要上游还在吐任何字节（含纯思考 reasoning），就重新计时——推理模型长时间思考不算卡住。改大能减少长思考被误掐（客户端会看到 upstream stream interrupted）。">
+        流超时
+        <input id="streamStall" type="number" min="30" step="30" style="width:74px"> 秒
+      </label>
       <label class="row" style="margin:0;color:var(--muted)">
         <input id="auto" type="checkbox" checked style="min-width:auto"> 自动刷新
       </label>
@@ -429,6 +434,10 @@ function render(state) {
   if (document.activeElement !== sel) sel.value = c.strategy || 'balance';
   const dOnly = $('dailyOnly');
   if (document.activeElement !== dOnly) dOnly.checked = !!c.daily_only;
+  const stall = $('streamStall');
+  if (stall && document.activeElement !== stall) {
+    stall.value = c.stream_progress_stall_seconds || c.stream_stall_seconds || 600;
+  }
   $('cards').innerHTML = [
     ['账号 Accounts', t.accounts + ' <small>/ 可用 ' + t.usable + '</small>'],
     ['可用积分 Available', t.available + (t.unique_accounts !== t.accounts ? ' <small>(去重 ' + t.unique_accounts + ' 号)</small>' : '')],
@@ -1360,6 +1369,58 @@ async function setAllPasswords() {
 // ------------------------------------------------------- SMS registration
 
 let REG_BUSY = false;
+//: fysms keyword-channel price, used for the pre-flight cost estimate.
+let REG_PRICE = 1.18;
+//: Accounts ticked as invitation donors (at most five).
+let REG_INVITE_SEL = new Set();
+
+function renderInvitePicker() {
+  const box = $('r-invite-list');
+  if (!box) return;
+  const q = ($('r-invite-search').value || '').trim().toLowerCase();
+  const pool = ((LAST_STATE || {}).accounts || []).filter(a =>
+    a.enabled && a.session && a.permanent
+    && (!q || String(a.name).toLowerCase().includes(q)
+        || String(a.loginid_masked || '').toLowerCase().includes(q)));
+  // Keep ticks that still exist; drop accounts that vanished from the pool.
+  const alive = new Set(pool.map(a => a.name));
+  [...REG_INVITE_SEL].forEach(n => { if (!alive.has(n)) REG_INVITE_SEL.delete(n); });
+  if (!pool.length) {
+    box.innerHTML = '<div class="muted" style="padding:8px;font-size:12px">'
+      + '没有可用的永久账号（需已设置密码且有 session）</div>';
+  } else {
+    box.innerHTML = pool.slice(0, 300).map(a => {
+      const on = REG_INVITE_SEL.has(a.name);
+      const chip = a.applied_invitation_code
+        ? ' <small class="muted">已用 ' + a.applied_invitation_code + '</small>' : '';
+      return '<label class="row" style="margin:0;padding:4px 6px;cursor:pointer">'
+        + '<input type="checkbox" data-invite="' + a.name + '"'
+        + (on ? ' checked' : '') + '> <span>' + a.name + chip + '</span></label>';
+    }).join('');
+    box.querySelectorAll('input[data-invite]').forEach(cb => {
+      cb.onchange = () => {
+        const n = cb.getAttribute('data-invite');
+        if (cb.checked) {
+          if (REG_INVITE_SEL.size >= 5) {
+            cb.checked = false;
+            toast('最多选 5 个账号作为邀请人', 'err');
+            return;
+          }
+          REG_INVITE_SEL.add(n);
+        } else {
+          REG_INVITE_SEL.delete(n);
+        }
+        updateInviteCount();
+      };
+    });
+  }
+  updateInviteCount();
+}
+
+function updateInviteCount() {
+  const el = $('r-invite-count');
+  if (el) el.textContent = '已选 ' + REG_INVITE_SEL.size + '/5';
+}
 
 function closeSmsReg() {
   // Closing while a batch runs would leave the server spending money with no
@@ -1386,11 +1447,21 @@ async function openSmsReg() {
     + '<label class="row" style="margin:0"><input type="checkbox" id="r-checkin"> 顺手签到</label>'
     + '<label class="row" style="margin:0"><input type="checkbox" id="r-onboarding"> 跑新手任务</label></div>'
     + '</div>'
+    + '<div style="margin-top:12px">'
+    + '<label class="row" style="margin:0 0 6px;justify-content:space-between">'
+    + '<span>顺便绑定邀请码 <small class="muted">（从已勾选账号里随机取一个码，双方各得 5000 永久积分）</small></span></label>'
+    + '<input id="r-invite-search" placeholder="搜索账号 / 手机号…" '
+    + 'style="width:100%;margin-bottom:6px">'
+    + '<div id="r-invite-list" style="max-height:190px;overflow:auto;border:1px solid var(--border);'
+    + 'border-radius:8px;padding:4px"></div>'
+    + '<div class="row" style="gap:8px;align-items:center;margin-top:6px">'
+    + '<span id="r-invite-count" class="muted" style="font-size:12px">已选 0/5</span>'
+    + '<button id="r-invite-clear" style="height:28px">清空</button></div></div>'
     + '<div class="row" style="gap:8px;align-items:center;margin-top:4px">'
     + '<button id="r-balance">查询余额（免费）</button>'
     + '<span id="r-balance-msg" class="muted" style="font-size:12px"></span></div>'
-    + '<div class="paywarn">⚠ 接码平台<b>成功取到验证码时扣费</b>（1.6 元/个，首次 65%），'
-    + '取号后没来短信不扣费，平台会在 18 次轮询后自动释放号码。'
+    + '<div class="paywarn">⚠ 接码平台<b>成功取到验证码时扣费</b>（' + REG_PRICE + ' 元/个，关键词通道），'
+    + '取号后没来短信不扣费，订单会自动释放并退款。'
     + '请确认数量和余额后再开始。</div>'
     + '<div class="hint">接码平台需<b>直连</b>访问，请关闭 VPN / 全局代理。'
     + '每个号码会依次：取号 → 讯飞发码 → 等待短信 → 验证码登录 → 自动设置登录密码并验证，'
@@ -1400,6 +1471,10 @@ async function openSmsReg() {
     + '<button onclick="closeSmsReg()">取消</button>'
     + '<button class="primary" id="r-start">开始注册（收费）</button></div>';
   $('regMask').classList.add('open');
+  REG_INVITE_SEL = new Set();
+  $('r-invite-search').oninput = renderInvitePicker;
+  $('r-invite-clear').onclick = () => { REG_INVITE_SEL = new Set(); renderInvitePicker(); };
+  renderInvitePicker();
   $('r-balance').onclick = queryFysmsBalance;
   $('r-start').onclick = startSmsReg;
 }
@@ -1417,6 +1492,7 @@ async function queryFysmsBalance() {
   try {
     const res = await api('/api/panel/fysms/balance', {
       method: 'POST', body: JSON.stringify(regCredentials())});
+    if (typeof res.price === 'number') REG_PRICE = res.price;
     msg.textContent = '余额 ' + res.balance + ' 元 · 约可注册 '
       + (res.affordable ?? '?') + ' 个（' + res.price + ' 元/个）';
     toast('fysms 余额：' + res.balance + ' 元', 'ok');
@@ -1443,9 +1519,14 @@ async function startSmsReg() {
   if (!creds.fysms_password && !(LAST_STATE.config || {}).fysms_password_set) {
     toast('请填写 fysms 密码', 'err'); return;
   }
-  if (!confirm('接码平台在成功取到验证码时扣费（1.6 元/个，首次 65%）。\n'
-      + '本次最多 ' + count + ' 个号码，最高约 ' + (count * 1.6).toFixed(2)
-      + ' 元；没收到短信的号码不扣费。\n\n确认开始？')) return;
+  const inviters = [...REG_INVITE_SEL];
+  if (!confirm('接码平台在成功取到验证码时扣费（' + REG_PRICE + ' 元/个，关键词通道）。\n'
+      + '本次最多 ' + count + ' 个号码，最高约 ' + (count * REG_PRICE).toFixed(2)
+      + ' 元；没收到短信的号码不扣费。\n'
+      + (inviters.length
+          ? '注册成功后，每个新号会随机绑定所选 ' + inviters.length
+            + ' 个账号之一的邀请码（双方各得 5000 永久积分）。\n' : '')
+      + '\n确认开始？')) return;
 
   REG_BUSY = true;
   const btn = $('r-start');
@@ -1460,6 +1541,7 @@ async function startSmsReg() {
       password: $('r-account-pass').value.trim(),
       checkin: $('r-checkin').checked,
       onboarding: $('r-onboarding').checked,
+      invite_targets: inviters,
     });
     // N numbers × (send + up to max_wait); fetch has no timeout, which is
     // what we want here — the progress log appears only when it returns.
@@ -1470,6 +1552,12 @@ async function startSmsReg() {
         + (r.ok ? '✓ 成功' + (r.permanent ? '（永久）' : '（未设密码）')
                 + (r.password ? '  密码 ' + r.password : '')
                 : '✗ ' + (r.error || '失败')));
+      if (r.invite) {
+        regLine(r.invite.ok
+          ? '    邀请码 ' + r.invite.code + '（来自 ' + r.invite.from + '）'
+            + ' +' + (r.invite.invitee_reward || 0) + ' 永久积分'
+          : '    邀请码绑定失败：' + (r.invite.error || '未知错误'));
+      }
     });
     regLine('完成：成功 ' + res.done + '/' + res.requested
       + '，余额 ' + res.balance_before + ' → ' + res.balance_after
@@ -1533,6 +1621,30 @@ $('dailyOnly').onchange = async () => {
     load(true);
   } finally {
     box.disabled = false;
+  }
+};
+
+/**
+ * Stream stall guard: how long the upstream may send *nothing at all* before
+ * the gateway gives up.  Save on blur so a half-typed number never lands.
+ */
+$('streamStall').onchange = async () => {
+  const el = $('streamStall');
+  const value = parseInt(el.value, 10);
+  if (!(value >= 30)) { toast('流超时至少 30 秒', 'err'); load(true); return; }
+  el.disabled = true;
+  try {
+    await api('/api/panel/config', {
+      method: 'POST',
+      body: JSON.stringify({stream_progress_stall_seconds: value})
+    });
+    toast('流超时已设为 ' + value + ' 秒（无任何数据才算卡住）', 'ok');
+    load(true);
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+    load(true);
+  } finally {
+    el.disabled = false;
   }
 };
 

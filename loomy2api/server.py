@@ -33,6 +33,22 @@ class StreamStalled(Exception):
         self.kind = kind
 
 
+def _stream_socket(resp, conn=None):
+    """The live socket behind a streaming response, or ``None``.
+
+    ``http.client`` hands the socket over to the response once
+    ``getresponse()`` has run, so ``conn.sock`` is already ``None`` by the time
+    the stream is read — setting a timeout there silently did nothing, which
+    made the "upstream went quiet" guard unreachable.  The socket lives on
+    ``resp.fp.raw._sock``.
+    """
+    sock = getattr(conn, "sock", None)
+    if sock is not None:
+        return sock
+    raw = getattr(getattr(resp, "fp", None), "raw", None)
+    return getattr(raw, "_sock", None)
+
+
 class _ContentRejected:
     """Stand-in for an upstream response when content inspection said no.
 
@@ -268,6 +284,23 @@ class Handler(BaseHTTPRequestHandler):
         if delay > 0:
             time.sleep(delay)
 
+    def _log_giveup(self, kind: str, model: str, status: int, attempts: int,
+                    last: str = "") -> None:
+        """Record a request the gateway finally gave up on.
+
+        The per-attempt lines ("等 Xs 后重试") make a recovered burst visible,
+        but the *failure* path — every account exhausted, a 502 handed to the
+        client — used to write nothing at all, so "客户端收到 502" left no
+        trace in the log and could not be diagnosed after the fact.
+        """
+        self.gateway.record_call(account="-", loginid="", model=model,
+                                 status=status or 502, seconds=0.0, kind=kind,
+                                 stream=kind.endswith("stream"),
+                                 error=f"gave up after {attempts} attempts: {last}"[:300])
+        self.gateway.log(f"[{kind}] 放弃 {model}：{attempts} 次尝试后仍失败 → "
+                         f"返回 {status or 502} 给客户端"
+                         + (f"（最后错误：{last[:160]}）" if last else ""))
+
     def setup(self):                               # noqa: D102
         super().setup()
         self._body_read = False
@@ -313,43 +346,42 @@ class Handler(BaseHTTPRequestHandler):
                 return None
         return block
 
-    def _read_chunk(self, conn, resp, idle_seconds: float, *,
-                    thinking_seconds: float = 0.0,
-                    saw_output: bool = True,
-                    content_started: float = 0.0) -> bytes:
-        """Read one chunk, aborting if the upstream goes quiet too long.
+    def _read_chunk(self, conn, resp, progress_seconds: float, *,
+                    last_progress: float = 0.0) -> bytes:
+        """Read one chunk, aborting if the upstream makes no progress.
 
         ``http.client`` cannot resume a read after a socket timeout, so the
-        idle budget is applied as the socket timeout itself rather than by
-        polling: a timeout means the upstream really went silent, and the
-        caller abandons the connection (retrying when nothing was sent yet).
+        budget is applied as the socket timeout itself rather than by polling:
+        a timeout means the upstream really went silent, and the caller
+        abandons the connection (retrying when nothing was sent yet).
 
-        ``thinking_seconds`` bounds how long a reasoning-only stream may run.
-        A looping model keeps sending reasoning deltas, so this is checked
-        between reads, not via the socket timeout.
-
-        ``read1`` rather than ``read``: ``HTTPResponse.read(n)`` is backed by a
-        ``BufferedReader`` and blocks until *n* bytes arrive (or EOF), so a
-        model that emits a token at a time would reach the client in 4 KiB
-        bursts — the "whole sentence appears at once" effect.  ``read1``
-        returns as soon as any data is available, preserving the upstream's
-        token-by-token cadence.
+        ``progress_seconds`` bounds the *total* time without any progress.  A
+        reasoning model that keeps streaming deltas is making progress even
+        though it has not emitted an answer yet, so the deadline is only hit
+        when **nothing at all** arrives — a genuine stall.  ``last_progress``
+        is the timestamp of the previous byte, so the caller's budget spans
+        the whole progress gap rather than just one read.
         """
-        start = time.time()
-        if (not saw_output and thinking_seconds and content_started
-                and time.time() - content_started > thinking_seconds):
-            raise StreamStalled(time.time() - content_started, "thinking-only")
-        if conn is not None and getattr(conn, "sock", None) is not None:
-            conn.sock.settimeout(idle_seconds)
+        if last_progress and progress_seconds:
+            idle = time.time() - last_progress
+            if idle > progress_seconds:
+                raise StreamStalled(idle, "no-progress")
+        sock = _stream_socket(resp, conn)
+        if sock is not None:
+            try:
+                sock.settimeout(progress_seconds or 180)
+            except OSError:
+                pass
         try:
             read1 = getattr(resp, "read1", None)
             if read1 is not None:
                 return read1(4096)
             return resp.read(4096)
         except socket.timeout as exc:
-            raise StreamStalled(idle_seconds, "idle") from exc
+            raise StreamStalled(progress_seconds, "no-progress") from exc
         except (OSError, ValueError) as exc:
-            raise StreamStalled(time.time() - start, f"io:{exc}") from exc
+            raise StreamStalled(time.time() - (last_progress or time.time()),
+                                f"io:{exc}") from exc
 
     def _json(self, status: int, obj: Any, extra: Optional[dict] = None) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -830,6 +862,9 @@ class Handler(BaseHTTPRequestHandler):
             if status in self.FATAL_REQUEST:            # not an account problem
                 break
         status, data = last
+        if status >= 400:
+            self._log_giveup("call", model, status,
+                             len(tried), data[:160].decode("utf-8", "replace"))
         try:
             return self._json(status or 502, json.loads(data.decode("utf-8")))
         except Exception:                               # noqa: BLE001
@@ -931,8 +966,9 @@ class Handler(BaseHTTPRequestHandler):
         usage: Dict[str, Any] = {}
         dropped = 0
         attempts = int(gw.cfg.get("stream_retries") or 0) + 1
-        stall_seconds = float(gw.cfg.get("stream_stall_seconds") or 180)
-        think_seconds = float(gw.cfg.get("thinking_stall_seconds") or 240)
+        progress_seconds = float(
+            gw.cfg.get("stream_progress_stall_seconds")
+            or gw.cfg.get("stream_stall_seconds") or 600)
         disable_thinking = bool(req.pop("_no_thinking", False))
         # accounts this request already found unusable: a stream retry must
         # land on a different account, otherwise a dead session (or a model
@@ -953,13 +989,17 @@ class Handler(BaseHTTPRequestHandler):
                 if attempt > 0:
                     # SSE headers already went out on the first attempt; a
                     # second HTTP response would be appended to the body.
+                    self._log_giveup("call", model, 200, attempts)
                     self._terminate_sse("所有账号都失败了 / all accounts failed")
                     return
                 if resp is None:
+                    self._log_giveup("call", model, 502, attempts)
                     return self._error(502, "所有账号都失败了 / all accounts failed",
                                        "upstream_error")
                 data = resp.read()
                 resp.close() if hasattr(resp, "close") else None
+                self._log_giveup("call", model, resp.status, attempts,
+                                 data[:160].decode("utf-8", "replace"))
                 try:
                     return self._json(resp.status, json.loads(data.decode("utf-8")))
                 except Exception:                       # noqa: BLE001
@@ -980,19 +1020,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.close_connection = True
 
             saw_content = False          # any text/tool/reasoning forwarded
-            saw_output = False           # text or tool (not just reasoning)
             saw_done = False             # upstream sent [DONE]
             finished = False             # upstream sent finish_reason
-            content_started = 0.0        # when the first content block arrived
+            last_progress = time.time()  # every upstream byte resets this
             stalled: Optional[StreamStalled] = None
             try:
                 while True:
-                    chunk = self._read_chunk(conn, resp, stall_seconds,
-                                             thinking_seconds=think_seconds,
-                                             saw_output=saw_output,
-                                             content_started=content_started)
+                    chunk = self._read_chunk(conn, resp, progress_seconds,
+                                             last_progress=last_progress)
                     if not chunk:
                         break
+                    last_progress = time.time()
                     buffer += chunk
                     while b"\n\n" in buffer:
                         block, buffer = buffer.split(b"\n\n", 1)
@@ -1004,9 +1042,6 @@ class Handler(BaseHTTPRequestHandler):
                             saw_done = True
                         if not saw_content:
                             saw_content = True
-                            content_started = time.time()
-                        if not saw_output and self._block_has_output(out):
-                            saw_output = True
                         if self._block_is_final(out):
                             finished = True
                         self._track_tool_args(out)
@@ -1024,9 +1059,6 @@ class Handler(BaseHTTPRequestHandler):
                             saw_done = True
                         if not saw_content:
                             saw_content = True
-                            content_started = time.time()
-                        if self._block_has_output(out):
-                            saw_output = True
             except StreamStalled as exc:
                 stalled = exc
             except (BrokenPipeError, ConnectionResetError):
@@ -1155,28 +1187,6 @@ class Handler(BaseHTTPRequestHandler):
                 return True
         return False
 
-    def _block_has_output(self, block: bytes) -> bool:
-        """True when an SSE block carries real output (text or a tool call).
-
-        Reasoning-only deltas (``reasoning_content``) do **not** count: a model
-        that never stops thinking must be treated as stalled.
-        """
-        if b"tool_calls" in block:
-            return True
-        for line in block.split(b"\n"):
-            if not line.strip().startswith(b"data:"):
-                continue
-            try:
-                obj = json.loads(line.strip()[5:].strip())
-            except Exception:                           # noqa: BLE001
-                continue
-            if obj.get("choices"):
-                delta = (obj["choices"][0].get("delta") or {})
-                content = delta.get("content")
-                if isinstance(content, str) and content:
-                    return True
-        return False
-
     def _terminate_sse(self, reason: str) -> None:
         """Emit a terminal event so the client does not see a silent truncation.
 
@@ -1272,6 +1282,9 @@ class Handler(BaseHTTPRequestHandler):
             if status in self.FATAL_REQUEST:
                 break
         status, data = last
+        if status >= 400:
+            self._log_giveup("messages", model, status,
+                             len(tried), data[:160].decode("utf-8", "replace"))
         return self._json(status or 502, {
             "type": "error",
             "error": {"type": "api_error",
@@ -1281,8 +1294,9 @@ class Handler(BaseHTTPRequestHandler):
         gw = self.gateway
 
         attempts = int(gw.cfg.get("stream_retries") or 0) + 1
-        stall_seconds = float(gw.cfg.get("stream_stall_seconds") or 180)
-        think_seconds = float(gw.cfg.get("thinking_stall_seconds") or 240)
+        progress_seconds = float(
+            gw.cfg.get("stream_progress_stall_seconds")
+            or gw.cfg.get("stream_stall_seconds") or 600)
         disable_thinking = bool(payload.pop("_no_thinking", False))
         failed_accounts: list = []
 
@@ -1307,13 +1321,17 @@ class Handler(BaseHTTPRequestHandler):
                     # so the error lands inside a well-formed message.
                     for event, data in anth.StreamTranslator(model).start():
                         emit(event, data)
+                    self._log_giveup("messages-stream", model, 200, attempts)
                     self._terminate_anthropic("all accounts failed")
                     return
                 if resp is None:
+                    self._log_giveup("messages-stream", model, 502, attempts)
                     return self._json(502, {"type": "error", "error": {
                         "type": "api_error", "message": "all accounts failed"}})
                 data = resp.read()
                 resp.close() if hasattr(resp, "close") else None
+                self._log_giveup("messages-stream", model, resp.status, attempts,
+                                 data[:160].decode("utf-8", "replace"))
                 return self._json(resp.status, {"type": "error", "error": {
                     "type": "api_error",
                     "message": data[:500].decode("utf-8", "replace")}})
@@ -1331,20 +1349,18 @@ class Handler(BaseHTTPRequestHandler):
 
             buffer = b""
             saw_content = False
-            saw_output = False
             saw_done = False
             finished = False
             started_stream = False       # message_start already emitted
-            content_started = 0.0
+            last_progress = time.time()  # every upstream byte resets this
             stalled: Optional[StreamStalled] = None
             try:
                 while True:
-                    chunk = self._read_chunk(conn, resp, stall_seconds,
-                                             thinking_seconds=think_seconds,
-                                             saw_output=saw_output,
-                                             content_started=content_started)
+                    chunk = self._read_chunk(conn, resp, progress_seconds,
+                                             last_progress=last_progress)
                     if not chunk:
                         break
+                    last_progress = time.time()
                     buffer += chunk
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
@@ -1371,17 +1387,11 @@ class Handler(BaseHTTPRequestHandler):
                                 emit(event, data)
                             started_stream = True
                         choice = (obj.get("choices") or [{}])[0]
-                        delta = choice.get("delta") or {}
-                        if not saw_output and (delta.get("content")
-                                               or delta.get("tool_calls")):
-                            saw_output = True
                         if choice.get("finish_reason"):
                             finished = True
                         events = list(translator.feed(obj))
                         for event, data in events:
                             if event != "ping":
-                                if not saw_content:
-                                    content_started = time.time()
                                 saw_content = True
                             emit(event, data)
                 if started_stream:

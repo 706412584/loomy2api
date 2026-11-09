@@ -298,6 +298,57 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertEqual(payload["choices"][0]["message"]["content"], "echo:ping")
         self.assertFalse(self.gateway.pool.get("a").session_valid)
 
+    def test_reasoning_only_stream_survives_long_thinking(self):
+        """A reasoning model that keeps streaming deltas is NOT a stall.
+
+        Before the progress-based watchdog, reasoning-only time was capped at
+        `thinking_stall_seconds`; GLM-5.3-Flash routinely thinks for minutes,
+        so it was cut off mid-think and surfaced to the client as
+        "upstream stream interrupted".  With the watchdog keyed on *any*
+        progress, the same stream must complete normally.
+        """
+        script = []
+        for i in range(14):
+            script.append(("delta", {"reasoning_content": f"think{i} "}))
+            script.append(("sleep", 0.2))          # ~2.8s of pure reasoning
+        script.append(("delta", {"content": "done"}))
+        # the pool has two accounts and either may be picked, so script both
+        self.upstream.scripted_streams["s1"] = script
+        self.upstream.scripted_streams["s2"] = script
+        self.cfg["stream_progress_stall_seconds"] = 1     # would kill a stall
+        self.cfg["stream_stall_seconds"] = 1
+
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "fake-model", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}, timeout=30)
+        text = body.decode("utf-8")
+        self.assertIn('"content": "done"', text)
+        self.assertNotIn("interrupted", text)
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+
+    def test_silent_stream_is_aborted_by_the_watchdog(self):
+        """No progress at all must still be caught — and fast."""
+        self.upstream.scripted_streams["s1"] = [
+            ("delta", {"reasoning_content": "start"}),
+            ("sleep", 6),                          # far past the 1s budget
+            ("delta", {"content": "too late"}),
+        ]
+        self.upstream.scripted_streams["s2"] = [
+            ("delta", {"reasoning_content": "start"}),
+            ("sleep", 6),
+            ("delta", {"content": "too late"}),
+        ]
+        self.cfg["stream_progress_stall_seconds"] = 1
+        self.cfg["stream_stall_seconds"] = 1
+        self.cfg["stream_retries"] = 0
+        started = __import__("time").time()
+        _s, body, _ = self.post("/v1/chat/completions", {
+            "model": "fake-model", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}]}, timeout=30)
+        elapsed = __import__("time").time() - started
+        self.assertLess(elapsed, 3)                # aborted, not waited out
+        self.assertNotIn('"content": "too late"', body.decode("utf-8"))
+
     def test_upstream_502_burst_is_retried_with_backoff(self):
         """A short 502/504 burst must be absorbed, not handed to the client.
 
@@ -325,6 +376,23 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["choices"][0]["message"]["content"],
                          "echo:ping")
+
+    def test_persistent_upstream_502_is_logged_when_given_up(self):
+        """When the client finally gets a 502, the log must say so.
+
+        The per-attempt lines only show retries; the give-up path used to write
+        nothing, so a real client-facing 502 could not be diagnosed afterwards.
+        """
+        self.cfg["upstream_fault_backoff"] = 0.01
+        self.upstream.reject_with = {"fake-model": (502, "bad gateway")}
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/v1/chat/completions", {
+                "model": "fake-model", "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(ctx.exception.code, 502)
+        log = Path(self.gateway.log.path).read_text(encoding="utf-8", errors="replace")
+        self.assertIn("放弃", log)
+        self.assertIn("返回 502 给客户端", log)
 
     def test_empty_stream_retry_switches_account(self):
         """An empty stream must not be retried on the same account."""

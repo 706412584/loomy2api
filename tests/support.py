@@ -115,6 +115,11 @@ class FakeUpstream:
         self.dead_sessions_200: List[str] = []
         #: Sessions whose stream answers 200 + SSE but sends no data at all.
         self.empty_stream_sessions: List[str] = []
+        #: Session token → scripted SSE events, as
+        #: ``[("delta", {...}) | ("sleep", seconds) | ("done", None), ...]``.
+        #: Lets a test drive a reasoning-only stream that either keeps making
+        #: progress (must survive) or goes completely silent (must be killed).
+        self.scripted_streams: Dict[str, Any] = {}
         #: model-id substring → (status, message); simulates upstream hiccups
         self.reject_with: Dict[str, Any] = {}
         #: model-id substring → [status, times]: reject the *first* ``times``
@@ -136,6 +141,11 @@ class FakeUpstream:
                       "capabilities": {"reasoning": True, "function_calling": True}}],
         }
         self.quota = {"balance": 100, "dailyBalance": 50, "availableBalance": 150}
+        #: session token → the invitation codes that account can hand out, as
+        #: ``{"inviteCode", "status", "maxUses", "usedCount"}``.
+        self.invite_codes: Dict[str, Any] = {}
+        #: every ``/points/activation`` call seen, for assertions.
+        self.activations: List[Dict[str, Any]] = []
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self.port = 0
@@ -260,6 +270,9 @@ class FakeUpstream:
                     if body.get("stream"):
                         if token in fake.empty_stream_sessions:
                             return self._empty_stream()
+                        if token in fake.scripted_streams:
+                            return self._scripted_stream(model,
+                                                         fake.scripted_streams[token])
                         return self._stream(model)
                     return fake._send_json(self, {
                         "id": "chatcmpl-fake", "object": "chat.completion",
@@ -271,6 +284,29 @@ class FakeUpstream:
                         "usage": {"prompt_tokens": 3, "completion_tokens": 5,
                                   "points_consumed": 1},
                     })
+                if path.endswith("/points/first-login"):
+                    return fake._send_json(self, {
+                        "code": "000000", "desc": "成功",
+                        "data": {"dailyQuota": 5000, "dailyConsumed": 0,
+                                 "dailyBalance": 5000, "permanentBalance": 0,
+                                 "registerReward": 0, "inviteeReward": 0,
+                                 "inviterReward": 0,
+                                 "invitationCodes": fake.invite_codes.get(token, []),
+                                 "alreadyProcessed": True}})
+                if path.endswith("/points/activation"):
+                    code = str(body.get("inviteCode") or "")
+                    fake.activations.append({"token": token, "code": code})
+                    known = {c.get("inviteCode") for codes in fake.invite_codes.values()
+                             for c in codes}
+                    if code not in known:
+                        return fake._send_json(self, {
+                            "code": "100003", "desc": "邀请码无效", "data": {}})
+                    return fake._send_json(self, {
+                        "code": "000000", "desc": "成功",
+                        "data": {"activated": True, "alreadyActivated": False,
+                                 "appliedInvitationCode": code,
+                                 "inviteeReward": 5000, "inviterReward": 5000,
+                                 "permanentBalance": 5000, "dailyBalance": 5000}})
                 if path.endswith("/images/generations"):
                     return fake._send_json(self, {"data": [{"url": "http://x/img.png"}]})
                 if path.endswith("/embeddings"):
@@ -284,6 +320,36 @@ class FakeUpstream:
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.flush()
+
+            def _scripted_stream(self, model: str, script) -> None:
+                """Replay a per-event script so a test can shape the cadence.
+
+                Each item is ``("delta", {…})`` to emit a data chunk,
+                ``("sleep", seconds)`` to stall, or ``("done", None)`` to end.
+                """
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                for kind, value in script:
+                    if kind == "sleep":
+                        time.sleep(float(value))
+                        continue
+                    if kind == "done":
+                        break
+                    payload = {"id": "chatcmpl-fake", "model": model,
+                               "choices": [{"index": 0, "delta": value}]}
+                    try:
+                        self.wfile.write(
+                            f"data: {json.dumps(payload)}\n\n".encode())
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except OSError:
+                    pass
 
             def _stream(self, model: str) -> None:
                 self.send_response(200)
