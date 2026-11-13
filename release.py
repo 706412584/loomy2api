@@ -42,6 +42,9 @@ ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 
 RELEASE_REPO = "706412584/loomy2api-releases"
+#: The source repo also gets a release holding the source zip: Wanneng2API's
+#: platform updater polls this repo for a ``*.zip`` asset.
+SOURCE_REPO = "706412584/loomy2api"
 RELEASE_BRANCH = "main"
 
 GRADLE_FILE = ROOT / "android" / "app" / "build.gradle.kts"
@@ -384,6 +387,40 @@ def create_release(version: str, assets: list[Path], notes: Path) -> None:
     confirm(f"将向公开仓库 {RELEASE_REPO} 发布 {tag}，此操作对外可见，继续？")
     gh(cmd)
     info(f"发布完成：https://github.com/{RELEASE_REPO}/releases/tag/{tag}")
+    create_source_release(version, assets, notes)
+
+
+def create_source_release(version: str, assets: list[Path], notes: Path) -> None:
+    """Also publish the source zip to the *source* repo.
+
+    Wanneng2API's platform updater polls ``706412584/loomy2api`` for a
+    ``*.zip`` asset, so without this second release the platform never sees a
+    new version no matter how many APKs land in the assets repo.  Only the zip
+    and the checksums go here — the APKs stay in the public releases repo.
+    """
+    if SOURCE_REPO == RELEASE_REPO:
+        return
+    wanted = [a for a in assets
+              if a.suffix == ".zip" or a.name == "SHA256SUMS.txt"]
+    if not wanted:
+        return
+    step(f"同步源码包到 {SOURCE_REPO}（Wanneng2API 从这里检查更新）")
+    tag = f"v{version}"
+    info("资产清单：")
+    for a in wanted:
+        info(f"  {a.name}  ({a.stat().st_size / 1048576:.1f} MB)")
+    confirm(f"将向 {SOURCE_REPO} 发布 {tag}（源码包 + 校验和），继续？")
+    # The tag already exists in this repo (publish mode pushed it), so reuse it.
+    existing = gh(["release", "view", tag, "--repo", SOURCE_REPO, "--json", "tagName"],
+                  capture=True, check=False)
+    if existing.returncode == 0:
+        gh(["release", "upload", tag, "--repo", SOURCE_REPO, "--clobber",
+            *[str(a) for a in wanted]])
+    else:
+        gh(["release", "create", tag, "--repo", SOURCE_REPO, "--target", RELEASE_BRANCH,
+            "--title", tag, "--notes-file", str(notes),
+            *[str(a) for a in wanted]])
+    info(f"已同步：https://github.com/{SOURCE_REPO}/releases/tag/{tag}")
 
 
 # --------------------------------------------------------------------------- main
