@@ -202,6 +202,9 @@
       <label class="row" style="margin:0;color:var(--muted)" title="只使用每日活动额度，绝不消耗永久积分。活动额度用完后请求会失败，等待次日重置。">
         <input id="dailyOnly" type="checkbox" style="min-width:auto"> 只用活动余额
       </label>
+      <label class="row" style="margin:0;color:var(--muted)" title="被上游降级到免费档的账号不参与调度。这类账号仍能应答，但请求付费模型会被静默换成免费模型（返回 200、不计积分），输出质量下降且无从察觉。关掉可把免费档当兜底使用。">
+        <input id="excludeDowngraded" type="checkbox" style="min-width:auto"> 排除降级账号
+      </label>
       <label class="row" style="margin:0;color:var(--muted)"
              title="流式响应「毫无进展」多少秒后放弃。只要上游还在吐任何字节（含纯思考 reasoning），就重新计时——推理模型长时间思考不算卡住。改大能减少长思考被误掐（客户端会看到 upstream stream interrupted）。">
         流超时
@@ -379,11 +382,53 @@ async function api(path, opts) {
   return data;
 }
 
+/**
+ * True when the upstream has cut this account back to the free tier.
+ *
+ * The catalogue is per-account and asking for an id an account lacks is
+ * answered with HTTP 200 and a *substituted* model, so a downgraded account
+ * still looks healthy while quietly serving a free one.  Entitlement is the
+ * real signal: every paid model in the pool's union is missing.  Counting
+ * entries does not work — the upstream renames and splits its free models
+ * (measured: a downgraded account went from one `spark-x2.6` to the pair
+ * `spark-x2.6-low` + `spark-x2.6-4b`, which a "<= 1 entry" test missed).
+ *
+ * ``null`` means "never probed" and must not be read as "limited".
+ */
+const FREE_MODEL_PREFIX = 'spark-';
+
+/** True when the pool's union contains a paid model this account lacks. */
+function isDowngraded(a, allModels) {
+  if (!Array.isArray(a.models) || a.models.length === 0) return false;
+  const paidUniverse = (allModels || []).filter(
+    m => !String(m).toLowerCase().startsWith(FREE_MODEL_PREFIX));
+  if (!paidUniverse.length) return false;      // pool has no paid tier at all
+  const own = new Set(a.models);
+  return paidUniverse.some(m => !own.has(m));
+}
+
+function downgradedBadge(a) {
+  if (!Array.isArray(a.models)) return '';
+  if (a.models.length === 0) {
+    return '<span class="badge b-bad" title="上游对这个账号返回了空的模型列表，'
+      + '它现在不参与任何模型的路由">无可用模型</span>';
+  }
+  const all = ((LAST_STATE && LAST_STATE.totals && LAST_STATE.totals.model_ids) || []);
+  if (!isDowngraded(a, all)) return '';
+  return '<span class="badge b-warn" title="上游把这个账号降到了免费档：'
+    + a.models.join(', ') + '；请求其它模型会被静默换成免费模型，'
+    + '所以路由会避开它">已降级</span>';
+}
+
 function badge(a) {
   if (!a.enabled) return '<span class="badge b-off">已禁用</span>';
   if (a.banned) return '<span class="badge b-bad">已封禁</span>';
   if (a.in_cooldown) return '<span class="badge b-warn">冷却 ' + Math.round(a.cooldown_seconds_left) + 's</span>';
   if (!a.session) return '<span class="badge b-bad">无登录态</span>';
+  // An entitlement downgrade outranks the balance/session states below: the
+  // account answers fine, it just cannot serve most models any more.
+  const down = downgradedBadge(a);
+  if (down) return down;
   // a password account is permanent: expiry is handled by an automatic re-login
   if (a.permanent) {
     if (a.session_days_left !== null && a.session_days_left < 3)
@@ -434,6 +479,10 @@ function render(state) {
   if (document.activeElement !== sel) sel.value = c.strategy || 'balance';
   const dOnly = $('dailyOnly');
   if (document.activeElement !== dOnly) dOnly.checked = !!c.daily_only;
+  const exclDown = $('excludeDowngraded');
+  if (exclDown && document.activeElement !== exclDown) {
+    exclDown.checked = c.exclude_downgraded !== false;
+  }
   const stall = $('streamStall');
   if (stall && document.activeElement !== stall) {
     stall.value = c.stream_progress_stall_seconds || c.stream_stall_seconds || 600;
@@ -515,6 +564,21 @@ function openAccountModal(name) {
     + remainingText(a) + '</div></div>'
     + '<div class="card"><div class="k">设备标识</div><div class="v"><small class="mono" style="white-space:normal">'
     + (id.devid || '—') + '</small></div></div>'
+    + '<div class="card"><div class="k">可用模型</div><div class="v">'
+    + (!Array.isArray(a.models)
+        ? '<span class="muted">未探测</span>'
+        : (a.models.length === 0
+            ? '<span class="badge b-bad">0 个</span>'
+              + '<small style="display:block;color:var(--muted)">上游返回空列表，该账号不参与路由</small>'
+            : '<small class="mono" style="white-space:normal">' + a.models
+                .map(m => '<div>' + m + '</div>').join('') + '</small>'
+              + (isDowngraded(a, (LAST_STATE && LAST_STATE.totals
+                                  && LAST_STATE.totals.model_ids) || [])
+                  ? '<small style="display:block;color:var(--warn)">上游把这个账号降到了免费档'
+                    + '（缺少池内可用的付费模型），请求付费模型会被静默换成免费模型，'
+                    + '所以路由会避开该账号</small>'
+                  : '')))
+    + '</div></div>'
     + '<div class="card"><div class="k">激活状态</div><div class="v">'
     + (a.activated === true ? '<span class="badge b-ok">已激活</span>'
        : a.activated === false ? '<span class="badge b-warn">未激活</span>'
@@ -553,6 +617,24 @@ function openAccountModal(name) {
     + '<button onclick="modalAct(\'toggle\')">' + (a.enabled ? '禁用' : '启用') + '</button>'
     + '<button class="danger" onclick="modalAct(\'remove\')">删除</button>'
     + '</div>'
+    // Password repair needs a working session (改密走 /userinfo/update/pwd),
+    // so once the session is gone an SMS code is the only way back in.  The
+    // add-form's SMS tab refuses an existing name, hence this inline form.
+    + (!a.session
+        ? '<div style="margin-top:10px;padding:10px;border:1px solid var(--line);'
+          + 'border-radius:8px">'
+          + '<div style="font-weight:600;margin-bottom:6px">'
+          + '用验证码重新登录（session 已失效）</div>'
+          + '<div class="row" style="gap:6px;flex-wrap:wrap">'
+          + '<input id="rs-phone" placeholder="手机号" style="flex:1;min-width:140px" value="'
+          + String(a.loginid || '').replace(/[&<>"']/g,
+              c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;',
+                     '"': '&quot;', "'": '&#39;'}[c])) + '">'
+          + '<input id="rs-code" placeholder="验证码" style="flex:1;min-width:100px">'
+          + '<button id="rs-send">获取验证码</button>'
+          + '<button class="primary" id="rs-login">登录</button>'
+          + '</div></div>'
+        : '')
     + '<div id="modalMsg" class="hint"></div>';
   $('modalMask').classList.add('open');
   // this account also becomes the points-section target
@@ -560,6 +642,52 @@ function openAccountModal(name) {
   if ([...sel.options].some(op => op.value === name)) {
     sel.value = name; POINTS_ACC = name; localStorage.setItem('loomy2api_points_acc', name);
   }
+  bindReloginSms(name);
+}
+
+/** Inline SMS re-login for an account whose session is gone. */
+function bindReloginSms(name) {
+  const send = $('rs-send'), login = $('rs-login');
+  if (!send || !login) return;
+  let msgid = '';
+  send.onclick = async () => {
+    const phone = $('rs-phone').value.trim();
+    if (!phone) { modalMsg('请填手机号', true); return; }
+    send.disabled = true;
+    try {
+      const res = await api('/api/panel/accounts/sms', {
+        method: 'POST', body: JSON.stringify({loginid: phone})});
+      msgid = res.msgid || '';
+      modalMsg('验证码已下发到 ' + phone, false);
+    } catch (e) {
+      modalMsg('下发失败：' + e.message, true);
+    } finally {
+      send.disabled = false;
+    }
+  };
+  login.onclick = async () => {
+    const phone = $('rs-phone').value.trim();
+    const code = $('rs-code').value.trim();
+    if (!phone || !code) { modalMsg('请填手机号和验证码', true); return; }
+    if (!msgid) { modalMsg('请先点「获取验证码」', true); return; }
+    login.disabled = true;
+    try {
+      // ``name`` is the existing account: the backend reuses it instead of
+      // rejecting the number as "account already exists".
+      const res = await api('/api/panel/accounts/sms-login', {
+        method: 'POST',
+        body: JSON.stringify({name, loginid: phone, code, msgid})});
+      msgid = '';
+      modalMsg('登录成功，session 已更新', false);
+      toast(name + ' 验证码登录成功', 'ok');
+      if (res.state) { LAST_STATE = res.state; render(res.state); }
+      closeAccountModal();
+    } catch (e) {
+      modalMsg('登录失败：' + e.message, true);
+    } finally {
+      login.disabled = false;
+    }
+  };
 }
 
 function closeAccountModal() { $('modalMask').classList.remove('open'); }
@@ -617,7 +745,12 @@ function copyText(text) {
   ta.remove();
 }
 
-function modalMsg(text) { const el = $('modalMsg'); if (el) el.textContent = text; }
+function modalMsg(text, isError) {
+  const el = $('modalMsg');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = isError ? 'var(--bad)' : '';
+}
 
 async function modalAct(kind) {
   const name = MODAL_ACC;
@@ -696,8 +829,16 @@ async function modalAct(kind) {
       };
       const [path, body] = map[kind];
       const res = await api(path, {method: 'POST', body: JSON.stringify(body)});
-      if (kind === 'identity') modalMsg('已换新设备标识：' + res.identity.devid);
-      else modalMsg(name + ' 操作完成');
+      // renew returns {ok:false, error} when the re-login was rejected.  Saying
+      // "操作完成" regardless made a failed renewal look like a no-op that
+      // worked — the password stayed dead and expiry kept closing in.
+      if (res.ok === false) {
+        modalMsg(res.error || '操作失败', true);
+      } else if (kind === 'identity') {
+        modalMsg('已换新设备标识：' + res.identity.devid);
+      } else {
+        modalMsg(name + ' 操作完成');
+      }
       if (res.state) { LAST_STATE = res.state; render(res.state); }
     }
   } catch (e) {
@@ -1615,6 +1756,26 @@ $('dailyOnly').onchange = async () => {
     });
     toast(value ? '已开启「只用活动余额」：额度用尽时会失败，不再消耗永久积分'
                 : '已关闭「只用活动余额」', 'ok');
+    load(true);
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+    load(true);
+  } finally {
+    box.disabled = false;
+  }
+};
+
+/** Skip accounts the upstream cut back to its free tier. */
+$('excludeDowngraded').onchange = async () => {
+  const box = $('excludeDowngraded');
+  const value = box.checked;
+  box.disabled = true;
+  try {
+    await api('/api/panel/config', {
+      method: 'POST', body: JSON.stringify({exclude_downgraded: value})
+    });
+    toast(value ? '已开启：降级账号不再参与调度'
+                : '已关闭：降级账号可作免费兜底参与调度', 'ok');
     load(true);
   } catch (e) {
     toast('保存失败：' + e.message, 'err');

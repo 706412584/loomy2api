@@ -1341,7 +1341,8 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
 
             items(accounts, key = { it.name }) { acc ->
                 AccountCard(acc, onClick = { selected = acc },
-                    onRefreshQuota = { vm.refreshQuota() })
+                    onRefreshQuota = { vm.refreshQuota() },
+                    modelIds = ui.state?.totals?.modelIds.orEmpty())
             }
         }
 
@@ -1531,7 +1532,8 @@ private fun SmsRegisterDialog(
 
 @Composable
 private fun AccountCard(acc: AccountView, onClick: () -> Unit,
-                        onRefreshQuota: () -> Unit) {
+                        onRefreshQuota: () -> Unit,
+                        modelIds: List<String> = emptyList()) {
     Card(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
         shape = RoundedCornerShape(14.dp),
@@ -1548,7 +1550,7 @@ private fun AccountCard(acc: AccountView, onClick: () -> Unit,
                 Spacer(Modifier.width(9.dp))
                 Text(acc.name, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.weight(1f))
-                StatusChip(acc)
+                StatusChip(acc, modelIds)
             }
             Spacer(Modifier.height(10.dp))
             Text(
@@ -1578,20 +1580,26 @@ private fun AccountCard(acc: AccountView, onClick: () -> Unit,
 }
 
 @Composable
-private fun StatusChip(acc: AccountView) {
-    val (bg, fg) = when {
-        !acc.enabled -> Line to Muted
-        acc.banned -> RedSoft to Red
-        acc.inCooldown -> AmberSoft to Amber
-        !acc.hasSession -> RedSoft to Red
+private fun StatusChip(acc: AccountView, modelIds: List<String> = emptyList()) {
+    // An entitlement downgrade outranks the balance/session states below: the
+    // account answers fine, it just cannot serve most models any more, and the
+    // upstream substitutes a free model instead of returning an error.
+    val (bg, fg, label) = when {
+        !acc.enabled -> Triple(Line, Muted, acc.statusLabel)
+        acc.banned -> Triple(RedSoft, Red, acc.statusLabel)
+        acc.inCooldown -> Triple(AmberSoft, Amber, acc.statusLabel)
+        !acc.hasSession -> Triple(RedSoft, Red, acc.statusLabel)
+        acc.hasNoModels -> Triple(RedSoft, Red, "无可用模型")
+        acc.isDowngraded(modelIds) -> Triple(AmberSoft, Amber, "已降级")
         // a password account renews itself — an imminent expiry is not a risk
-        acc.permanent -> GreenSoft to Green
-        acc.sessionDaysLeft != null && acc.sessionDaysLeft < 3 -> AmberSoft to Amber
-        else -> GreenSoft to Green
+        acc.permanent -> Triple(GreenSoft, Green, acc.statusLabel)
+        acc.sessionDaysLeft != null && acc.sessionDaysLeft < 3 ->
+            Triple(AmberSoft, Amber, acc.statusLabel)
+        else -> Triple(GreenSoft, Green, acc.statusLabel)
     }
     Box(
         Modifier.background(bg, RoundedCornerShape(20.dp)).padding(horizontal = 10.dp, vertical = 4.dp)
-    ) { Text(acc.statusLabel, color = fg, fontSize = 12.sp) }
+    ) { Text(label, color = fg, fontSize = 12.sp) }
 }
 
 @Composable
@@ -1749,6 +1757,32 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                         + fmtShortTime(acc.obtainedAt) + " · "
                         + (acc.ledgerTotal?.let { "$it 条" } ?: "?"),
                         Modifier.weight(1f))
+                }
+                // The upstream scopes models per account and silently swaps in
+                // a free one for anything the account lacks, so this list is
+                // the only way to tell what an account can really serve.
+                Spacer(Modifier.height(8.dp))
+                val uiState by vm.ui.collectAsState()
+                val allIds = uiState.state?.totals?.modelIds.orEmpty()
+                Column {
+                    Text(
+                        when {
+                            acc.models == null -> "可用模型：未探测"
+                            acc.hasNoModels -> "可用模型：0 个（不参与路由）"
+                            acc.isDowngraded(allIds) ->
+                                "可用模型：${acc.models!!.size} 个 · 已降级"
+                            else -> "可用模型：${acc.models!!.size} 个"
+                        },
+                        color = if (acc.hasNoModels || acc.isDowngraded(allIds)) Amber else Muted,
+                        fontSize = 12.sp, fontWeight = FontWeight.Medium,
+                    )
+                    acc.models?.forEach { id ->
+                        Text("· $id", color = Muted, fontSize = 11.sp)
+                    }
+                    if (acc.isDowngraded(allIds)) {
+                        Text("请求其它模型会被上游静默换成免费模型，路由会避开该账号",
+                            color = Amber, fontSize = 11.sp)
+                    }
                 }
                 Spacer(Modifier.height(14.dp))
 

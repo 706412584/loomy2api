@@ -144,14 +144,25 @@ class ModelGateway:
     # -- read-only ------------------------------------------------------
 
     def models(self, session: str) -> Dict[str, Any]:
+        # A catalogue read is small and cheap, and the probe fans out across the
+        # whole pool from the keeper thread.  Inheriting ``timeout`` (1200s by
+        # default for chat) meant a hung upstream could stall the keeper for
+        # hours — and with it every session renewal and quota refresh.
         status, _h, data = http_request(
             self._url("models"), method="GET", headers=self._headers(session),
-            timeout=float(self.cfg.get("timeout") or 60),
+            timeout=float(self.cfg.get("models_timeout") or 45),
             proxy=str(self.cfg.get("proxy") or ""))
         if status != 200:
             raise UpstreamError(f"/models HTTP {status}: "
                                 f"{data[:200].decode('utf-8', 'replace')}", status)
-        return json.loads(data.decode("utf-8"))
+        payload = json.loads(data.decode("utf-8"))
+        # A dead session answers 200 with ``{"code":"100002","desc":"登录已失效",
+        # "data":{}}`` and no ``data`` list.  Without this check the probe read
+        # that as a *successful* empty catalogue, removed the account from every
+        # routed model and never re-logged it in.  _check_payload promotes the
+        # expiry marker to 401, which is what the caller rotates on.
+        _check_payload(status, payload, data, "/models")
+        return payload
 
     def points_records(self, session: str, page_size: int = 20) -> Dict[str, Any]:
         url = self._url(f"points/records?record_type=all&page_no=1&page_size={page_size}")

@@ -103,6 +103,42 @@ class TestPanelState(PanelHarness, unittest.TestCase):
         self.assertEqual(account["mode"], "password")
         self.assertNotIn('"password":', json.dumps(payload))
 
+    def test_state_exposes_the_model_universe(self):
+        """The panel spots a downgraded account by diffing its catalogue
+        against the pool's, so the union has to be in the payload.
+
+        A per-account ``models`` list alone cannot tell "this account lost the
+        paid models" from "the pool never had them".
+        """
+        _s, payload = self.get_json("/api/panel/state")
+        self.assertIsInstance(payload["totals"]["model_ids"], list)
+        self.assertIn("fake-model", payload["totals"]["model_ids"])
+        self.assertIsInstance(payload["accounts"][0]["models"], (list, type(None)))
+
+    def test_model_universe_is_empty_until_the_upstream_confirms_it(self):
+        """Before the first probe the catalogue is a built-in guess.
+
+        Exposing those ids made the panel diff every account against models the
+        upstream does not even have, so a freshly restarted gateway showed the
+        whole pool as downgraded until the probe finished.
+        """
+        # The fixture gateway has already probed; build a fresh one to observe the
+        # window between "listening" and "first probe finished".
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            write_accounts(d / "accounts.json", [
+                {"name": "a", "session": "s1",
+                 "expireAt": int(time.time()) + 14 * 86400}])
+            fresh = Gateway(make_config(d, self.base))
+            fresh.pool.client = FakeAccountClient()
+            fresh.pool.bootstrap()
+            self.assertFalse(fresh.models_confirmed)
+            self.assertEqual(fresh.panel.state(wait=False)["totals"]["model_ids"], [])
+            fresh.refresh_models()
+            self.assertTrue(fresh.models_confirmed)
+            self.assertIn("fake-model",
+                          fresh.panel.state(wait=False)["totals"]["model_ids"])
+
     def test_state_reports_identity(self):
         _s, payload = self.get_json("/api/panel/state")
         identity = payload["accounts"][0]["identity"]

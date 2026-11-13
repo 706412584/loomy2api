@@ -69,6 +69,19 @@ class _Harness:
         body = response.read()
         return response.status, body, response
 
+    def post_status(self, path, payload, *, timeout=30):
+        """Like :meth:`post` but tolerates an error status instead of raising."""
+        request = urllib.request.Request(
+            self.base + path,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout)
+            return response.status, response.read(), response
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read(), exc
+
     def get(self, path, headers=None):
         request = urllib.request.Request(self.base + path, headers=headers or {})
         response = urllib.request.urlopen(request, timeout=30)
@@ -125,6 +138,94 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         _s, body, _ = self.post("/v1/chat/completions", {
             "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "x"}]})
         self.assertEqual(json.loads(body)["model"], "gpt-4o-mini")
+
+    def test_chat_routes_to_an_account_entitled_to_the_model(self):
+        """A limited account must not be picked for a model it cannot serve.
+
+        The upstream answers HTTP 200 with a substituted model instead of an
+        error, so the *only* way to keep output correct is to route around it.
+        """
+        limited, full = self.gateway.pool.get("a"), self.gateway.pool.get("b")
+        limited.models = ("fake-model",)
+        full.models = ("fake-model", "GLM-5.3-Flash")
+        limited.available, full.available = 900, 10   # balance would pick `a`
+        status, body, _ = self.post("/v1/chat/completions", {
+            "model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 200)
+        # The fake upstream echoes whatever id it was given.
+        self.assertEqual(json.loads(body)["model"], "GLM-5.3-Flash")
+        chat = [c for c in self.upstream.calls
+                if c["path"].endswith("/chat/completions")]
+        self.assertEqual(chat[-1]["token"], "s2")    # went to `full`, not `a`
+
+    def test_no_entitled_account_answers_400_with_the_reason(self):
+        """When every account lost the entitlement the caller must be told.
+
+        Regression: the pool raised ``PoolError`` before any upstream call, the
+        chat loop swallowed it and answered a bare 502 with an empty message —
+        so the real reason ("no account has GLM-5.3-Flash") never surfaced.
+        """
+        self.gateway.pool._seen_models.update({"GLM-5.3-Flash", "fake-model"})
+        for acc in self.gateway.pool.accounts:
+            acc.models = ("fake-model",)
+        self.upstream.calls.clear()
+        status, body, _ = self.post_status("/v1/chat/completions", {
+            "model": "GLM-5.3-Flash", "messages": [{"role": "user", "content": "x"}]})
+        payload = json.loads(body)
+        self.assertEqual(status, 400)
+        self.assertIn("GLM-5.3-Flash", json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(payload["error"]["type"], "account_pool_error")
+        self.assertFalse([c for c in self.upstream.calls
+                          if c["path"].endswith("/chat/completions")])
+
+    def test_stream_no_entitled_account_answers_400(self):
+        """The SSE path must fail the same way, not fall back to a 502."""
+        self.gateway.pool._seen_models.update({"GLM-5.3-Flash", "fake-model"})
+        for acc in self.gateway.pool.accounts:
+            acc.models = ("fake-model",)
+        status, body, _ = self.post_status("/v1/chat/completions", {
+            "model": "GLM-5.3-Flash", "stream": True,
+            "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 400)
+        self.assertIn("GLM-5.3-Flash", body.decode("utf-8"))
+
+    def test_messages_no_entitled_account_answers_400(self):
+        self.gateway.pool._seen_models.update({"GLM-5.3-Flash", "fake-model"})
+        for acc in self.gateway.pool.accounts:
+            acc.models = ("fake-model",)
+        status, body, _ = self.post_status("/v1/messages", {
+            "model": "GLM-5.3-Flash", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(status, 400)
+        self.assertIn("GLM-5.3-Flash", body.decode("utf-8"))
+
+    def test_probe_keeps_the_session_on_a_200_login_expired(self):
+        """End-to-end: the upstream's real dead-session shape for /models.
+
+        It answers HTTP 200 with ``code 100002`` and no ``data``.  Reading that
+        as a successful empty catalogue wiped the session and took the account
+        out of routing forever; the probe must instead record a failure, keep
+        both the catalogue and the session, and bench the account briefly.
+        """
+        acc = self.gateway.pool.get("a")
+        acc.models = ("fake-model",)
+        acc.session, acc.expire_at = "s1", int(__import__("time").time()) + 9 * 86400
+        self.upstream.models_session_invalid = ["s1"]
+
+        result = self.gateway.pool.probe_models()
+        self.assertEqual(len(result["failed"]), 1)
+        self.assertEqual(acc.models, ("fake-model",))   # catalogue kept
+        self.assertEqual(acc.session, "s1")             # session kept
+        self.assertTrue(acc.in_cooldown)                # benched, not destroyed
+        self.assertFalse(acc.login_blocked_until > 0)   # no login attempted
+
+    def test_substituted_model_is_reported_and_dropped(self):
+        """If the upstream answers with another id, stop routing that model
+        to the account — the response itself is the only signal we get."""
+        acc = self.gateway.pool.get("a")
+        acc.models = ("fake-model", "GLM-5.3-Flash")
+        self.gateway.note_model_substitution(acc, "GLM-5.3-Flash", "fake-model")
+        self.assertEqual(acc.models, ("fake-model",))
 
     def test_missing_model_falls_back_to_default(self):
         _s, body, _ = self.post("/v1/chat/completions", {

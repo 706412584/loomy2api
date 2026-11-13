@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from . import constants as C
+from .model_events import is_free
 from . import anthropic as anth
 from .panel import Panel
 from .pool import AccountPool, PoolError
@@ -104,6 +105,11 @@ class Gateway:
         self.panel = Panel(self)
         self.models: list = []
         self._models_lock = threading.Lock()
+        #: True once ``self.models`` holds a real upstream union.  Until then
+        #: ``catalogue()`` answers the built-in FALLBACK list, which is a
+        #: *guess* — the panel must not diff accounts against it, or every
+        #: account looks downgraded on the first page load after a restart.
+        self._models_confirmed = False
         # Rolling call records for the mobile "记录" tab.  Kept in memory: the
         # gateway is a long-lived process and this is diagnostics, not an audit
         # log — the file log remains the durable record.
@@ -171,13 +177,33 @@ class Gateway:
     # -- model catalogue -------------------------------------------------
 
     def refresh_models(self) -> list:
+        """Union every account's catalogue into the advertised model list.
+
+        The upstream scopes ``/models`` **per account**: an account without an
+        entitlement simply does not see that id, and asking for it anyway gets
+        HTTP 200 with a *substituted* default model.  Probing a single account
+        (as this used to) therefore advertised whatever that one account had —
+        in practice one account that had been downgraded to a free model hid
+        every paid model the rest of the pool could still serve.
+
+        Side effect: each account's own ids are recorded on ``Account.models``,
+        which is what routing filters on (``Pool.serves_model``).
+        """
         try:
-            acc = self.pool.acquire()
-            payload = self.models_client.models(acc.session)
-            data = payload.get("data") or []
+            result = self.pool.probe_models()
+            # Startup also counts as a probe: without this the keeper would
+            # fan out over the whole pool again minutes later.
+            self.pool._last_model_probe = time.time()
+            union = result["models"]
+            data = sorted(union.values(), key=lambda m: str(m.get("id") or ""))
             with self._models_lock:
-                self.models = data
-            self.log(f"上游模型列表已刷新：{len(data)} 个")
+                if data:
+                    self.models = data
+                    self._models_confirmed = True
+            counts = self.pool.model_stats()
+            self.log(f"上游模型列表已刷新：{len(data)} 个"
+                     f"（探测 {result['probed']}/{result['probed'] + len(result['failed'])} 个账号，"
+                     f"权限分布 {counts}）")
         except Exception as exc:                        # noqa: BLE001
             with self._models_lock:
                 have = bool(self.models)
@@ -187,12 +213,48 @@ class Gateway:
                 self.log(f"[warn] 拉取模型列表失败，使用内置清单：{exc}")
         return self.models
 
+    @property
+    def models_confirmed(self) -> bool:
+        """True once the advertised catalogue came from the upstream."""
+        with self._models_lock:
+            return self._models_confirmed
+
     def catalogue(self) -> list:
         with self._models_lock:
             if not self.models:
                 self.models = [dict(m, object="model", owned_by="loomy")
                                for m in C.FALLBACK_MODELS]
             return list(self.models)
+
+    def note_model_substitution(self, acc, requested: str, served: str) -> None:
+        """Handle the upstream answering a different model than was asked.
+
+        Its ``/models`` list is per account and it *substitutes* the default
+        (HTTP 200, no error) when the account lacks the requested id.  Treat
+        that as proof this account's cached catalogue is stale: drop the id so
+        routing stops sending it here, and leave a log line — otherwise the
+        degradation is invisible from the outside.
+        """
+        served = str(served or "")
+        if not served or not requested or served == requested:
+            return
+        if is_free(requested):
+            # The free tier is renamed/split constantly (``spark-x2.6`` →
+            # ``spark-x2.6-low``).  Recording those as downgrades would fill
+            # the history with noise and bury the real signal.
+            return
+        with acc.models_lock:
+            if acc.models is None or requested not in acc.models:
+                return
+            new = tuple(m for m in acc.models if m != requested)
+            # This is the strongest evidence available: a real request came
+            # back with a different model.  Record it as a downgrade so the
+            # history shows the actual moment the entitlement was lost, not
+            # just whatever a later /models probe happens to report.
+            self.pool.model_events.record(acc.name, "downgrade", acc.models, new)
+            acc.models = new
+            self.log(f"[warn] {acc.name} 请求 {requested} 但上游返回 {served}"
+                     f"（静默降级；已从该账号的模型清单移除 {requested}）")
 
     def resolve_model(self, requested: str) -> str:
         """Model ids are used **verbatim** — there is no alias table.
@@ -664,6 +726,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/refresh": lambda _p: panel.refresh(_p),
             "/api/panel/config": panel.update_config,
             "/api/panel/export": lambda _p: panel.export_accounts(),
+            "/api/panel/model-events": panel.model_events,
         }
         handler = handlers.get(path)
         if handler is None:
@@ -734,9 +797,9 @@ class Handler(BaseHTTPRequestHandler):
     def _passthrough(self, suffix: str) -> None:
         gw = self.gateway
         raw = self._read_body()
-        acc = gw.pool.acquire()
-        status, headers, data = gw.models_client.call(
-            acc.session, suffix, json.loads(raw.decode("utf-8")) if raw else {})
+        body = json.loads(raw.decode("utf-8")) if raw else {}
+        acc = gw.pool.acquire(model=str(body.get("model") or ""))
+        status, headers, data = gw.models_client.call(acc.session, suffix, body)
         if status == 200:
             # a dead session answers 200 with a JSON envelope on these
             # endpoints too — surface it as the error it is
@@ -789,11 +852,17 @@ class Handler(BaseHTTPRequestHandler):
 
         tried: list = []
         last: Tuple[int, bytes] = (0, b"")
+        pool_error = ""
         for attempt in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
-                acc = gw.pool.acquire(exclude=tried)
+                acc = gw.pool.acquire(exclude=tried, model=model)
             except PoolError as exc:
                 gw.log(f"[warn] {exc}")
+                # Only a refusal *before any upstream call* is a verdict on
+                # the model; after that, the accounts were simply exhausted
+                # and the real upstream status must survive.
+                if not tried:
+                    pool_error = str(exc)
                 break
             tried.append(acc.name)
             started = time.time()
@@ -824,6 +893,7 @@ class Handler(BaseHTTPRequestHandler):
                 usage = (obj or {}).get("usage") or {}
                 gw.pool.report_success(acc, usage)
                 elapsed = time.time() - started
+                gw.note_model_substitution(acc, model, (obj or {}).get("model"))
                 gw.record_call(account=acc.name, loginid=acc.loginid, model=model,
                                status=200, seconds=elapsed, usage=usage,
                                kind="chat", stream=False)
@@ -861,6 +931,12 @@ class Handler(BaseHTTPRequestHandler):
                        f"（不冷却该账号）")
             if status in self.FATAL_REQUEST:            # not an account problem
                 break
+        if not last[0] and pool_error:
+            # Nothing was ever sent upstream: the pool refused before any call.
+            # That is a request-level verdict (no account is entitled to this
+            # model), not an upstream failure — 502 with an empty message told
+            # the caller nothing.
+            return self._error(400, pool_error, "account_pool_error")
         status, data = last
         if status >= 400:
             self._log_giveup("call", model, status,
@@ -874,6 +950,7 @@ class Handler(BaseHTTPRequestHandler):
     def _open_stream(self, req: Dict[str, Any], extra: Optional[Dict[str, str]],
                      *, log_tag: str,
                      exclude: Tuple[str, ...] = (),
+                     pool_error: Optional[list] = None,
                      ) -> Tuple[Optional[Any], Optional[Any], Optional[Any]]:
         """Acquire an account and open a 200 stream, retrying other accounts.
 
@@ -884,6 +961,10 @@ class Handler(BaseHTTPRequestHandler):
 
         Returns ``(acc, conn, resp)``; ``acc`` is ``None`` when every attempt
         failed (``resp`` then carries the last error response, if any).
+
+        ``pool_error`` is an optional one-element list the caller passes in to
+        receive the reason the pool refused — without it, "no account is
+        entitled to this model" reached the client as an empty 502.
         """
         gw = self.gateway
         model = req.get("model")
@@ -892,9 +973,15 @@ class Handler(BaseHTTPRequestHandler):
 
         for attempt in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
-                acc = gw.pool.acquire(exclude=tried)
+                acc = gw.pool.acquire(exclude=tried, model=model)
             except PoolError as exc:
                 gw.log(f"[warn] {exc}")
+                # Only the *first* attempt says anything about the model: once
+                # an upstream call has been attempted and failed, the accounts
+                # are merely exhausted, and "no account is entitled to it"
+                # would misattribute an upstream outage to the pool.
+                if pool_error is not None and not tried:
+                    pool_error.append(str(exc))
                 return None, None, resp
             tried.append(acc.name)
             conn, resp = gw.models_client.stream(acc.session, "chat/completions",
@@ -983,8 +1070,10 @@ class Handler(BaseHTTPRequestHandler):
                 body["enable_thinking"] = False
                 body["chat_template_kwargs"] = {"enable_thinking": False}
 
+            pool_error: list = []
             acc, conn, resp = self._open_stream(
-                body, extra, log_tag="call", exclude=tuple(failed_accounts))
+                body, extra, log_tag="call", exclude=tuple(failed_accounts),
+                pool_error=pool_error)
             if acc is None:
                 if attempt > 0:
                     # SSE headers already went out on the first attempt; a
@@ -993,6 +1082,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._terminate_sse("所有账号都失败了 / all accounts failed")
                     return
                 if resp is None:
+                    if pool_error:
+                        # The pool refused before anything was sent: tell the
+                        # caller which model it cannot serve, not a bare 502.
+                        self._log_giveup("call", model, 400, attempts, pool_error[0])
+                        return self._error(400, pool_error[0], "account_pool_error")
                     self._log_giveup("call", model, 502, attempts)
                     return self._error(502, "所有账号都失败了 / all accounts failed",
                                        "upstream_error")
@@ -1220,11 +1314,17 @@ class Handler(BaseHTTPRequestHandler):
 
         tried: list = []
         last: Tuple[int, bytes] = (0, b"")
+        pool_error = ""
         for attempt in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
-                acc = gw.pool.acquire(exclude=tried)
+                acc = gw.pool.acquire(exclude=tried, model=model)
             except PoolError as exc:
                 gw.log(f"[warn] {exc}")
+                # Only a refusal *before any upstream call* is a verdict on
+                # the model; after that, the accounts were simply exhausted
+                # and the real upstream status must survive.
+                if not tried:
+                    pool_error = str(exc)
                 break
             tried.append(acc.name)
             started = time.time()
@@ -1247,6 +1347,7 @@ class Handler(BaseHTTPRequestHandler):
                             acc, fault, data[:200].decode("utf-8", "replace"))
                     continue
                 obj = json.loads(data.decode("utf-8"))
+                gw.note_model_substitution(acc, model, obj.get("model"))
                 usage = obj.get("usage") or {}
                 gw.pool.report_success(acc, usage)
                 elapsed = time.time() - started
@@ -1281,6 +1382,8 @@ class Handler(BaseHTTPRequestHandler):
                        f" → 上游异常，换账号重试（不冷却该账号）")
             if status in self.FATAL_REQUEST:
                 break
+        if not last[0] and pool_error:
+            return self._error(400, pool_error, "account_pool_error")
         status, data = last
         if status >= 400:
             self._log_giveup("messages", model, status,
@@ -1312,8 +1415,10 @@ class Handler(BaseHTTPRequestHandler):
                 body["enable_thinking"] = False
                 body["chat_template_kwargs"] = {"enable_thinking": False}
 
+            pool_error: list = []
             acc, conn, resp = self._open_stream(
-                body, None, log_tag="messages", exclude=tuple(failed_accounts))
+                body, None, log_tag="messages", exclude=tuple(failed_accounts),
+                pool_error=pool_error)
             if acc is None:
                 if attempt > 0:
                     # the SSE response is already open; a JSON error appended
@@ -1325,6 +1430,12 @@ class Handler(BaseHTTPRequestHandler):
                     self._terminate_anthropic("all accounts failed")
                     return
                 if resp is None:
+                    if pool_error:
+                        self._log_giveup("messages-stream", model, 400, attempts,
+                                         pool_error[0])
+                        return self._json(400, {"type": "error", "error": {
+                            "type": "account_pool_error",
+                            "message": pool_error[0]}})
                     self._log_giveup("messages-stream", model, 502, attempts)
                     return self._json(502, {"type": "error", "error": {
                         "type": "api_error", "message": "all accounts failed"}})

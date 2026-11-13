@@ -358,6 +358,101 @@ class TestSessionLifecycle(unittest.TestCase):
         self.assertFalse(acc.password_verified_at)
         self.assertTrue(acc.login_blocked_until > time.time())
 
+    def test_forced_renew_reports_a_rejected_password(self):
+        """Panel "续期重登" must fail loudly when nothing was renewed.
+
+        With ``auto_repair_password`` off and the stored password already
+        rejected, a forced renewal could not fix anything — yet it returned the
+        still-valid session, so the panel said "操作完成" and the user never
+        learned the password was dead.
+        """
+        from tests.support import write_accounts
+        from loomy2api.account import AccountError
+
+        self.cfg["auto_repair_password"] = False
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "passwordSetAt": int(time.time()) - 25 * 86400,
+             "session": "good", "expireAt": int(time.time()) + 2.7 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+
+        class FakeClient:
+            def fill(self, account):
+                raise AccountError("/login/account/byPwd failed: 密码错误",
+                                   code="220204")
+
+        pool.client = FakeClient()
+        with self.assertRaises(PoolError) as ctx:
+            pool.ensure_session(pool.get("a"), force=True)
+        message = str(ctx.exception)
+        self.assertIn("续期失败", message)
+        self.assertIn("重设密码", message)          # actionable next step
+        self.assertIn("auto_repair_password", message)
+
+    def test_failed_relogin_keeps_the_previous_session_record(self):
+        """Clearing the session before trying the re-login lost it forever.
+
+        A rejected quota read whose re-login also fails left the account with
+        neither a session nor a usable password, and no record of the session
+        it had used — making it impossible to tell when it actually died.
+        """
+        from tests.support import write_accounts
+        from loomy2api.account import AccountError
+        from loomy2api.upstream import UpstreamError
+
+        self.cfg["auto_repair_password"] = False
+        self.cfg["quota_auth_faults_before_relogin"] = 1
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "session": "old-session", "expireAt": int(time.time()) + 9 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+
+        class FakeGateway:
+            def quota(self, session):
+                raise UpstreamError("登录已失效", 401)
+
+        class FakeClient:
+            def fill(self, account):
+                raise AccountError("/login/account/byPwd failed: 密码错误",
+                                   code="220204")
+
+        pool.gateway = FakeGateway()
+        pool.client = FakeClient()
+        acc = pool.get("a")
+        before_expiry = acc.expire_at
+        pool.refresh_quota(acc)
+        self.assertEqual(acc.session, "old-session")   # not erased
+        self.assertEqual(acc.expire_at, before_expiry)  # untouched
+        self.assertIn("relogin", acc.last_error)       # reason recorded
+
+    def test_implicit_renew_stays_quiet_on_a_rejected_password(self):
+        """Routing/keeper renewal keeps the working session — no exception.
+
+        Only an explicit panel/CLI renewal may fail; a background refresh must
+        not take a request down while the session it holds still works.
+        """
+        from tests.support import write_accounts
+        from loomy2api.account import AccountError
+
+        self.cfg["auto_repair_password"] = False
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "passwordSetAt": int(time.time()) - 25 * 86400,
+             "session": "good", "expireAt": int(time.time()) + 2.9 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+
+        class FakeClient:
+            def fill(self, account):
+                raise AccountError("/login/account/byPwd failed: 密码错误",
+                                   code="220204")
+
+        pool.client = FakeClient()
+        acc = pool.ensure_session(pool.get("a"))    # implicit, must not raise
+        self.assertEqual(acc.session, "good")
+
     def test_login_block_stops_retrying_and_expires(self):
         """A rejected password is not retried inside the lockout window."""
         from tests.support import write_accounts
@@ -598,6 +693,9 @@ class TestSessionLifecycle(unittest.TestCase):
         self.assertTrue(acc.password)
         self.assertFalse(acc.permanent)
         self.assertFalse(acc.password_verified_at)
+        # and no "已设置密码" stamp either: leaving it made the panel promise
+        # automatic renewal for a credential the upstream already rejected
+        self.assertEqual(acc.password_set_at, 0)
 
     def test_unverified_password_is_checked_before_rotation(self):
         """A stored but unproven password is tested, not overwritten."""
@@ -893,12 +991,12 @@ class TestSessionLifecycle(unittest.TestCase):
         finally:
             upstream.stop()
 
-    def test_tick_clears_session_after_repeated_401(self):
-        """A session-less account drops out only after a *run* of 401s, not one.
+    def test_tick_keeps_the_session_record_when_it_cannot_relogin(self):
+        """Without a password there is no way back, so do not erase the session.
 
-        The credentials are missing here, so there is no re-login to fall back
-        on — but the same "don't trust a single blip" rule applies: the first
-        tick records a fault, the second confirms it and clears the session.
+        Clearing it achieved nothing — routing already treats a rejected
+        session as unusable — and it destroyed the only evidence that the
+        account ever worked, leaving an operator with no idea when it died.
         """
         from loomy2api.upstream import UpstreamError
         from tests.support import write_accounts
@@ -916,7 +1014,466 @@ class TestSessionLifecycle(unittest.TestCase):
         pool.tick()
         self.assertTrue(pool.get("a").session_valid)   # one blip, kept
         pool.tick()
-        self.assertFalse(pool.get("a").session_valid)  # confirmed, dropped
+        acc = pool.get("a")
+        self.assertEqual(acc.session, "s")             # record preserved
+        self.assertIn("无法自动重登", acc.last_error)
+        self.assertNotEqual(acc.last_error, "")
+
+
+class TestModelEntitlements(unittest.TestCase):
+    """The upstream scopes /models per account and silently substitutes a
+    default for ids an account lacks.  Routing must therefore only pick
+    accounts whose own catalogue lists the requested model."""
+
+    FUTURE = int(time.time()) + 14 * 86400
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.cfg = make_config(self.dir, "http://127.0.0.1:1/api/v1")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _pool(self, accounts):
+        (self.dir / "accounts.json").write_text(
+            json.dumps({"accounts": accounts}), encoding="utf-8")
+        return AccountPool(self.cfg)
+
+    def test_unknown_catalogue_allows_any_model(self):
+        """An account whose list was never fetched must stay routable."""
+        pool = self._pool([{"name": "a", "session": "s", "expireAt": self.FUTURE}])
+        acc = pool.get("a")
+        self.assertIsNone(acc.models)
+        self.assertTrue(pool.serves_model(acc, "GLM-5.3-Flash"))
+
+    def test_limited_account_is_skipped_for_every_model_by_default(self):
+        """A downgraded account is kept out of scheduling entirely.
+
+        It could serve the free model correctly, but letting it take work that
+        a full-entitlement account can do better is exactly what the
+        ``exclude_downgraded`` default avoids.
+        """
+        pool = self._pool([
+            {"name": "limited", "session": "s1", "expireAt": self.FUTURE},
+            {"name": "full", "session": "s2", "expireAt": self.FUTURE},
+        ])
+        pool.get("limited").models = ("spark-x2.6",)
+        pool.get("limited").available = 900              # richest, would win
+        pool.get("full").models = ("spark-x2.6", "GLM-5.3-Flash")
+        pool.get("full").available = 10
+        self.assertEqual(pool.acquire(model="GLM-5.3-Flash").name, "full")
+        self.assertEqual(pool.acquire(model="spark-x2.6").name, "full")
+
+    def test_limited_account_serves_the_free_model_when_the_switch_is_off(self):
+        self.cfg["exclude_downgraded"] = False
+        pool = self._pool([
+            {"name": "limited", "session": "s1", "expireAt": self.FUTURE},
+            {"name": "full", "session": "s2", "expireAt": self.FUTURE},
+        ])
+        pool.get("limited").models = ("spark-x2.6",)
+        pool.get("limited").available = 900
+        pool.get("full").models = ("spark-x2.6", "GLM-5.3-Flash")
+        pool.get("full").available = 10
+        self.assertEqual(pool.acquire(model="GLM-5.3-Flash").name, "full")
+        self.assertEqual(pool.acquire(model="spark-x2.6").name, "limited")
+
+    def test_no_entitled_account_fails_loudly(self):
+        """Never fall back to an account that would answer with another model:
+        HTTP 200 + a substituted id is worse than an explicit error.
+
+        The id must be one the pool knows about — otherwise it is passed
+        through verbatim (see ``test_unknown_model_passes_through``).
+        """
+        pool = self._pool([
+            {"name": "limited", "session": "s1", "expireAt": self.FUTURE},
+            {"name": "rich", "session": "s2", "expireAt": self.FUTURE},
+        ])
+        pool.get("limited").models = ("spark-x2.6",)
+        pool.get("rich").models = ("spark-x2.6", "Kimi-k2.6")
+        pool.get("rich").enabled = False                 # entitlement exists, unusable
+        with self.assertRaises(PoolError) as ctx:
+            pool.acquire(model="Kimi-k2.6")
+        self.assertIn("Kimi-k2.6", str(ctx.exception))
+
+    def test_withdrawn_model_is_not_treated_as_unknown(self):
+        """Once every account loses an id, it must still be rejected.
+
+        ``/models`` is the only source of truth, so a withdrawn entitlement
+        makes the id vanish from every catalogue.  Reading that as "the caller
+        invented this name" would pass it upstream, where the upstream answers
+        200 with a substituted model — the exact silent downgrade this whole
+        mechanism exists to prevent.  The persisted history remembers it.
+        """
+        pool = self._pool([{"name": "a", "session": "s", "expireAt": self.FUTURE}])
+        pool._seen_models.update({"spark-x2.6", "GLM-5.3-Flash"})
+        pool.get("a").models = ("spark-x2.6",)         # entitlement withdrawn
+        with self.assertRaises(PoolError) as ctx:
+            pool.acquire(model="GLM-5.3-Flash")
+        self.assertIn("GLM-5.3-Flash", str(ctx.exception))
+        # An id never seen anywhere is still forwarded verbatim.
+        self.assertEqual(pool.acquire(model="gpt-4o-mini").name, "a")
+
+    def test_known_models_survive_a_reload(self):
+        pool = self._pool([{"name": "a", "session": "s", "expireAt": self.FUTURE}])
+        pool._seen_models.update({"GLM-5.3-Flash"})
+        pool.save(force=True)
+        again = AccountPool(self.cfg)
+        self.assertEqual(again._seen_models, {"GLM-5.3-Flash"})
+
+    def test_unknown_model_passes_through(self):
+        """An id no account has ever listed is forwarded verbatim.
+
+        It may be a typo, a model added upstream since the last probe, or a
+        caller-specific id — refusing it here turned pass-through requests into
+        502s.  The upstream decides, and ``note_model_substitution`` reports
+        whatever it actually serves.
+        """
+        pool = self._pool([{"name": "a", "session": "s", "expireAt": self.FUTURE}])
+        pool.get("a").models = ("spark-x2.6",)
+        self.assertEqual(pool.acquire(model="gpt-4o-mini").name, "a")
+
+    def test_empty_model_does_not_filter(self):
+        pool = self._pool([{"name": "a", "session": "s", "expireAt": self.FUTURE}])
+        pool.get("a").models = ("spark-x2.6",)
+        self.assertEqual(pool.acquire().name, "a")
+
+    def test_probe_records_ids_and_unions_catalogues(self):
+        pool = self._pool([
+            {"name": "limited", "session": "s1", "expireAt": self.FUTURE},
+            {"name": "full", "session": "s2", "expireAt": self.FUTURE},
+        ])
+
+        class FakeGateway:
+            def models(self, session):
+                if session == "s1":
+                    return {"data": [{"id": "spark-x2.6", "name": "free"}]}
+                return {"data": [{"id": "spark-x2.6"}, {"id": "GLM-5.3-Flash"}]}
+
+        pool.gateway = FakeGateway()
+        result = pool.probe_models()
+        self.assertEqual(sorted(result["models"]), ["GLM-5.3-Flash", "spark-x2.6"])
+        self.assertEqual(result["probed"], 2)
+        self.assertEqual(pool.get("limited").models, ("spark-x2.6",))
+        self.assertEqual(pool.model_stats(), {"spark-x2.6": 2, "GLM-5.3-Flash": 1})
+
+    def test_probe_treats_200_login_expired_as_a_rejected_session(self):
+        """The upstream answers /models with HTTP 200 + ``code 100002``.
+
+        Reading that as a *successful empty catalogue* recorded ``models=()``,
+        dropped the account from every routed model and never re-logged it in —
+        the exact opposite of what a dead session needs.  It must raise, keep
+        the previous list and start a recovery.
+        """
+        from loomy2api.upstream import ModelGateway
+
+        pool = self._pool([{"name": "a", "loginid": "13800000001", "password": "p",
+                            "session": "s", "expireAt": self.FUTURE}])
+        pool.get("a").models = ("GLM-5.3-Flash",)
+
+        class Expiring:
+            def models(self, session):
+                # exactly the shape the fake upstream now emits
+                from loomy2api.upstream import _check_payload
+                payload = {"code": "100002", "desc": "登录已失效，请重新登录",
+                           "data": {}}
+                data = json.dumps(payload).encode()
+                _check_payload(200, payload, data, "/models")
+                return payload
+
+        pool.gateway = Expiring()
+        result = pool.probe_models()
+        self.assertEqual(len(result["failed"]), 1)
+        self.assertEqual(pool.get("a").models, ("GLM-5.3-Flash",))  # kept
+        self.assertEqual(pool.get("a").session, "s")                # kept too
+
+    def test_probe_keeps_previous_list_on_failure(self):
+        """A network blip is not evidence that an entitlement was withdrawn."""
+        pool = self._pool([{"name": "a", "session": "s", "expireAt": self.FUTURE}])
+        pool.get("a").models = ("GLM-5.3-Flash",)
+        recovered = []
+        pool.schedule_recovery = lambda acc: recovered.append(acc.name)
+
+        class Broken:
+            def models(self, session):
+                raise RuntimeError("boom")
+
+        pool.gateway = Broken()
+        result = pool.probe_models()
+        self.assertEqual(result["failed"], ["a: boom"])
+        self.assertEqual(pool.get("a").models, ("GLM-5.3-Flash",))
+        # A timeout says nothing about the session: re-logging in would be a
+        # 顶号 against whoever else is using the account.
+        self.assertEqual(recovered, [])
+
+    def test_probe_never_relogs_or_drops_the_session(self):
+        """A rejected catalogue read must not touch the credentials.
+
+        ``report_failure`` treats a 401 as proof the session is dead: it wipes
+        it and starts a login.  Applying that from a *probe* destroyed accounts
+        that were merely unreadable at that moment, and burned a 顶号 login on
+        a read that has no bearing on whether real requests still work.  The
+        probe cools the account down and leaves the session alone.
+        """
+        from loomy2api.upstream import UpstreamError
+
+        pool = self._pool([{"name": "a", "loginid": "13800000001", "password": "p",
+                            "session": "s", "expireAt": self.FUTURE}])
+        recovered = []
+        pool.schedule_recovery = lambda acc: recovered.append(acc.name)
+
+        class Expired:
+            def models(self, session):
+                raise UpstreamError("/models HTTP 200: 登录已失效，请重新登录", 401)
+
+        pool.gateway = Expired()
+        pool.probe_models()
+        acc = pool.get("a")
+        self.assertEqual(recovered, [])
+        self.assertEqual(acc.session, "s")           # untouched
+        self.assertTrue(acc.in_cooldown)             # benched, not destroyed
+
+    def test_empty_catalogue_means_serve_nothing(self):
+        """A well-formed empty list is data, not a failure: the account may use
+        no model at all, so routing must skip it and the probe must not retry
+        it as if the call had failed."""
+        pool = self._pool([{"name": "a", "session": "s", "expireAt": self.FUTURE}])
+        pool.schedule_recovery = lambda acc: self.fail("must not re-login")
+
+        class Empty:
+            def models(self, session):
+                return {"object": "list", "data": []}
+
+        pool.gateway = Empty()
+        result = pool.probe_models()
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(pool.get("a").models, ())
+        with self.assertRaises(PoolError):
+            pool.acquire(model="spark-x2.6")
+
+    def test_models_survive_a_save_and_reload(self):
+        pool = self._pool([{"name": "a", "session": "s", "expireAt": self.FUTURE}])
+        pool.get("a").models = ("spark-x2.6", "GLM-5.3-Flash")
+        pool.save(force=True)
+        again = AccountPool(self.cfg)
+        self.assertEqual(again.get("a").models, ("spark-x2.6", "GLM-5.3-Flash"))
+
+
+class TestDowngradeExclusion(unittest.TestCase):
+    """Downgraded accounts are excluded from scheduling by default."""
+
+    FUTURE = int(time.time()) + 14 * 86400
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.cfg = make_config(self.dir, "http://127.0.0.1:1/api/v1")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _pool(self, accounts, **cfg):
+        (self.dir / "accounts.json").write_text(
+            json.dumps({"accounts": accounts}), encoding="utf-8")
+        self.cfg.update(cfg)
+        return AccountPool(self.cfg)
+
+    def _two(self):
+        return [
+            {"name": "full", "session": "s1", "expireAt": self.FUTURE},
+            {"name": "cut", "session": "s2", "expireAt": self.FUTURE},
+        ]
+
+    def test_downgraded_account_is_skipped_by_default(self):
+        pool = self._pool(self._two())
+        pool.get("full").models = ("spark-x2.6", "GLM-5.3-Flash")
+        pool.get("cut").models = ("spark-x2.6-low", "spark-x2.6-4b")
+        pool.get("cut").available = 900          # richest, would win
+        pool.get("full").available = 10
+        self.assertTrue(pool.exclude_downgraded())
+        self.assertTrue(pool.is_downgraded(pool.get("cut")))
+        self.assertFalse(pool.is_downgraded(pool.get("full")))
+        names = [a.name for a in pool.usable()]
+        self.assertEqual(names, ["full"])
+
+    def test_cooled_down_account_still_gets_a_self_heal_attempt(self):
+        """A model entitlement must not short-circuit the re-login fallback.
+
+        Raising "no account can serve this model" before trying the enabled
+        accounts turned a 300-second cooldown into a hard 400 for small pools,
+        even though a re-login would have brought the account straight back.
+        """
+        pool = self._pool([{"name": "only", "session": "s1",
+                            "expireAt": self.FUTURE}])
+        pool.get("only").models = ("spark-x2.6", "GLM-5.3-Flash")
+        pool.get("only").cooldown(300, "冷却中")      # not usable right now
+        pool._seen_models.update({"GLM-5.3-Flash"})
+        self.assertEqual(pool.acquire(model="GLM-5.3-Flash").name, "only")
+
+    def test_no_entitled_account_at_all_still_fails_clearly(self):
+        """Once the self-heal set is empty too, the model error is correct."""
+        pool = self._pool([{"name": "a", "session": "s1",
+                            "expireAt": self.FUTURE}])
+        pool.get("a").models = ("spark-x2.6",)
+        pool._seen_models.update({"GLM-5.3-Flash"})
+        with self.assertRaises(PoolError) as ctx:
+            pool.acquire(model="GLM-5.3-Flash")
+        self.assertIn("GLM-5.3-Flash", str(ctx.exception))
+
+    def test_preference_falls_back_instead_of_failing_the_request(self):
+        """Entitlements are per account: "everyone lacks some paid model" is
+        the normal state, not an outage.
+
+        Filtering on that and then finding nobody must fall back to the
+        unfiltered set — ``serves_model`` has already guaranteed each candidate
+        can answer the requested id, so failing here would break working
+        traffic for a scheduling preference.
+        """
+        pool = self._pool([
+            {"name": "a", "session": "s1", "expireAt": self.FUTURE},
+            {"name": "b", "session": "s2", "expireAt": self.FUTURE},
+        ])
+        # Each holds a *different* paid model, so each looks "downgraded".
+        pool.get("a").models = ("GLM-5.3-Flash",)
+        pool.get("b").models = ("DeepSeek-V4.1-Flash",)
+        self.assertTrue(pool.is_downgraded(pool.get("a")))
+        self.assertTrue(pool.is_downgraded(pool.get("b")))
+        self.assertEqual(sorted(x.name for x in pool.usable()), ["a", "b"])
+
+    def test_switch_off_lets_the_free_tier_back_in(self):
+        pool = self._pool(self._two(), exclude_downgraded=False)
+        pool.get("full").models = ("spark-x2.6", "GLM-5.3-Flash")
+        pool.get("cut").models = ("spark-x2.6-low",)
+        self.assertFalse(pool.exclude_downgraded())
+        self.assertEqual(sorted(a.name for a in pool.usable()), ["cut", "full"])
+
+    def test_free_only_pool_has_nobody_downgraded(self):
+        """With no paid model anywhere, the free tier is all there is."""
+        pool = self._pool([
+            {"name": "a", "session": "s1", "expireAt": self.FUTURE},
+            {"name": "b", "session": "s2", "expireAt": self.FUTURE},
+        ])
+        pool.get("a").models = ("spark-x2.6",)
+        pool.get("b").models = ("spark-x2.6-low",)
+        self.assertFalse(pool.is_downgraded(pool.get("a")))
+        self.assertFalse(pool.is_downgraded(pool.get("b")))
+        self.assertEqual(sorted(a.name for a in pool.usable()), ["a", "b"])
+
+    def test_unknown_catalogue_is_never_downgraded(self):
+        pool = self._pool(self._two())
+        pool.get("full").models = ("GLM-5.3-Flash",)
+        self.assertIsNone(pool.get("cut").models)
+        self.assertFalse(pool.is_downgraded(pool.get("cut")))
+        self.assertEqual(sorted(a.name for a in pool.usable()), ["cut", "full"])
+
+
+class TestModelEventLog(unittest.TestCase):
+    """The 7-day entitlement history."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.cfg = make_config(self.dir, "http://127.0.0.1:1/api/v1")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _pool(self, accounts):
+        (self.dir / "accounts.json").write_text(
+            json.dumps({"accounts": accounts}), encoding="utf-8")
+        return AccountPool(self.cfg)
+
+    def test_probe_records_downgrade_and_recovery(self):
+        pool = self._pool([{"name": "a", "session": "s",
+                            "expireAt": int(time.time()) + 14 * 86400}])
+        pool.get("a").models = ("spark-x2.6", "GLM-5.3-Flash")
+
+        class Cut:
+            def models(self, session):
+                return {"data": [{"id": "spark-x2.6"}]}
+
+        class Restored:
+            def models(self, session):
+                return {"data": [{"id": "spark-x2.6"}, {"id": "GLM-5.3-Flash"}]}
+
+        pool.gateway = Cut()
+        pool.probe_models()
+        pool.gateway = Restored()
+        pool.probe_models()
+
+        events = pool.model_events.events(days=7)
+        # Both transitions land in the same second; order by content, not time.
+        by_kind = {e["event"]: e for e in events}
+        self.assertEqual(sorted(by_kind), ["downgrade", "recover"])
+        self.assertEqual(by_kind["downgrade"]["lost"], ["GLM-5.3-Flash"])
+        self.assertEqual(by_kind["recover"]["gained"], ["GLM-5.3-Flash"])
+        summary = pool.model_events.summary()
+        self.assertEqual(summary["a"]["downgrades"], 1)
+        self.assertEqual(summary["a"]["recovers"], 1)
+        self.assertEqual(summary["a"]["event"], "recover")
+
+    def test_free_model_rename_is_not_an_event(self):
+        """The upstream splits/renames its free ids constantly."""
+        pool = self._pool([{"name": "a", "session": "s",
+                            "expireAt": int(time.time()) + 14 * 86400}])
+        pool.get("a").models = ("spark-x2.6",)
+
+        class Split:
+            def models(self, session):
+                return {"data": [{"id": "spark-x2.6-low"},
+                                 {"id": "spark-x2.6-4b"}]}
+
+        pool.gateway = Split()
+        pool.probe_models()
+        self.assertEqual(pool.model_events.events(days=7), [])
+
+    def test_periodic_probe_is_rate_limited(self):
+        """Entitlements change without traffic, so the keeper re-probes."""
+        pool = self._pool([{"name": "a", "session": "s",
+                            "expireAt": int(time.time()) + 14 * 86400}])
+        calls = []
+
+        class Counting:
+            def models(self, session):
+                calls.append(session)
+                return {"data": [{"id": "spark-x2.6"}]}
+
+        pool.gateway = Counting()
+        pool.cfg["model_probe_minutes"] = 60
+        self.assertTrue(pool.maybe_probe_models())
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(pool.maybe_probe_models())   # inside the window
+        self.assertEqual(len(calls), 1)
+        pool._last_model_probe = time.time() - 61 * 60
+        self.assertTrue(pool.maybe_probe_models())
+        self.assertEqual(len(calls), 2)
+
+    def test_periodic_probe_can_be_disabled(self):
+        pool = self._pool([{"name": "a", "session": "s",
+                            "expireAt": int(time.time()) + 14 * 86400}])
+        pool.cfg["model_probe_minutes"] = 0
+        self.assertFalse(pool.maybe_probe_models())
+
+    def test_events_expire_after_the_retention_window(self):
+        from loomy2api.model_events import ModelEventLog
+
+        path = self.dir / "model_events.jsonl"
+        log = ModelEventLog(path, retention=7 * 86400)
+        stale = int(time.time() - 8 * 86400)
+        fresh = int(time.time())
+        log.append({"at": stale, "account": "a", "event": "downgrade",
+                    "lost": ["GLM-5.3-Flash"], "gained": [],
+                    "from": ["GLM-5.3-Flash"], "to": []})
+        log.append({"at": fresh, "account": "b", "event": "recover",
+                    "lost": [], "gained": ["GLM-5.3-Flash"],
+                    "from": [], "to": ["GLM-5.3-Flash"]})
+        log._last_prune = 0.0            # force a prune pass
+        log.append({"at": fresh + 1, "account": "c", "event": "downgrade",
+                    "lost": [], "gained": [], "from": [], "to": []})
+        # Assert on the file itself: ``events(days=7)`` filters by time anyway,
+        # so it cannot prove the 8-day-old row was actually rewritten away.
+        on_disk = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual([r["account"] for r in on_disk], ["b", "c"])
 
 
 if __name__ == "__main__":

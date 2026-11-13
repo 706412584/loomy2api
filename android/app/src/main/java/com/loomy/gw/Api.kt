@@ -171,7 +171,37 @@ data class AccountView(
     val recycled: Boolean? = null,
     /** true when the upstream disabled this account (banned / suspended). */
     val banned: Boolean = false,
+    /**
+     * Model ids this account may use, as reported by its own /models call.
+     * null = never probed.
+     */
+    val models: List<String>? = null,
 ) {
+    /**
+     * True when the upstream cut this account back to its free tier.
+     *
+     * The catalogue is per account and the upstream answers a model it does
+     * not grant with HTTP 200 plus a *substituted* free model, so a downgraded
+     * account still looks healthy while quietly serving something worse.
+     * Judged against the pool's union rather than by counting entries: the
+     * upstream renames and splits its free ids constantly, so "how many
+     * models" says nothing.
+     *
+     * [modelIds] is empty until the first probe completes — that must not be
+     * read as "nobody is entitled", so it yields false (no badge).
+     */
+    fun isDowngraded(modelIds: List<String>): Boolean {
+        val own = models ?: return false
+        if (own.isEmpty()) return false
+        val paid = modelIds.filterNot { it.lowercase().startsWith("spark-") }
+        if (paid.isEmpty()) return false
+        return paid.any { it !in own }
+    }
+
+    /** The upstream reports no usable model at all for this account. */
+    val hasNoModels: Boolean
+        get() = models != null && models.isEmpty()
+
     val statusLabel: String
         get() = when {
             !enabled -> "已禁用"
@@ -192,6 +222,8 @@ data class Totals(
     val accounts: Int, val usable: Int, val available: Int,
     val requests: Int, val pointsUsed: Int,
     val totalRequests: Int, val tokens: Int, val failures: Int,
+    /** Every model id the pool can serve — the baseline for the downgrade badge. */
+    val modelIds: List<String> = emptyList(),
 )
 
 data class ConfigView(
@@ -279,6 +311,9 @@ fun parseState(o: JSONObject): StateView {
             ledgerTotal = if (a.isNull("ledger_total")) null else a.optInt("ledger_total"),
             recycled = if (a.isNull("recycled")) null else a.optBoolean("recycled"),
             banned = a.optBoolean("banned"),
+            models = a.optJSONArray("models")?.let { arr2 ->
+                (0 until arr2.length()).map { j -> arr2.optString(j) }
+            },
         )
     }
     val keys = c.optJSONArray("api_keys") ?: JSONArray()
@@ -293,6 +328,9 @@ fun parseState(o: JSONObject): StateView {
             totalRequests = t.optInt("total_requests", t.optInt("requests")),
             tokens = t.optInt("tokens"),
             failures = t.optInt("failures"),
+            modelIds = t.optJSONArray("model_ids")?.let { arr2 ->
+                (0 until arr2.length()).map { j -> arr2.optString(j) }
+            } ?: emptyList(),
         ),
         config = ConfigView(
             upstream = c.optString("upstream"),

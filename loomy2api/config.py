@@ -100,6 +100,18 @@ DEFAULTS: Dict[str, Any] = {
     #: reset while the permanent balance carries over, so this maximises what
     #: is actually used — at the cost of failing once every grant is spent.
     "daily_only": False,
+    #: Skip accounts the upstream has cut back to its free tier when routing.
+    #: The upstream scopes its model catalogue per account and silently swaps
+    #: in a free model for any id an account lacks, so a downgraded account
+    #: answers every request — just with worse output and zero points spent.
+    #: Excluding them keeps paid traffic on the accounts that still have the
+    #: entitlements.  Turn this off to keep using the free tier as a fallback.
+    "exclude_downgraded": True,
+    #: Minutes between automatic model-entitlement probes.  Entitlements
+    #: change without any traffic, so a list captured at startup goes stale:
+    #: recovered accounts would never come back and newly downgraded ones
+    #: would keep taking paid work.  0 disables the periodic probe.
+    "model_probe_minutes": 60,
     "session_renew_before_days": 3,
     #: Upgrade a password-less account this many days before its session
     #: expires: set a password through the still-valid session, so it can

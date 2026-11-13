@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -152,6 +153,22 @@ class Account:
     #: unix seconds when the ban was first observed.
     banned_at: int = 0
 
+    #: Model ids this account is entitled to, as last reported by its own
+    #: ``/models`` call.  The catalogue is **per-account**: the upstream
+    #: silently serves a different (cheaper/default) model when an account
+    #: asks for one it does not have, answering HTTP 200 with the substituted
+    #: id — so routing a request to the wrong account degrades output without
+    #: any error.  Distinct from "not fetched yet": the empty tuple means the
+    #: account returned no usable catalogue, ``None`` means unknown.
+    models: Optional[Tuple[str, ...]] = None
+    #: unix seconds when :attr:`models` was last confirmed upstream.
+    models_updated_at: int = 0
+    #: Guards read-modify-write on :attr:`models`.  The probe thread rewrites
+    #: it while concurrent requests may drop an id after observing a silent
+    #: substitution; without a shared lock one update silently undoes another.
+    models_lock: threading.Lock = field(default_factory=threading.Lock,
+                                        repr=False, compare=False)
+
     # quota cache (filled from /points/records)
     balance: Optional[int] = None
     daily_balance: Optional[int] = None
@@ -244,6 +261,9 @@ class Account:
                           else (int(raw["ledger_total"]) if raw.get("ledger_total") is not None
                                 else None)),
             recycled=(raw.get("recycled") if isinstance(raw.get("recycled"), bool) else None),
+            models=(tuple(str(m) for m in raw["models"])
+                    if isinstance(raw.get("models"), list) else None),
+            models_updated_at=int(raw.get("modelsUpdatedAt") or 0),
             banned=raw.get("banned") is True,
             banned_at=int(raw.get("bannedAt") or raw.get("banned_at") or 0),
             available=(int(raw["available"]) if raw.get("available") is not None else None),
@@ -297,6 +317,12 @@ class Account:
             out["ledgerTotal"] = self.ledger_total
         if self.recycled is not None:
             out["recycled"] = bool(self.recycled)
+        # Stored so a cold start can route by model before the first /models
+        # probe finishes; refreshed whenever the account answers.
+        if self.models is not None:
+            out["models"] = list(self.models)
+            if self.models_updated_at:
+                out["modelsUpdatedAt"] = self.models_updated_at
         if self.banned:
             out["banned"] = True
             if self.banned_at:
@@ -352,6 +378,10 @@ class Account:
             "recycled": self.recycled,
             "banned": self.banned,
             "banned_at": self.banned_at,
+            # What this account can actually serve: the upstream scopes its
+            # catalogue per account and silently swaps in a default otherwise.
+            "models": list(self.models) if self.models is not None else None,
+            "models_updated_at": self.models_updated_at,
             "identity": self.identity_view(),
         }
         return out

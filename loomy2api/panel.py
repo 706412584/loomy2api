@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import constants as C
 from .account import Account, AccountError
+from .model_events import is_free
 from .pool import PoolError
 from .upstream import UpstreamError
 
@@ -222,11 +223,23 @@ class Panel:
                 "total_requests": self.gw.totals.get("requests", 0),
                 "tokens": self.gw.totals.get("tokens", 0),
                 "failures": self.gw.totals.get("failures", 0),
+                # The ids the pool as a whole can serve.  The UI compares each
+                # account against this to spot a downgrade: an account missing
+                # any paid model here has been cut back to the free tier.
+                #
+                # Empty until a real probe has run.  ``catalogue()`` answers a
+                # built-in guess before that, and diffing accounts against a
+                # guess marked the whole pool as downgraded on the first page
+                # load after every restart.
+                "model_ids": ([str(m.get("id")) for m in self.gw.catalogue()
+                               if m.get("id")]
+                              if self.gw.models_confirmed else []),
             },
             "config": {
                 "upstream": self.gw.cfg["upstream"],
                 "strategy": self.gw.cfg.get("strategy"),
                 "daily_only": self.pool.daily_only(),
+                "exclude_downgraded": self.pool.exclude_downgraded(),
                 "default_model": self.gw.cfg.get("default_model"),
                 "identity_mode": self.gw.cfg.get("identity_mode"),
                 "models": len(self.gw.catalogue()),
@@ -275,7 +288,8 @@ class Panel:
             "stream_progress_stall_seconds", "stream_stall_seconds",
             "session_renew_before_days", "password_set_before_days",
             "quota_refresh_minutes", "sessions_from_client", "identity_mode",
-            "daily_only", "auto_repair_password", "auto_set_password",
+            "daily_only", "exclude_downgraded",
+            "auto_repair_password", "auto_set_password",
             "fysms_username", "fysms_password", "fysms_keyword",
             "fysms_max_wait",
         }
@@ -302,9 +316,15 @@ class Panel:
                     raw = text.split(",")
             changes["api_keys"] = [str(v).strip() for v in (raw or []) if str(v).strip()]
         for flag in ("log_requests", "sessions_from_client", "daily_only",
-                     "auto_repair_password", "auto_set_password"):
+                     "exclude_downgraded", "auto_repair_password",
+                     "auto_set_password"):
             if flag in changes:
-                changes[flag] = bool(changes[flag])
+                # ``bool("false")`` is True — a string from the UI or an env
+                # var would silently lock the switch on.
+                value = changes[flag]
+                if isinstance(value, str):
+                    value = value.strip().lower() not in ("", "0", "false", "no", "off")
+                changes[flag] = bool(value)
         for num_key in ("timeout", "max_retries", "cooldown_seconds",
                         "stream_progress_stall_seconds", "stream_stall_seconds",
                         "session_renew_before_days", "password_set_before_days",
@@ -553,6 +573,20 @@ class Panel:
         acc = self.pool.get(name)
         if acc is None:
             acc = self.pool.add_account(name, loginid=phone)
+        else:
+            # Re-login of an *existing* account: the old session's failures and
+            # the password lockout refer to a credential that is about to be
+            # replaced (or was already rejected), so carrying them over would
+            # keep the account benched right after a successful login.
+            acc.login_blocked_until = 0.0
+            acc.cooldown_until = 0.0
+            acc.last_error = ""
+            # A successful SMS login is proof the account works again; a stale
+            # ban flag would keep it out of routing no matter what.
+            acc.banned = False
+            acc.banned_at = 0
+            if phone and not acc.loginid:
+                acc.loginid = phone
         acc.session = got["session"]
         acc.userid = got.get("userid", "")
         acc.obtained_at = int(time.time())
@@ -904,12 +938,18 @@ class Panel:
                 "state": self.state()}
 
     def models(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Catalogue with the points multiplier pulled out of the upstream name."""
+        """Catalogue with the points multiplier pulled out of the upstream name.
+
+        ``refresh`` used to re-probe the whole pool synchronously: one panel
+        click became N upstream round-trips (minutes on a phone) and benched
+        every account whose session was rejected along the way.  It now just
+        kicks the keeper, which probes on its own thread and cadence.
+        """
         if (payload or {}).get("refresh"):
             try:
-                self.gw.refresh_models()
+                self.pool.request_model_probe()
             except Exception as exc:                     # noqa: BLE001
-                self.log(f"[panel] 刷新模型列表失败：{exc}")
+                self.log(f"[panel] 请求刷新模型列表失败：{exc}")
         items = []
         for raw in self.gw.catalogue():
             name = str(raw.get("name") or raw.get("id") or "")
@@ -1225,6 +1265,51 @@ class Panel:
                 "daily_cycle_date": data.get("dailyCycleDate"),
                 "desc": data.get("desc"),
                 "points": self.points({"name": acc.name, "ledger": False})}
+
+    def model_events(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Entitlement history for the last 7 days.
+
+        ``accounts.json`` only knows the *current* catalogue, so a downgrade
+        that later reverses would otherwise be invisible.  This answers both
+        the raw transitions and, per account, the current state plus how many
+        times it has moved each way.
+        """
+        payload = payload or {}
+        days = float(payload.get("days") or 7)
+        account = str(payload.get("name") or "").strip()
+        log = self.pool.model_events
+        events = log.events(account=account, days=days,
+                            limit=int(payload.get("limit") or 500))
+        summary = log.summary(days=days)
+        if account:
+            summary = {k: v for k, v in summary.items() if k == account}
+        # Same rule the panel uses: an account is downgraded when it lacks a
+        # paid model the pool as a whole can serve.  Counting entries would
+        # miss the free-tier splits the upstream keeps making.
+        # Before the first probe the catalogue is the built-in FALLBACK guess;
+        # diffing against it marked the whole pool as downgraded — the same bug
+        # ``state()`` already guards against.
+        paid_universe = set()
+        if self.gw.models_confirmed:
+            paid_universe = {str(m.get("id")) for m in self.gw.catalogue()
+                             if m.get("id") and not is_free(str(m.get("id")))}
+        downgraded_now = set()
+        if paid_universe:
+            for acc in self.pool.accounts:
+                if not acc.enabled or acc.models is None or not acc.models:
+                    continue
+                if any(m not in acc.models for m in paid_universe):
+                    downgraded_now.add(acc.name)
+        return {
+            "ok": True,
+            "days": days,
+            "retention_days": log.retention / 86400,
+            "path": str(log.path),
+            "events": events,
+            "summary": summary,
+            # convenience for the UI's "currently downgraded" filter
+            "downgraded_now": sorted(downgraded_now),
+        }
 
     def logs(self, lines: int = 200) -> Dict[str, Any]:
         path = self.gw.log.path

@@ -33,6 +33,7 @@ from typing import Dict, List, Optional, Sequence
 from . import constants as C
 from .account import (Account, AccountClient, AccountError, generate_password,
                       is_credential_error)
+from .model_events import ModelEventLog, classify, is_free
 from .upstream import ModelGateway, UpstreamError
 
 __all__ = ["AccountPool", "PoolError"]
@@ -68,7 +69,22 @@ class AccountPool:
         self._recovering: set = set()
         self._recovering_lock = threading.Lock()
         self._recovery_threads: List[threading.Thread] = []
+        #: Ids any account has ever reported, persisted under ``known_models``
+        #: so a withdrawn entitlement is still recognised as a real model.
+        self._seen_models: set = set()
         self._file = cfg.path("accounts_file", "accounts.json")
+        # Entitlement history, kept beside the accounts file so it travels with
+        # the deployment.  ``accounts.json`` only holds the *current* list, so
+        # without this a downgrade that later reverses leaves no trace.
+        self.model_events = ModelEventLog(
+            self._file.parent / "model_events.jsonl")
+        #: When the catalogue was last probed, so the keeper can re-check on a
+        #: slow cadence instead of only at startup.
+        self._last_model_probe = 0.0
+        #: Set by the panel's refresh button; the keeper honours it on its next
+        #: wake-up instead of blocking a request thread on a pool-wide probe.
+        self._probe_requested = threading.Event()
+        self._probe_thread: Optional[threading.Thread] = None
         self.load()
 
     def _account_lock(self, name: str) -> threading.Lock:
@@ -89,6 +105,7 @@ class AccountPool:
                 raise PoolError(f"{self._file} 解析失败 / parse error: {exc}") from exc
 
         items = raw.get("accounts") if isinstance(raw, dict) else raw
+        persisted_known = raw.get("known_models") if isinstance(raw, dict) else None
         accounts: List[Account] = []
         for idx, item in enumerate(items or []):
             if isinstance(item, dict):
@@ -110,6 +127,8 @@ class AccountPool:
                         acc.session, acc.expire_at, acc.userid = (
                             old.session, old.expire_at, old.userid)
             self._accounts = accounts
+            if isinstance(persisted_known, list):
+                self._seen_models.update(str(m) for m in persisted_known)
 
         self.log(f"账号池载入 {len(accounts)} 个账号"
                  + (f"（{', '.join(a.name for a in accounts)}）" if accounts else ""))
@@ -168,7 +187,12 @@ class AccountPool:
                 return
             self._dirty = False
             self._last_save = now
-            payload = {"accounts": [a.to_dict() for a in self._accounts if a.persist]}
+            payload = {
+                "accounts": [a.to_dict() for a in self._accounts if a.persist],
+                # Grows only: lets a later request for a withdrawn model be
+                # recognised as "entitlement lost" rather than "unknown id".
+                "known_models": sorted(self._seen_models),
+            }
         # Batch actions (e.g. setting passwords concurrently) save from several
         # threads at once; they must not race on the same temp file.
         with self._save_lock:
@@ -293,6 +317,14 @@ class AccountPool:
             got = self.client.login_by_password(
                 acc.loginid, new_password, acc.identity or None)
         except AccountError as exc:
+            # The upstream accepted the change but rejects the new password at
+            # login.  Keeping ``password_set_at`` here made the panel advertise
+            # this account as "permanent" (到期自动续期) while the stored
+            # credential was already unusable — the account then died silently
+            # at its next expiry.  Clearing the stamp makes the UI say what is
+            # true: no verified password.
+            acc.password_set_at = 0
+            acc.password_verified_at = 0
             self.save(force=True)
             raise PoolError(
                 f"账号 {acc.name} 密码已设置，但用新密码登录验证失败：{exc}。"
@@ -526,10 +558,30 @@ class AccountPool:
                 acc.last_error = f"login: {exc}"
                 self.log(f"账号 {acc.name} 续期失败：{exc}")
             self.save()
-            if acc.session_valid:
+            if acc.session_valid and not force:
+                # Implicit renewal (routing, the keeper): the session we hold
+                # still works, so keep serving on it.  The block above stops
+                # the next attempt from piling on.
                 self.log(f"账号 {acc.name} 沿用现有 session"
                          f"（剩余 {(acc.days_left or 0):.1f} 天）")
                 return acc
+            if acc.session_valid:
+                # An explicit renewal (panel "续期重登", CLI login) must not
+                # report success: nothing was renewed.  Silence here is what
+                # made the button look like it worked while the password stayed
+                # rejected and the expiry kept closing in.
+                if acc.has_password:
+                    reason = ("自动改密已被配置关闭（auto_repair_password=false）"
+                              if not bool(self.cfg.get("auto_repair_password", True))
+                              else "自动改密失败，请查看日志")
+                    raise PoolError(
+                        f"账号 {acc.name} 的密码被上游拒绝，续期失败：{reason}。"
+                        f"现有 session 仍可用（剩余 {(acc.days_left or 0):.1f} 天），"
+                        f"请在本弹窗点「重设密码」——它用当前 session 直接改密并"
+                        f"跑一次真实登录验证，session 到期后才能自动续期。")
+                raise PoolError(
+                    f"账号 {acc.name} 续期失败：{exc}。"
+                    f"现有 session 仍可用（剩余 {(acc.days_left or 0):.1f} 天）。")
             raise PoolError(
                 f"账号 {acc.name} 的 session 已失效且无法重新登录：{exc}"
                 f"（请在面板重新设置密码或短信登录）") from exc
@@ -586,12 +638,28 @@ class AccountPool:
                 return acc
             self.log(f"账号 {acc.name} session 被上游拒绝（HTTP {exc.status}）")
             if not (relogin and acc.has_password):
-                acc.session, acc.expire_at = "", 0
-                acc.last_error = f"quota: {exc}"
+                # No way back in without an SMS code.  Forgetting the session
+                # here made the account unrecoverable *and* erased the only
+                # evidence that it ever worked: keep it and let routing skip
+                # the account (``session_valid`` already accounts for expiry,
+                # and a rejected session fails the next request anyway, which
+                # is where the cooldown belongs).
+                acc.last_error = f"quota: {exc}（session 被拒，无法自动重登）"
+                self.log(f"账号 {acc.name} 没有可用的密码，保留 session 记录"
+                         f"（请用验证码重新登录）")
                 return acc
-            acc.session, acc.expire_at = "", 0
+            # Try the re-login FIRST and only overwrite the session on success.
+            # Clearing it up front meant a rejected password left the account
+            # with neither a session nor a usable password — and no record of
+            # which session it used to hold.
+            previous = (acc.session, acc.expire_at, acc.obtained_at)
+            relogged_in = False
             try:
-                self.ensure_session(acc)
+                # ``force``: the session is still marked valid (it has not
+                # expired yet), so an unforced call would decide nothing needs
+                # doing and return without logging in.
+                self.ensure_session(acc, force=True)
+                relogged_in = True
                 quota = self.gateway.quota(acc.session)
             except UpstreamError as relogin_exc:
                 if getattr(relogin_exc, "banned", False):
@@ -604,10 +672,19 @@ class AccountPool:
                 self.log(f"账号 {acc.name} 额度查询失败，重登也没成功：{relogin_exc}")
                 return acc
             except (AccountError, PoolError) as relogin_exc:
+                if not relogged_in:
+                    acc.session, acc.expire_at, acc.obtained_at = previous
                 acc.last_error = f"quota: {exc}; relogin: {relogin_exc}"
-                self.log(f"账号 {acc.name} 额度查询失败，重登也没成功：{relogin_exc}")
+                self.log(f"账号 {acc.name} 额度查询失败，重登也没成功"
+                         f"（保留原 session 记录）：{relogin_exc}")
                 return acc
             except Exception as relogin_exc:             # noqa: BLE001
+                # The login may have succeeded and only the quota read failed
+                # (a JSON/socket hiccup).  Rolling the session back then would
+                # discard a *fresh, valid* session — and the old one was just
+                # invalidated by that very login.
+                if not relogged_in:
+                    acc.session, acc.expire_at, acc.obtained_at = previous
                 acc.last_error = f"quota: {exc}; relogin: {relogin_exc}"
                 self.log(f"账号 {acc.name} 额度查询异常（网络？）：{relogin_exc}")
                 return acc
@@ -792,8 +869,7 @@ class AccountPool:
 
     # ------------------------------------------------------------ routing
 
-    def usable(self, exclude: Sequence[str] = ()) -> List[Account]:
-        now = time.time()
+    def usable(self, exclude: Sequence[str] = (), model: str = "") -> List[Account]:
         rows = [a for a in self.accounts
                 if a.enabled and not a.banned and not a.in_cooldown
                 and a.name not in exclude
@@ -802,8 +878,113 @@ class AccountPool:
             # Only the daily grant may be spent.  An account whose grant is
             # used up is skipped entirely, so the permanent balance survives
             # the cycle reset instead of being drained by routing.
-            return [a for a in rows if (a.daily_balance or 0) > 0]
+            rows = [a for a in rows if (a.daily_balance or 0) > 0]
+        rows = [a for a in rows if self.serves_model(a, model)]
+        if rows and self.exclude_downgraded():
+            # A downgraded account still serves its own models perfectly well,
+            # so this is a *preference*, never a correctness rule: skipping
+            # them keeps paid traffic on the accounts that hold the
+            # entitlements.  ``serves_model`` above already guarantees each
+            # candidate can answer the requested id, so if the preference
+            # leaves nobody, fall back rather than fail the request — with
+            # 60 accounts holding different subsets, "everyone lacks some paid
+            # model" is the normal state, not an outage.
+            preferred = [a for a in rows if not self.is_downgraded(a)]
+            if preferred:
+                rows = preferred
         return rows
+
+    def exclude_downgraded(self) -> bool:
+        """True when routing should skip accounts cut back to the free tier."""
+        return bool(self.cfg.get("exclude_downgraded", True))
+
+    def is_downgraded(self, acc: Account) -> bool:
+        """Whether ``acc`` has lost a paid model the rest of the pool serves.
+
+        Judged against the *other* accounts' union, not by counting entries:
+        the upstream renames and splits its free models (one ``spark-x2.6``
+        became ``spark-x2.6-low`` + ``spark-x2.6-4b``), so "how many models"
+        says nothing about entitlement.
+
+        An unknown catalogue (``None``) is never downgraded — there is no
+        evidence yet — and an account holding every paid model in the pool
+        obviously is not.
+        """
+        if acc.models is None or not acc.models:
+            return False
+        own = set(acc.models)
+        paid = self._paid_union(exclude=acc)
+        if not paid:
+            return False
+        return any(m not in own for m in paid)
+
+    def _paid_union(self, exclude: Optional[Account] = None) -> set:
+        """Paid ids served by an enabled account other than ``exclude``.
+
+        Recomputed per call: it is a handful of set unions over a pool of tens
+        of accounts, and a cache would go stale the moment any account's
+        catalogue changes — which happens from the probe thread, from request
+        handling on substitution, and from panel edits.
+        """
+        seen = set()
+        for acc in self.accounts:
+            if acc is exclude or not acc.enabled or not acc.models:
+                continue
+            seen.update(m for m in acc.models if not is_free(m))
+        return seen
+
+    def serves_model(self, acc: Account, model: str) -> bool:
+        """Whether ``acc`` is entitled to ``model``.
+
+        The upstream scopes ``/models`` per account and *silently substitutes*
+        its default when asked for an id the account lacks — HTTP 200, no error,
+        a different ``model`` in the response.  Routing by that id would
+        therefore degrade the caller's output invisibly, so an account whose
+        own catalogue is known to omit it is skipped.
+
+        Filtering only applies to ids the pool has actually seen somewhere.
+        An id *no* account lists may be a typo, a model the caller made up, or
+        something the upstream added since the last probe — this pool cannot
+        tell, and guessing "not entitled" would turn a previously working
+        pass-through request into a 502.  Those go upstream as-is, which is
+        also what the verbatim-model contract promises.
+        """
+        name = str(model or "").strip()
+        known = acc.models
+        # An account the upstream says may use *nothing* gets no traffic at
+        # all — including the pass-through path below, which otherwise lets
+        # any id through for accounts with an unknown catalogue.
+        if known is not None and not known:
+            return False
+        if not name:
+            return True
+        if known is None:
+            return True
+        if name in known:
+            return True
+        return name not in self._known_models()
+
+    def _known_models(self) -> set:
+        """Every model id this pool has **ever** seen an account report.
+
+        Persisted, and never shrinks.  That distinction matters: once the
+        upstream withdraws an id from every account, the current catalogues no
+        longer mention it — but it is still a real model, not a typo, so a
+        request for it must fail loudly instead of being passed through to be
+        silently substituted.  Only ids never seen anywhere are treated as
+        caller-supplied and forwarded verbatim.
+        """
+        with self._lock:
+            seen = set(self._seen_models)
+        for acc in self.accounts:
+            if acc.models:
+                seen.update(acc.models)
+        return seen
+
+    def model_accounts(self, model: str) -> List[Account]:
+        """Accounts currently entitled to ``model`` (for the CLI / panel)."""
+        return [a for a in self.accounts
+                if a.enabled and not a.banned and self.serves_model(a, model)]
 
     def daily_only(self) -> bool:
         """True when routing must stay inside the daily (activity) grant."""
@@ -854,14 +1035,18 @@ class AccountPool:
             a.available if a.available is not None else 10**9,
             -a.last_used), reverse=True)
 
-    def acquire(self, exclude: Sequence[str] = ()) -> Account:
+    def acquire(self, exclude: Sequence[str] = (), model: str = "") -> Account:
         """Return the next usable account whose session is guaranteed valid.
 
         A candidate whose renewal fails is skipped and the next one is tried:
         one account with a rejected password must never fail the whole request
         while the pool still holds healthy accounts.
+
+        ``model`` restricts the pool to accounts the upstream told us are
+        entitled to it — see :meth:`serves_model` for why that matters.
         """
-        candidates = self.usable(exclude)
+        candidates = self.usable(exclude, model=model)
+        requested = str(model or "").strip()
         if not candidates and self.daily_only():
             # "Only spend the activity balance" is an explicit instruction, so
             # falling back to permanent points would be worse than failing.
@@ -869,12 +1054,31 @@ class AccountPool:
                 "没有账号还有活动余额（已开启「只用活动余额」；"
                 "关闭它或等待每日额度重置）")
         if not candidates:
-            # nothing healthy: give single-account setups a chance to self-heal
-            all_enabled = [a for a in self.accounts if a.enabled and a.name not in exclude]
-            if not all_enabled:
+            # Nothing healthy: give single-account setups a chance to self-heal.
+            # The model filter still applies — re-login cannot grant an
+            # entitlement the upstream never returned, and letting such an
+            # account through would answer with a substituted model.
+            all_enabled = [a for a in self.accounts
+                           if a.enabled and a.name not in exclude
+                           and self.serves_model(a, model)]
+            if all_enabled:
+                candidates = all_enabled
+                self.log("没有健康账号，尝试对现有账号续期/重登")
+            elif requested and requested in self._known_models():
+                # Only now is the pool genuinely unable to serve this id:
+                # healthy AND self-heal candidates have both run out.  Saying
+                # so before trying to re-login turned a recoverable cooldown
+                # into a hard 400.
+                known = self.model_accounts(model)
+                if known:
+                    raise PoolError(
+                        f"没有可用账号能提供模型 {requested}（"
+                        f"{len(known)} 个账号有权限，但都在冷却/余额不足/会话失效）")
+                raise PoolError(
+                    f"账号池里没有账号有模型 {requested} 的权限"
+                    f"（上游可能已回收该权益；用 models 命令核对）")
+            else:
                 raise PoolError("账号池里没有可用账号（accounts.json 为空或全部禁用）")
-            candidates = all_enabled
-            self.log("没有健康账号，尝试对现有账号续期/重登")
 
         last: Optional[Exception] = None
         for acc in self._ordered(candidates):
@@ -1009,11 +1213,157 @@ class AccountPool:
         for thread in list(self._recovery_threads):
             thread.join(timeout)
 
+    # ------------------------------------------------------ model entitlements
+
+    def _note_models_locked(self, acc: Account, new: Sequence[str]) -> None:
+        """Record an entitlement transition for ``acc``.
+
+        Caller holds ``acc.models_lock``.  Only paid models are compared (see
+        ``model_events.classify``): the upstream renames and splits its free
+        ones, so a ``spark-x2.6`` → ``spark-x2.6-low`` shuffle is not a change
+        worth an entry.
+
+        ``acc.models is None`` means the catalogue was never fetched — that is
+        the baseline, not a transition, so it produces no event.
+        """
+        if acc.models is None:
+            return
+        event = classify(acc.models, new)
+        if not event:
+            return
+        entry = self.model_events.record(acc.name, event, acc.models, new)
+        if event == "downgrade":
+            self.log(f"账号 {acc.name} 被上游降级：失去 {', '.join(entry['lost'])}"
+                     f"（现可用 {len(new)} 个模型，已记入降级历史）")
+        else:
+            self.log(f"账号 {acc.name} 权限已恢复：新增 {', '.join(entry['gained'])}"
+                     f"（现可用 {len(new)} 个模型）")
+
+    def probe_models(self, accounts: Optional[Sequence[Account]] = None,
+                     *, workers: int = 4, persist: bool = True) -> Dict[str, Any]:
+        """Record each account's own ``/models`` answer onto ``Account.models``.
+
+        Returns the **union** of every catalogue seen, keyed by model id, so the
+        gateway can advertise what the pool can actually serve — not what one
+        arbitrary account happens to see.  Accounts that fail the probe keep
+        their previous (possibly ``None``) state: a transient network error is
+        not evidence that an entitlement was withdrawn.
+
+        ``persist`` exists for out-of-process callers (the CLI): writing
+        ``accounts.json`` from there would race the running gateway and could
+        overwrite a session it just renewed.
+        """
+        rows = list(accounts if accounts is not None else self.accounts)
+        rows = [a for a in rows if a.enabled and a.session_valid]
+        union: Dict[str, Dict[str, Any]] = {}
+        failed: List[str] = []
+        stale: List[tuple] = []
+        lock = threading.Lock()
+
+        def probe(acc: Account) -> None:
+            try:
+                payload = self.gateway.models(acc.session)
+            except Exception as exc:                    # noqa: BLE001
+                # ``Gateway.models`` raises for a business envelope (a dead
+                # session answers 200 + code 100002).  Keep the previous
+                # catalogue rather than reading the failure as "no models".
+                with lock:
+                    failed.append(f"{acc.name}: {exc}")
+                    # Only a rejected session justifies a re-login; a timeout
+                    # or upstream hiccup must not start one (a needless login
+                    # is a 顶号 for whoever else is using the account).
+                    status = getattr(exc, "status", 0)
+                    if status in (401, 403):
+                        stale.append((acc.name, status, bool(getattr(exc, "banned", False))))
+                return
+            raw_data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(raw_data, list):
+                # No ``data`` array at all: a malformed reply, not a verdict on
+                # entitlements.  Treating it as an empty catalogue wiped the
+                # account and recorded a bogus downgrade — the opposite of what
+                # this whole mechanism exists to prevent.
+                with lock:
+                    failed.append(f"{acc.name}: 响应缺少 data 列表")
+                return
+            data = [m for m in raw_data if isinstance(m, dict) and m.get("id")]
+            if not data:
+                # A well-formed but empty list is the upstream saying this
+                # account may use *nothing* right now.  That is genuine data,
+                # unlike a failed call, so record it: routing must not send
+                # any model here, and the panel should show the account as
+                # downgraded rather than healthy.
+                with acc.models_lock:
+                    self._note_models_locked(acc, ())
+                    acc.models = ()
+                    acc.models_updated_at = int(time.time())
+                return
+            ids = tuple(str(m["id"]) for m in data)
+            with acc.models_lock:
+                self._note_models_locked(acc, ids)
+                acc.models = ids
+                acc.models_updated_at = int(time.time())
+            with lock:
+                for m in data:
+                    union.setdefault(str(m["id"]), m)
+            # ``save`` snapshots this set under ``_lock`` while requests may be
+            # writing accounts.json concurrently; mutating it under the local
+            # probe lock alone allowed "Set changed size during iteration".
+            with self._lock:
+                self._seen_models.update(ids)
+
+        # Keep concurrency low.  Firing all probes at once trips the upstream's
+        # own throttling, which answers an empty catalogue for a handful of
+        # accounts — indistinguishable from "no entitlements" and silently
+        # dropping those accounts from routing.  Probing is a background task,
+        # so trading a little wall-clock for trustworthy data is the right way.
+        if len(rows) <= 1:
+            for acc in rows:
+                probe(acc)
+        else:
+            with ThreadPoolExecutor(max_workers=max(1, min(workers, 4))) as pool:
+                list(pool.map(probe, rows))
+        if rows and persist:
+            self.save(force=True)
+        if failed:
+            self.log(f"[warn] {len(failed)} 个账号的模型列表探测失败（保留上次结果）："
+                     + failed[0])
+        for name, status, banned in stale:
+            acc = self.get(name)
+            if acc is None or acc.in_cooldown:
+                continue
+            if banned:
+                self.mark_banned(acc, f"模型列表探测 HTTP {status}")
+                continue
+            # Do NOT go through ``report_failure``: that path erases the
+            # session for a 401 and starts a re-login.  A catalogue probe is a
+            # read that says nothing about the credentials' health — using it
+            # to delete a session turned a readable account into an
+            # unrecoverable one.  Bench it for the cooldown window instead, and
+            # let the *routing* path re-login if a real request also fails.
+            cooldown = float(self.cfg.get("cooldown_seconds") or 300)
+            acc.cooldown(cooldown, "模型列表探测被拒")
+            acc.last_error = f"models: HTTP {status}"
+            self.log(f"账号 {acc.name} 模型列表探测被拒（HTTP {status}）"
+                     f"→ 冷却 {cooldown:.0f}s（保留 session）")
+        return {"models": union, "probed": len(rows) - len(failed),
+                "failed": failed}
+
+    def model_stats(self) -> Dict[str, int]:
+        """How many accounts are entitled to each model id."""
+        counts: Dict[str, int] = {}
+        for acc in self.accounts:
+            if not acc.enabled or acc.banned:
+                continue
+            for mid in (acc.models or ()):
+                counts[mid] = counts.get(mid, 0) + 1
+        return counts
+
     def snapshot(self) -> Dict:
         return {
             "strategy": self.cfg.get("strategy"),
             "count": len(self.accounts),
             "usable": len(self.usable()),
+            "models": self.model_stats(),
             "accounts": [a.public_dict() for a in self.accounts],
         }
 
@@ -1026,7 +1376,13 @@ class AccountPool:
         self._thread = threading.Thread(target=self._loop, name="account-keeper",
                                         daemon=True)
         self._thread.start()
-        self.log("账号守护线程已启动（续期 + 额度刷新）")
+        # Catalogue probing lives on its own thread: it fans out over the whole
+        # pool and must neither delay renewals nor wait for the 30-minute tick.
+        if self._probe_thread is None or not self._probe_thread.is_alive():
+            self._probe_thread = threading.Thread(
+                target=self._model_probe_loop, name="model-probe", daemon=True)
+            self._probe_thread.start()
+        self.log("账号守护线程已启动（续期 + 额度刷新 + 模型权限定期探测）")
 
     def stop(self) -> None:
         self._stop.set()
@@ -1040,6 +1396,26 @@ class AccountPool:
                 self.tick()
             except Exception as exc:                    # noqa: BLE001
                 self.log(f"账号守护线程异常：{exc}")
+
+    def _model_probe_loop(self) -> None:
+        """Re-probe catalogues on its own thread.
+
+        Separate from :meth:`_loop` so the panel's refresh button acts within
+        seconds instead of waiting for the next 30-minute maintenance pass — and
+        so a slow probe cannot delay session renewal.
+        """
+        while not self._stop.is_set():
+            # Wake often enough to honour a request promptly; the cadence
+            # itself is enforced inside maybe_probe_models.
+            if self._stop.wait(20):
+                break
+            try:
+                if self.maybe_probe_models():
+                    raw = self.cfg.get("model_probe_minutes")
+                    self.log(f"已刷新模型权限（周期 "
+                             f"{'关闭' if raw is not None and float(raw) <= 0 else f'{float(raw) if raw is not None else 60:g} 分钟'}）")
+            except Exception as exc:                    # noqa: BLE001
+                self.log(f"刷新模型权限失败：{exc}")
 
     def _maintain(self, acc: Account, upgrade_days: float) -> None:
         try:
@@ -1075,6 +1451,37 @@ class AccountPool:
         with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
             list(pool.map(lambda a: self._maintain(a, upgrade_days), targets))
         self.save()
+
+    def request_model_probe(self) -> None:
+        """Ask the keeper to probe soon (panel "refresh" button).
+
+        Probes are network fan-out over the whole pool, so they must not run on
+        a request thread: a panel click used to block for minutes on a phone
+        link and bench accounts whose sessions were rejected along the way.
+        """
+        self._probe_requested.set()
+
+    def maybe_probe_models(self, force: bool = False) -> bool:
+        """Probe catalogues on a slow cadence while the keeper runs.
+
+        Entitlements come and go without any traffic (the upstream re-scopes
+        accounts on its own schedule), and ``accounts.json`` would otherwise
+        keep the list captured at the last startup — so a recovered account
+        never comes back and a newly downgraded one keeps taking paid traffic.
+        Returns True when a probe ran.
+        """
+        raw = self.cfg.get("model_probe_minutes")
+        minutes = 60.0 if raw is None else float(raw)
+        requested = self._probe_requested.is_set()
+        if minutes <= 0 and not requested:
+            return False                       # explicitly disabled
+        now = time.time()
+        if not requested and now - self._last_model_probe < minutes * 60:
+            return False
+        self._probe_requested.clear()
+        self._last_model_probe = now
+        self.probe_models()
+        return True
 
     def bootstrap(self) -> None:
         """Login/Fill any account that has no usable session.

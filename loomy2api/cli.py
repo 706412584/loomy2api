@@ -271,13 +271,24 @@ def cmd_identity(cfg, args) -> int:
 
 
 def cmd_models(cfg, args) -> int:
+    """List the pool's models and how many accounts can actually serve each.
+
+    The upstream catalogue is scoped per account, so probing one account shows
+    only *its* entitlements — an account downgraded to the free model hides
+    everything the rest of the pool still has.  This probes every account and
+    prints the union.
+    """
     pool = _pool(cfg)
-    client = ModelGateway(cfg)
-    acc = pool.acquire()
-    data = client.models(acc.session).get("data") or []
-    print(f"{'id':<26}{'倍率':<10}{'上下文':>10}  能力")
-    print("-" * 78)
-    for model in data:
+    # Read-only: the running gateway owns accounts.json, and writing it here could
+    # clobber a session it just renewed.
+    result = pool.probe_models(persist=False)
+    union = result["models"]
+    counts = pool.model_stats()
+    total = max(1, len([a for a in pool.accounts if a.enabled and a.session_valid]))
+    print(f"{'id':<26}{'倍率':<10}{'上下文':>10}  {'可用账号':>8}  能力")
+    print("-" * 86)
+    for mid in sorted(union):
+        model = union[mid]
         caps = model.get("capabilities") or {}
         tags = ",".join(k for k, v in (
             ("reasoning", caps.get("reasoning")),
@@ -287,8 +298,61 @@ def cmd_models(cfg, args) -> int:
         ) if v)
         name = str(model.get("name") or "")
         mult = name[name.rfind("x") : -1] if "x" in name else "-"
-        print(f"{model.get('id', ''):<26}{mult:<10}"
-              f"{str(model.get('context_length') or '-'):>10}  {tags}")
+        have = counts.get(mid, 0)
+        print(f"{mid:<26}{mult:<10}"
+              f"{str(model.get('context_length') or '-'):>10}  "
+              f"{have:>4}/{total:<3}  {tags}")
+    limited = [a for a in pool.accounts
+               if a.enabled and a.models is not None and len(a.models) == 1]
+    empty = [a for a in pool.accounts
+             if a.enabled and a.models is not None and len(a.models) == 0]
+    print(f"\n共 {len(union)} 个模型；探测 {result['probed']}/{total} 个账号"
+          f"（{len(result['failed'])} 个失败）")
+    if limited:
+        print(f"[warn] {len(limited)} 个账号被上游限制为单一模型："
+              + ", ".join(a.name for a in limited[:8])
+              + (" …" if len(limited) > 8 else ""))
+    if empty:
+        print(f"[warn] {len(empty)} 个账号上游返回空模型列表（不参与路由）："
+              + ", ".join(a.name for a in empty[:8])
+              + (" …" if len(empty) > 8 else ""))
+    return 0
+
+
+def cmd_model_events(cfg, args) -> int:
+    """Show the entitlement history recorded by the gateway.
+
+    Reads the file directly — the running gateway owns ``accounts.json``, but
+    the event log is append-only, so an out-of-process read is safe and does
+    not disturb routing.
+    """
+    from .model_events import ModelEventLog
+
+    path = cfg.path("accounts_file", "accounts.json").parent / "model_events.jsonl"
+    log = ModelEventLog(path)
+    events = log.events(account=args.name, days=args.days, limit=args.limit)
+    if not events:
+        print(f"最近 {args.days:g} 天没有模型权限变化记录（{path}）")
+        return 0
+    print(f"{'时间':<17}{'账号':<15}{'事件':<10}详情")
+    print("-" * 78)
+    for row in events:
+        when = time.strftime("%m-%d %H:%M:%S",
+                             time.localtime(float(row.get("at") or 0)))
+        kind = "降级" if row.get("event") == "downgrade" else "恢复"
+        detail = row.get("note") or (
+            "失去 " + ", ".join(row.get("lost") or [])
+            if kind == "降级"
+            else "新增 " + ", ".join(row.get("gained") or []))
+        print(f"{when:<17}{str(row.get('account'))[:14]:<15}{kind:<10}"
+              f"{detail}（现 {len(row.get('to') or [])} 个模型）")
+    print("-" * 78)
+    summary = log.summary(days=args.days)
+    still = [n for n, v in summary.items() if v.get("event") == "downgrade"]
+    if still:
+        print(f"[warn] {len(still)} 个账号最后一次变化是降级（尚未恢复）："
+              + ", ".join(sorted(still)[:10])
+              + (" …" if len(still) > 10 else ""))
     return 0
 
 
@@ -309,9 +373,10 @@ def cmd_quota(cfg, args) -> int:
 def cmd_chat(cfg, args) -> int:
     pool = _pool(cfg)
     client = ModelGateway(cfg)
-    acc = pool.acquire()
+    model = args.model or cfg.get("default_model") or C.DEFAULT_MODEL
+    acc = pool.acquire(model=model)
     payload = {
-        "model": args.model or cfg.get("default_model") or C.DEFAULT_MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": args.prompt}],
         "stream": False,
     }
@@ -321,8 +386,14 @@ def cmd_chat(cfg, args) -> int:
         print(f"HTTP {status}: {data[:400].decode('utf-8', 'replace')}")
         return 1
     obj = json.loads(data.decode("utf-8"))
+    served = str(obj.get("model") or "")
     message = (obj.get("choices") or [{}])[0].get("message") or {}
     print(f"[{acc.name} {time.time() - started:.1f}s] {message.get('content')}")
+    # The upstream answers 200 with a substituted model when the account lacks
+    # the entitlement.  Say so loudly: otherwise a degraded answer looks fine.
+    if served and served != model:
+        print(f"[warn] 上游实际使用的是 {served}，不是请求的 {model}"
+              f"（该账号没有 {model} 的权限）")
     print(f"usage: {json.dumps(obj.get('usage'), ensure_ascii=False)}")
     pool.report_success(acc, obj.get("usage") or {})
     pool.flush()
@@ -399,6 +470,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("quota", help="查看各账号积分")
     p.set_defaults(func=cmd_quota)
+
+    p = sub.add_parser("model-events", help="查看最近 7 天的模型权限变化（降级/恢复）")
+    p.add_argument("--days", type=float, default=7, help="回溯天数（默认 7）")
+    p.add_argument("--name", default="", help="只看某个账号")
+    p.add_argument("--limit", type=int, default=200)
+    p.set_defaults(func=cmd_model_events)
 
     p = sub.add_parser("chat", help="单次对话自检")
     p.add_argument("prompt")

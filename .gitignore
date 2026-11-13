@@ -33,6 +33,10 @@ legacy/
 *.apk
 accounts.json.bak*
 
+# per-deployment entitlement history, written beside accounts.json
+model_events.jsonl
+model_events.jsonl.*
+
 # ---- android build ----
 android/.gradle/
 android/.kotlin/

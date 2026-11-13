@@ -108,6 +108,11 @@ class FakeUpstream:
         #: That is what the upstream actually does, and ignoring it is what
         #: made the panel report "quota unknown" forever.
         self.points_session_invalid = False
+        #: Sessions whose ``/models`` answers **HTTP 200 + a business envelope**
+        #: (``code=100002 登录已失效``) instead of a catalogue.  The upstream
+        #: really does this, and reading it as an empty catalogue silently
+        #: removed the account from every routed model.
+        self.models_session_invalid: List[str] = []
         #: Sessions the upstream answers with **HTTP 200 + a JSON business
         #: envelope** (``code=100002 登录已失效``) instead of an SSE stream.
         #: That is what the real gateway does for a dead session, and treating
@@ -227,6 +232,10 @@ class FakeUpstream:
                 if fake.valid_sessions is not None and token not in fake.valid_sessions:
                     return fake._reject(self, 401, "invalid session")
                 if path.endswith("/models"):
+                    if token in fake.models_session_invalid:
+                        return fake._send_json(self, {
+                            "code": "100002", "desc": "登录已失效，请重新登录",
+                            "data": {}})
                     return fake._send_json(self, fake.models_payload)
                 if path.endswith("/points/records"):
                     if fake.points_session_invalid:
