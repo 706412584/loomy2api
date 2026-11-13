@@ -94,8 +94,13 @@ class TestStreamTranslator(unittest.TestCase):
         names = [e for e, _ in events]
         self.assertEqual(names[0], "message_start")
         self.assertEqual(names[-1], "message_stop")
+        # Thinking is block 0 and text block 1 — each block owns its own index.
+        # Sharing one (what this used to assert) would make the two blocks
+        # indistinguishable to the client.
         indexes = {d["index"] for e, d in events if e == "content_block_delta"}
-        self.assertEqual(indexes, {0})                     # thinking and text share idx 0
+        self.assertEqual(indexes, {0, 1})
+        self.assertEqual([d["index"] for e, d in events
+                          if e == "content_block_stop"], [0, 1])
         kinds = [d["content_block"]["type"] for e, d in events
                  if e == "content_block_start"]
         self.assertEqual(kinds, ["thinking", "text"])
