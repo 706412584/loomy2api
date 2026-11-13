@@ -249,8 +249,11 @@ def build_apks() -> None:
         env["JAVA_HOME"] = str(jdk)
         env["PATH"] = str(jdk / "bin") + os.pathsep + env.get("PATH", "")
         info(f"JAVA_HOME = {jdk}")
+    # cmd.exe resolves a bare name through PATH, not the working directory, so
+    # plain "gradlew.bat" is not found even with cwd set to android/.
     run(
-        ["cmd.exe", "/c", "gradlew.bat", ":app:assembleFullRelease", ":app:assembleLiteRelease"],
+        ["cmd.exe", "/c", str(ROOT / "android" / "gradlew.bat"),
+         ":app:assembleFullRelease", ":app:assembleLiteRelease"],
         cwd=ROOT / "android", env=env,
     )
     for apk in (APK_FULL, APK_LITE):
