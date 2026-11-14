@@ -95,6 +95,11 @@ DEFAULTS: Dict[str, Any] = {
     #: repair rotates the upstream password and logs the account out on every
     #: other device, so this caps the damage a failing repair loop could do.
     "password_repair_interval_hours": 24,
+    #: Verify every stored password once at startup and repair the rejected
+    #: ones while their session still works.  The keeper only renews sessions
+    #: that are about to expire, so without this an invalidated password goes
+    #: unnoticed until the account dies at expiry.
+    "password_audit_on_startup": True,
     #: Give password-less accounts a random password shortly before their
     #: session expires.  Same "顶号" trade-off as above; also defaults to off
     #: on mobile, where the account list is shared with the phone's own client.

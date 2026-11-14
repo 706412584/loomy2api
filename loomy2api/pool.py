@@ -85,6 +85,7 @@ class AccountPool:
         #: wake-up instead of blocking a request thread on a pool-wide probe.
         self._probe_requested = threading.Event()
         self._probe_thread: Optional[threading.Thread] = None
+        self._password_thread: Optional[threading.Thread] = None
         self.load()
 
     def _account_lock(self, name: str) -> threading.Lock:
@@ -1395,7 +1396,51 @@ class AccountPool:
             self._probe_thread = threading.Thread(
                 target=self._model_probe_loop, name="model-probe", daemon=True)
             self._probe_thread.start()
-        self.log("账号守护线程已启动（续期 + 额度刷新 + 模型权限定期探测）")
+        # Password health check on startup.  The keeper only renews sessions
+        # that are *expiring*, so an account whose password was invalidated
+        # upstream kept its dead password for weeks and then died at expiry.
+        # Checking once at startup repairs it while the session still works.
+        self._password_thread = threading.Thread(
+            target=self._audit_passwords_once, name="password-audit", daemon=True)
+        self._password_thread.start()
+        self.log("账号守护线程已启动（续期 + 额度刷新 + 模型权限探测 + 密码巡检）")
+
+    def _audit_passwords_once(self) -> None:
+        """Verify every stored password once, repairing the rejected ones.
+
+        Repair is capped to one rotation per account per day (see
+        ``_repair_password``), so restarting the gateway repeatedly cannot
+        turn this into a 顶号 storm.
+        """
+        if not bool(self.cfg.get("auto_repair_password", True)):
+            self.log("密码巡检：自动改密已关闭，跳过")
+            return
+        if not bool(self.cfg.get("password_audit_on_startup", True)):
+            return
+        targets = [a for a in self.accounts
+                   if a.enabled and a.persist and a.has_password]
+        if not targets:
+            return
+        self.log(f"密码巡检：检查 {len(targets)} 个账号的密码是否仍可用")
+        repaired = failed = 0
+
+        def check(acc: Account) -> None:
+            nonlocal repaired, failed
+            if acc.password_verified_at:
+                return                          # proven by a real login already
+            if not acc.session_valid:
+                return                          # cannot rotate without a session
+            if self.verify_password(acc):
+                return
+            if self._repair_password(acc, reason="启动密码巡检"):
+                repaired += 1
+            else:
+                failed += 1
+
+        with ThreadPoolExecutor(max_workers=min(4, len(targets))) as pool:
+            list(pool.map(check, targets))
+        self.save(force=True)
+        self.log(f"密码巡检完成：修复 {repaired} 个，仍失败 {failed} 个")
 
     def stop(self) -> None:
         self._stop.set()

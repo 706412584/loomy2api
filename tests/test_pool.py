@@ -624,6 +624,65 @@ class TestSessionLifecycle(unittest.TestCase):
         self.assertFalse(pool._repair_password(acc, reason="test"))
         self.assertEqual(len(rotates), 1)
 
+    def test_startup_audit_repairs_a_rejected_password(self):
+        """The keeper only renews expiring sessions, so a password that the
+        upstream invalidated sat dead until the session finally expired.
+
+        The startup audit proves every stored password and rotates the ones
+        the upstream rejects, while the session is still able to do it.
+        """
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            # 10 days left: far outside the renewal window, so only the audit
+            # will look at it.
+            {"name": "stale", "loginid": "13800000001", "password": "dead",
+             "session": "s1", "expireAt": int(time.time()) + 10 * 86400},
+            # Already proven: the audit must leave it alone.
+            {"name": "ok", "loginid": "13800000002", "password": "good",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "s2", "expireAt": int(time.time()) + 10 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        rotated = []
+
+        class FakeClient:
+            def login_by_password(self, loginid, password, identity=None):
+                from loomy2api.account import AccountError
+                if password == "dead":
+                    raise AccountError("密码错误", code="220204")
+                return {"session": "fresh", "userid": "u"}
+
+            def set_password(self, session, new_password, identity=None):
+                rotated.append(session)
+
+        pool.client = FakeClient()
+        pool._audit_passwords_once()
+
+        stale, ok = pool.get("stale"), pool.get("ok")
+        self.assertEqual(rotated, ["s1"])              # only the stale one
+        self.assertTrue(stale.password_verified_at > 0)   # proven after rotation
+        self.assertNotEqual(stale.password, "dead")       # a new one was generated
+        self.assertEqual(ok.password, "good")             # untouched
+        self.assertTrue(ok.password_verified_at > 0)
+
+    def test_startup_audit_can_be_disabled(self):
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "stale", "loginid": "13800000001", "password": "dead",
+             "session": "s1", "expireAt": int(time.time()) + 10 * 86400},
+        ])
+        self.cfg["password_audit_on_startup"] = False
+        pool = AccountPool(self.cfg)
+
+        class FakeClient:
+            def login_by_password(self, *a, **k):
+                raise AssertionError("audit must not run")
+
+        pool.client = FakeClient()
+        pool._audit_passwords_once()                   # no exception
+
     def test_repair_stamp_is_persisted(self):
         from tests.support import write_accounts
 
