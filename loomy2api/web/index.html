@@ -3,12 +3,27 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>loomy2api · 控制面板</title>
+<title>loomy2api · 账号工作台</title>
+<script>
+  const themeMode = localStorage.getItem('loomy2api_theme') || 'auto';
+  document.documentElement.dataset.theme = themeMode === 'auto'
+    ? (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : themeMode;
+</script>
 <style>
   :root{
-    --bg:#0f1115; --panel:#171a21; --panel2:#1d212a; --line:#272c38;
-    --fg:#e6e9ef; --muted:#9aa3b8; --accent:#5b9dff; --ok:#3ecf8e;
-    --warn:#f5a524; --bad:#f2545b; --radius:10px;
+    color-scheme:light;
+    --bg:#f6f8f7; --panel:#fff; --panel2:#eef2f0; --line:#e4eae7;
+    --fg:#1c2420; --muted:#5b6b64; --faint:#8a9992; --accent:#12a66b;
+    --accent-weak:#e3f6ec; --ok:#16a34a; --warn:#d9821f; --bad:#e5484d;
+    --shadow:0 1px 2px rgba(20,40,32,.05),0 2px 8px rgba(20,40,32,.05);
+    --radius:12px;
+  }
+  :root[data-theme=dark]{
+    color-scheme:dark;
+    --bg:#121614; --panel:#1c221f; --panel2:#212825; --line:#2a322e;
+    --fg:#e8eeea; --muted:#a3b2ab; --faint:#6f7d76; --accent:#22c07f;
+    --accent-weak:#16352a; --ok:#34c46a; --warn:#f09a3e; --bad:#f05f64;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 2px 10px rgba(0,0,0,.25);
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
@@ -178,71 +193,172 @@
     .grid{grid-template-columns:1fr}
     #inviteWrap .row{gap:8px}
   }
+  /* Workbench shell, adapted from wanneng2api's green/gray visual language. */
+  :root{--border:var(--line)}
+  body{min-width:320px}
+  button:hover{color:var(--accent)}
+  button.primary{color:#fff;background:var(--accent);border-color:var(--accent)}
+  button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,
+  tr:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .card,.metric,section,.app-sidebar,.app-topbar{border-color:var(--line);box-shadow:var(--shadow)}
+  .card .v,.num{font-variant-numeric:tabular-nums}
+  pre#log,.pwd-reveal,#regLog{background:var(--bg);color:var(--muted)}
+  .app-shell{display:flex;min-height:100vh}
+  .app-sidebar{position:fixed;inset:0 auto 0 0;width:216px;padding:14px 10px;
+    background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;z-index:4}
+  .brand{display:flex;align-items:center;gap:9px;padding:6px 10px 18px;font-weight:700;font-size:15px}
+  .brand-logo{width:32px;height:32px;display:grid;place-items:center;border-radius:9px;
+    background:linear-gradient(135deg,var(--accent),#0b7a4e);color:#fff;font-weight:800}
+  .nav-group{padding:12px 10px 5px;color:var(--faint);font-size:11px;letter-spacing:.5px}
+  .nav-item{display:flex;align-items:center;gap:9px;width:100%;height:auto;padding:9px 10px;
+    border:0;background:none;color:var(--muted);text-align:left;font-size:13px;text-decoration:none}
+  .nav-item:hover,.nav-item.active{background:var(--accent-weak);color:var(--accent)}
+  .nav-item .ico{width:18px;text-align:center}
+  .sidebar-foot{margin-top:auto;padding:10px 0 0}
+  .app-main{margin-left:216px;min-width:0;flex:1}
+  .app-topbar{height:56px;display:flex;align-items:center;gap:12px;padding:0 22px;
+    background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:3}
+  .app-topbar h1{font-size:17px;margin:0}
+  .topbar-spacer{flex:1}
+  .health-pill{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+  .health-dot{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+  .app-main .wrap{max-width:1440px;padding:20px 22px 50px;margin:0 auto}
+  [data-view]{display:none}
+  [data-view].active-view{display:block;animation:view-enter .14s ease-out}
+  @keyframes view-enter{from{opacity:.6;transform:translateY(3px)}to{opacity:1;transform:none}}
+  .app-main .wrap>header{margin:0 0 16px}
+  .section-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .section-actions{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+  .toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 12px}
+  .toolbar input{width:240px}.toolbar select{width:145px}
+  .toolbar-spacer{flex:1}.toolbar-meta{font-size:12px;color:var(--muted)}
+  .selection-bar{display:flex;align-items:center;gap:7px;flex-wrap:wrap;
+    padding:10px 12px;margin:0 0 12px;border:1px solid var(--line);border-radius:9px;
+    background:var(--panel2)}
+  .selection-bar button{height:30px;padding:0 9px}
+  .selection-bar .selected-count{font-weight:600;color:var(--accent);margin-right:4px}
+  .account-check{width:17px;height:17px;accent-color:var(--accent);margin:0}
+  .check-col{width:36px;text-align:center}
+  .account-tools{display:flex;gap:8px;flex-wrap:wrap;padding:10px 0 0;margin-top:8px;
+    border-top:1px solid var(--line)}
+  .account-tools small{color:var(--muted);align-self:center;margin-right:5px}
+  .empty-filter{padding:24px;text-align:center;color:var(--muted)}
+  .quota-cooldown{display:block;font-size:11px;margin-top:3px;color:var(--warn)}
+  @media(max-width:900px){
+    .app-shell{display:block}
+    .app-sidebar{scrollbar-width:none}.app-sidebar::-webkit-scrollbar{display:none}
+    .app-sidebar{position:static;width:100%;padding:10px 12px;border-right:0;
+      border-bottom:1px solid var(--line);flex-direction:row;align-items:center;gap:5px;overflow-x:auto}
+    .brand{padding:0 8px 0 0;white-space:nowrap}.nav-group,.sidebar-foot .nav-item span:last-child{display:none}
+    .nav-item{width:auto;white-space:nowrap;padding:7px 9px}.nav-item .ico{width:auto}
+    .sidebar-foot{margin:0 0 0 auto;padding:0}.app-main{margin-left:0}.app-topbar{height:48px}
+    .app-main .wrap{padding:16px 14px 40px}
+  }
+  @media(max-width:760px){
+    .app-sidebar{gap:2px}.brand{font-size:13px}.brand-logo{width:27px;height:27px}
+    .app-sidebar .nav-item{font-size:12px;padding:7px}.app-topbar{padding:0 14px}
+    .toolbar input,.toolbar select{width:100%;flex:1 1 140px}.toolbar-spacer{display:none}
+    .selection-bar{padding:10px}.selection-bar button{height:36px;flex:1 1 auto}
+    .section-head{width:100%}.section-actions{margin-left:0;width:100%}
+    .account-check{width:22px;height:22px}
+    tbody td.check-col{display:block;text-align:left;padding:0 0 7px}
+    tbody td.check-col::before{content:none}
+    .account-tools button{height:38px}
+  }
+  @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
 </style>
 </head>
 <body>
-<div class="wrap">
-
-  <header>
-    <h1>loomy2api<span>控制面板 / control panel</span></h1>
-    <div class="row">
-      <input id="apiKey" type="password" placeholder="API Key（如需）" style="width:170px">
-      <button id="saveKey">保存 Key</button>
-      <label class="row" style="margin:0;color:var(--muted)">
-        选号
-        <select id="strategy" style="min-width:130px">
-          <option value="balance">余额均衡</option>
-          <option value="daily">先用活动余额</option>
-          <option value="permanent">先用永久余额</option>
-          <option value="round_robin">顺序轮询</option>
-          <option value="lru">最久未用</option>
-          <option value="weighted">加权随机</option>
-        </select>
-      </label>
-      <label class="row" style="margin:0;color:var(--muted)" title="只使用每日活动额度，绝不消耗永久积分。活动额度用完后请求会失败，等待次日重置。">
-        <input id="dailyOnly" type="checkbox" style="min-width:auto"> 只用活动余额
-      </label>
-      <label class="row" style="margin:0;color:var(--muted)" title="被上游降级到免费档的账号不参与调度。这类账号仍能应答，但请求付费模型会被静默换成免费模型（返回 200、不计积分），输出质量下降且无从察觉。关掉可把免费档当兜底使用。">
-        <input id="excludeDowngraded" type="checkbox" style="min-width:auto"> 排除降级账号
-      </label>
-      <label class="row" style="margin:0;color:var(--muted)"
-             title="流式响应「毫无进展」多少秒后放弃。只要上游还在吐任何字节（含纯思考 reasoning），就重新计时——推理模型长时间思考不算卡住。改大能减少长思考被误掐（客户端会看到 upstream stream interrupted）。">
-        流超时
-        <input id="streamStall" type="number" min="30" step="30" style="width:74px"> 秒
-      </label>
-      <label class="row" style="margin:0;color:var(--muted)">
-        <input id="auto" type="checkbox" checked style="min-width:auto"> 自动刷新
-      </label>
-      <button id="setAllPasswords">一键设置密码</button>
-      <button id="checkPool">检测续期</button>
-      <button id="showSmsReg" hidden>接码注册</button>
+<div class="app-shell">
+  <aside class="app-sidebar">
+    <div class="brand"><span class="brand-logo">L</span><span>loomy2api</span></div>
+    <div class="nav-group">工作区</div>
+    <a class="nav-item" href="#overview"><span class="ico">▤</span><span>概览</span></a>
+    <a class="nav-item active" href="#accounts"><span class="ico">▦</span><span>账号池</span></a>
+    <a class="nav-item" href="#models"><span class="ico">◇</span><span>模型</span></a>
+    <div class="nav-group">运维</div>
+    <a class="nav-item" href="#points"><span class="ico">↻</span><span>积分与任务</span></a>
+    <a class="nav-item" href="#logs"><span class="ico">▥</span><span>运行日志</span></a>
+    <a class="nav-item" href="#settings"><span class="ico">⚙</span><span>网关设置</span></a>
+    <div class="sidebar-foot"><button class="nav-item" id="themeToggle" title="切换浅色 / 深色 / 跟随系统"><span class="ico">◐</span><span>主题</span></button></div>
+  </aside>
+  <main class="app-main">
+    <header class="app-topbar"><h1 id="viewTitle">账号池</h1><div class="topbar-spacer"></div>
+      <span class="health-pill"><i class="health-dot"></i><span id="gatewayHealth">网关运行中</span></span>
       <button class="primary" id="refresh">刷新额度</button>
+    </header>
+<div class="wrap">
+  <div id="overview" data-view="overview">
+  <section><h2>运行概览 <small>overview</small></h2>
+  <div class="cards" id="cards"></div></section>
+  </div>
+
+  <section id="settings" data-view="settings"><h2>网关设置 <small>routing & access</small></h2>
+    <div class="grid">
+      <div><label for="apiKey">API Key（如需）</label><div class="row"><input id="apiKey" type="password" placeholder="Bearer / x-api-key"><button id="saveKey">保存</button></div></div>
+      <div><label for="strategy">选号策略</label><select id="strategy">
+        <option value="balance">余额均衡</option><option value="daily">先用活动余额</option>
+        <option value="permanent">先用永久余额</option><option value="round_robin">顺序轮询</option>
+        <option value="lru">最久未用</option><option value="weighted">加权随机</option></select></div>
+      <div><label for="streamStall">流无进展超时（秒）</label><input id="streamStall" type="number" min="30" step="30"></div>
     </div>
-  </header>
+    <div class="row" style="margin-top:12px">
+      <label class="row" style="margin:0"><input id="dailyOnly" type="checkbox"> 只用活动余额</label>
+      <label class="row" style="margin:0" title="降级账号无法提供付费模型，默认不参与路由"><input id="excludeDowngraded" type="checkbox"> 排除降级账号</label>
+      <label class="row" style="margin:0"><input id="auto" type="checkbox" checked> 自动刷新</label>
+    </div>
+  </section>
 
-  <div class="cards" id="cards"></div>
-
-  <section>
-    <h2>账号 <small>accounts</small>
-      <span style="float:right">
+  <section id="accounts" data-view="accounts">
+    <h2 class="section-head">账号池 <small>accounts</small>
+      <span class="section-actions">
         <button id="showImport">导入账号</button>
         <button id="exportAccounts">导出账号</button>
         <button class="primary" id="showAdd">＋ 添加账号</button>
       </span>
     </h2>
+    <div class="toolbar">
+      <input id="accountSearch" type="search" placeholder="搜索名称、手机号、设备标识…" aria-label="搜索账号">
+      <select id="accountStatus" aria-label="按状态筛选">
+        <option value="all">全部状态</option><option value="usable">可调度</option>
+        <option value="ok">正常</option><option value="quota">额度冷却</option>
+        <option value="cooldown">其他冷却</option><option value="disabled">已禁用</option>
+        <option value="banned">已封禁</option><option value="session">无登录态</option>
+        <option value="downgraded">降级 / 无模型</option><option value="expiring">即将到期</option>
+        <option value="empty">额度为零</option>
+      </select>
+      <select id="accountSort" aria-label="账号排序"><option value="default">默认排序</option>
+        <option value="available">可用积分</option><option value="requests">请求数</option>
+        <option value="failures">失败数</option><option value="expiry">session 到期</option></select>
+      <span class="toolbar-spacer"></span><span id="accountCount" class="toolbar-meta"></span>
+      <button id="clearFilters">重置筛选</button>
+    </div>
+    <div class="selection-bar">
+      <strong class="selected-count" id="selectedCount">已选 0 个</strong>
+      <button data-batch="reset">重置冷却</button><button data-batch="enable">启用</button>
+      <button data-batch="disable">禁用</button><button data-batch="check">检测续期</button>
+      <button data-batch="checkin">签到</button><button data-batch="onboarding">新手任务</button>
+      <button id="clearSelection">清空选择</button>
+    </div>
+    <div class="hint" id="batchMsg" style="margin:0 0 10px">批量操作只作用于勾选账号；检测续期不强制重登健康账号。重置冷却不代表上游额度已恢复。</div>
     <table>
       <thead>
         <tr>
+          <th class="check-col"><input id="selectVisible" class="account-check" type="checkbox" aria-label="选择当前筛选结果" title="选择当前筛选结果"></th>
           <th>名称</th><th>手机号</th><th>状态</th><th>剩余</th><th>号龄</th>
           <th>可用积分</th><th>请求</th><th>扣分</th><th>设备标识</th><th>操作</th>
         </tr>
       </thead>
-      <tbody id="rows"><tr><td colspan="10" class="muted">加载中…</td></tr></tbody>
+      <tbody id="rows"><tr><td colspan="11" class="muted">加载中…</td></tr></tbody>
     </table>
     <div class="hint" id="poolHint"></div>
+    <div class="account-tools"><small>全池工具（不取决于勾选）</small>
+      <button id="checkPool">检测续期</button><button id="setAllPasswords">一键设置密码</button>
+      <button id="showSmsReg" hidden>接码注册</button>
+    </div>
   </section>
 
-  <section>
+  <section id="models" data-view="models">
     <h2>模型列表 <small id="modelCount">models</small>
       <button id="loadModels" style="float:right">刷新模型（含倍率）</button>
     </h2>
@@ -258,7 +374,7 @@
     <div class="hint">倍率即积分消耗系数（越低越便宜），从上游模型名中解析；「限时免费」等未标注倍率的模型显示为 —。</div>
   </section>
 
-  <section>
+  <section id="points" data-view="points">
     <h2>积分与邀请码 <small id="pointsFor">points &amp; invites</small>
       <select id="pointsAccount" style="margin-left:10px;font-weight:normal"></select>
       <button id="pointsToggle" class="mobile-only">展开</button>
@@ -299,7 +415,7 @@
     </div><!-- /pointsBody -->
   </section>
 
-  <section>
+  <section id="logs" data-view="logs">
     <h2>运行日志 <small>recent log</small></h2>
     <div class="row" style="margin-bottom:8px">
       <button id="loadLog">刷新日志</button>
@@ -316,6 +432,8 @@
       控制面板 API: GET /api/panel/state · POST /api/panel/accounts · /accounts/update · /accounts/remove · /accounts/renew · /accounts/check · /accounts/identity · /accounts/password · /accounts/passwords · /refresh
     </div>
   </details>
+</div>
+  </main>
 </div>
 <div id="toast"></div>
 
@@ -345,6 +463,118 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let KEY = localStorage.getItem('loomy2api_key') || '';
+const SELECTED_ACCOUNTS = new Set();
+let BATCH_RUNNING = false;
+
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
+function accountStatus(a) {
+  const models = ((LAST_STATE && LAST_STATE.totals && LAST_STATE.totals.model_ids) || []);
+  if (!a.enabled) return 'disabled';
+  if (a.banned) return 'banned';
+  if (a.in_cooldown) return a.cooldown_reason === 'quota' ? 'quota' : 'cooldown';
+  if (!a.session) return 'session';
+  if ((Array.isArray(a.models) && a.models.length === 0) || isDowngraded(a, models)) return 'downgraded';
+  if (!a.permanent && a.session_days_left !== null && a.session_days_left < 3) return 'expiring';
+  if (a.available === 0) return 'empty';
+  return 'ok';
+}
+
+function isUsable(a) { return accountStatus(a) === 'ok'; }
+
+function visibleAccounts() {
+  const q = ($('accountSearch').value || '').trim().toLowerCase();
+  const status = $('accountStatus').value;
+  const sort = $('accountSort').value;
+  const accounts = ((LAST_STATE && LAST_STATE.accounts) || []).filter(a => {
+    const text = [a.name, a.loginid, a.loginid_masked, a.identity && a.identity.devid]
+      .join(' ').toLowerCase();
+    return (!q || text.includes(q)) && (status === 'all'
+      || (status === 'usable' ? isUsable(a) : accountStatus(a) === status));
+  });
+  if (sort !== 'default') {
+    const value = a => sort === 'expiry' ? (a.expire_at || Infinity)
+      : (a[sort] ?? -1);
+    accounts.sort((a, b) => {
+      const diff = sort === 'expiry' ? value(a) - value(b) : value(b) - value(a);
+      return diff || a.name.localeCompare(b.name);
+    });
+  }
+  return accounts;
+}
+
+function renderSelection(visible) {
+  const alive = new Set(((LAST_STATE && LAST_STATE.accounts) || []).map(a => a.name));
+  [...SELECTED_ACCOUNTS].forEach(n => { if (!alive.has(n)) SELECTED_ACCOUNTS.delete(n); });
+  $('selectedCount').textContent = '已选 ' + SELECTED_ACCOUNTS.size + ' 个';
+  document.querySelectorAll('[data-batch]').forEach(b => {
+    b.disabled = BATCH_RUNNING || SELECTED_ACCOUNTS.size === 0;
+  });
+  $('clearSelection').disabled = SELECTED_ACCOUNTS.size === 0;
+  const selectedVisible = visible.filter(a => SELECTED_ACCOUNTS.has(a.name)).length;
+  $('selectVisible').checked = visible.length > 0 && selectedVisible === visible.length;
+  $('selectVisible').indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+}
+
+function renderAccountRows() {
+  const visible = visibleAccounts();
+  $('accountCount').textContent = '可见 ' + visible.length + ' / '
+    + ((LAST_STATE && LAST_STATE.accounts) || []).length + ' 个';
+  if (!visible.length) {
+    $('rows').innerHTML = '<tr><td colspan="11" class="empty-filter">'
+      + (((LAST_STATE && LAST_STATE.accounts) || []).length
+        ? '没有符合搜索或筛选条件的账号' : '还没有账号，点击「添加账号」开始') + '</td></tr>';
+    renderSelection(visible);
+    return;
+  }
+  $('rows').innerHTML = visible.map(a => {
+    const id = a.identity || {};
+    return '<tr data-name="' + esc(a.name) + '" style="cursor:pointer" tabindex="0">'
+      + '<td class="check-col"><input class="account-check" type="checkbox" data-account="'
+        + esc(a.name) + '" aria-label="选择 ' + esc(a.name) + '" '
+        + (SELECTED_ACCOUNTS.has(a.name) ? 'checked' : '') + '></td>'
+      + '<td data-label="账号"><b>' + esc(a.name) + '</b><div class="mono">'
+        + (a.source === 'client' ? 'client 导入' : (a.mode === 'session' ? '仅 session' : '密码账号'))
+        + (a.permanent ? ' · <span style="color:var(--ok)">永久</span>'
+           : (a.password_set_at ? ' · <span style="color:var(--warn)">密码未验证</span>' : ''))
+        + (a.activated === true ? ' · 已激活' : (a.activated === false ? ' · 未激活' : ''))
+        + '</div></td>'
+      + '<td data-label="手机号" class="mono">' + esc(a.loginid_masked || '—') + '</td>'
+      + '<td data-label="状态">' + badge(a) + '</td>'
+      + '<td data-label="剩余">' + remainingText(a) + '</td>'
+      + '<td data-label="号龄">' + ageCell(a) + '</td>'
+      + '<td data-label="可用积分"><span><b>' + num(a.available) + '</b><div class="mono">余额 '
+        + num(a.balance) + ' + 每日 ' + num(a.daily_balance) + '</div></span></td>'
+      + '<td data-label="请求">' + a.requests + '</td><td data-label="扣分">' + a.points_used + '</td>'
+      + '<td data-label="设备" class="mono" title="' + esc(id.campus_device_id || '') + '">'
+        + esc(id.devid || '—') + '</td>'
+      + '<td class="act"><button data-manage="' + esc(a.name) + '">管理</button></td></tr>';
+  }).join('');
+  $('rows').querySelectorAll('input[data-account]').forEach(cb => {
+    cb.onclick = e => e.stopPropagation();
+    cb.onchange = () => {
+      if (cb.checked) SELECTED_ACCOUNTS.add(cb.dataset.account);
+      else SELECTED_ACCOUNTS.delete(cb.dataset.account);
+      renderSelection(visibleAccounts());
+    };
+  });
+  $('rows').querySelectorAll('tr[tabindex]').forEach(row => {
+    row.onclick = () => openAccountModal(row.dataset.name);
+    row.querySelector('[data-manage]').onclick = e => {
+      e.stopPropagation(); openAccountModal(row.dataset.name);
+    };
+    row.onkeydown = e => {
+      if (e.target === row && (e.key === 'Enter' || e.key === ' ')) {
+        e.preventDefault(); row.click();
+      }
+    };
+  });
+  renderSelection(visible);
+}
+
 
 function toast(msg, kind) {
   const el = document.createElement('div');
@@ -423,7 +653,13 @@ function downgradedBadge(a) {
 function badge(a) {
   if (!a.enabled) return '<span class="badge b-off">已禁用</span>';
   if (a.banned) return '<span class="badge b-bad">已封禁</span>';
-  if (a.in_cooldown) return '<span class="badge b-warn">冷却 ' + Math.round(a.cooldown_seconds_left) + 's</span>';
+  if (a.in_cooldown) {
+    if (a.cooldown_reason === 'quota') {
+      return '<span class="badge b-warn">额度冷却</span><small class="quota-cooldown">至 '
+        + fmtTime(a.cooldown_until) + '（次日 00:00）</small>';
+    }
+    return '<span class="badge b-warn">冷却 ' + Math.round(a.cooldown_seconds_left) + 's</span>';
+  }
   if (!a.session) return '<span class="badge b-bad">无登录态</span>';
   // An entitlement downgrade outranks the balance/session states below: the
   // account answers fine, it just cannot serve most models any more.
@@ -506,33 +742,13 @@ function render(state) {
     + (c.auth_required ? ' · 面板已开启 API Key 校验' : ' · 面板未设 API Key（仅本机使用）');
 
   if (!state.accounts.length) {
-    $('rows').innerHTML = '<tr><td colspan="10" class="muted">还没有账号，用下面的表单添加</td></tr>';
+    LAST_STATE = state;
+    renderAccountRows();
     return;
   }
   fillAccountPicker(state);
   LAST_STATE = state;
-  $('rows').innerHTML = state.accounts.map(a => {
-    const id = a.identity || {};
-    // data-label feeds the card layout on phones; the desktop table ignores it
-    return '<tr onclick="openAccountModal(\'' + a.name + '\')" style="cursor:pointer">'
-      + '<td data-label="账号"><b>' + a.name + '</b><div class="mono">'
-        + (a.source === 'client' ? 'client 导入' : (a.mode === 'session' ? '仅 session' : '密码账号'))
-        + (a.permanent ? ' · <span style="color:var(--ok)">永久</span>'
-           : (a.password_set_at ? ' · <span style="color:var(--warn)">密码未验证</span>' : ''))
-        + (a.activated === true
-            ? ' · <span style="color:var(--ok)">已激活</span>'
-            : (a.activated === false
-                ? ' · <span style="color:var(--warn)">未激活</span>' : ''))
-        + '</div></td>'
-      + '<td data-label="手机号" class="mono">' + (a.loginid_masked || '—') + '</td>'
-      + '<td data-label="状态">' + badge(a) + '</td>'
-      + '<td data-label="剩余">' + remainingText(a) + '</td>'
-      + '<td data-label="号龄">' + ageCell(a) + '</td>'
-      + '<td data-label="可用积分"><span><b>' + num(a.available) + '</b><div class="mono">余额 ' + num(a.balance) + ' + 每日 ' + num(a.daily_balance) + '</div></span></td>'
-      + '<td data-label="请求">' + a.requests + '</td><td data-label="扣分">' + a.points_used + '</td>'
-      + '<td data-label="设备" class="mono" title="' + (id.campus_device_id || '') + '">' + (id.devid || '—') + '</td>'
-      + '<td class="act"><button onclick="event.stopPropagation();openAccountModal(\'' + a.name + '\')">管理</button></td></tr>';
-  }).join('');
+  renderAccountRows();
 }
 
 function pickAndLoad(name) {
@@ -542,6 +758,7 @@ function pickAndLoad(name) {
     POINTS_ACC = name; localStorage.setItem('loomy2api_points_acc', name);
   }
   document.querySelector('#pointsAccount').scrollIntoView({behavior: 'smooth', block: 'center'});
+  location.hash = 'points';
   loadPoints();
 }
 
@@ -609,6 +826,7 @@ function openAccountModal(name) {
     + '<button onclick="modalAct(\'checkin\')">每日签到</button>'
     + '<button onclick="modalAct(\'onboarding\')">新手任务</button>'
     + '<button onclick="modalAct(\'renew\')">续期重登</button>'
+    + '<button onclick="modalAct(\'reset\')" title="只清除本地冷却，不触发重登">重置冷却</button>'
     + '<button onclick="modalAct(\'password\')">'
     + (a.permanent ? '重设密码' : '设置密码') + '</button>'
     + '<button onclick="modalAct(\'showpwd\')">显示密码</button>'
@@ -760,7 +978,8 @@ async function modalAct(kind) {
     if (kind === 'points') {
       const data = await api('/api/panel/points?name=' + encodeURIComponent(name));
       renderPoints(data);
-      modalMsg('已加载积分（下方积分区同步更新）');
+      modalMsg('已加载积分，正在打开积分视图');
+      location.hash = 'points';
     } else if (kind === 'checkin') {
       const res = await api('/api/panel/points/checkin', {
         method: 'POST', body: JSON.stringify({name})});
@@ -824,6 +1043,7 @@ async function modalAct(kind) {
     } else {
       const map = {
         renew: ['/api/panel/accounts/renew', {name}],
+        reset: ['/api/panel/accounts/reset-cooldown', {name}],
         identity: ['/api/panel/accounts/identity', {name, regenerate: true}],
         toggle: ['/api/panel/accounts/update', {name, enabled: !acc.enabled}],
       };
@@ -1275,21 +1495,25 @@ async function doInviteAuto() {
  * client does the same).  A transient failure (5xx / timeout) is retried once;
  * anything else is reported as-is.  The two batch buttons below reuse it.
  */
-async function runBatchPool(label, action) {
+async function runBatchPool(label, action, selectedOnly = false) {
+  if (BATCH_RUNNING) { toast('已有批量任务在执行', 'err'); return; }
   const accounts = ((LAST_STATE && LAST_STATE.accounts) || []).filter(
-    a => a.enabled && a.session && !a.in_cooldown);
+    a => selectedOnly ? SELECTED_ACCOUNTS.has(a.name)
+      : a.enabled && a.session && !a.in_cooldown);
   if (!accounts.length) {
-    $('pointsMsg').textContent = '没有可用账号';
-    toast('没有可用账号', 'err');
+    toast(selectedOnly ? '请先选择账号' : '没有可用账号', 'err');
     return;
   }
-  const btns = [$('doBatchCheckin'), $('doBatchOnboarding'), $('doInviteAuto')];
+  BATCH_RUNNING = true;
+  const btns = [$('doBatchCheckin'), $('doBatchOnboarding'), $('doInviteAuto'),
+    ...document.querySelectorAll('[data-batch]')];
   btns.forEach(b => b && (b.disabled = true));
 
   let done = 0, ok = 0;
   const failures = [];
   const setMsg = () => {
-    $('pointsMsg').textContent = label + '：' + done + '/' + accounts.length
+    const target = selectedOnly ? $('batchMsg') : $('pointsMsg');
+    target.textContent = label + '：' + done + '/' + accounts.length
       + (failures.length ? ' · 失败 ' + failures.length : '');
   };
   setMsg();
@@ -1319,11 +1543,13 @@ async function runBatchPool(label, action) {
   }
 
   btns.forEach(b => b && (b.disabled = false));
+  BATCH_RUNNING = false;
+  renderSelection(visibleAccounts());
   const summary = failures.length
     ? label + '完成：' + ok + '/' + accounts.length + ' 成功，' + failures.length
       + ' 失败\n' + failures.slice(0, 3).join('\n')
     : label + '完成：' + ok + '/' + accounts.length + ' 成功';
-  $('pointsMsg').textContent = summary;
+  (selectedOnly ? $('batchMsg') : $('pointsMsg')).textContent = summary;
   toast(summary.split('\n')[0], failures.length ? 'err' : 'ok');
   await load(true);
 }
@@ -1424,6 +1650,128 @@ async function exportAccounts() {
   }
 }
 $('exportAccounts').onclick = exportAccounts;
+$('accountSearch').oninput = renderAccountRows;
+$('accountStatus').onchange = renderAccountRows;
+$('accountSort').onchange = renderAccountRows;
+$('clearFilters').onclick = () => {
+  $('accountSearch').value = ''; $('accountStatus').value = 'all';
+  $('accountSort').value = 'default'; renderAccountRows();
+};
+$('selectVisible').onchange = () => {
+  visibleAccounts().forEach(a => {
+    if ($('selectVisible').checked) SELECTED_ACCOUNTS.add(a.name);
+    else SELECTED_ACCOUNTS.delete(a.name);
+  });
+  renderAccountRows();
+};
+$('clearSelection').onclick = () => { SELECTED_ACCOUNTS.clear(); renderAccountRows(); };
+
+async function batchAccountAction(kind) {
+  const names = [...SELECTED_ACCOUNTS];
+  if (!names.length) { toast('请先选择账号', 'err'); return; }
+  if (BATCH_RUNNING) { toast('已有批量任务在执行', 'err'); return; }
+  if (kind === 'checkin' || kind === 'onboarding') {
+    const path = kind === 'checkin' ? '/api/panel/points/checkin' : '/api/panel/points/onboarding';
+    return runBatchPool(kind === 'checkin' ? '所选账号签到' : '所选账号新手任务', async acc => {
+      const res = await api(path, {method: 'POST', body: JSON.stringify({name: acc.name}),
+        timeoutMs: kind === 'checkin' ? 60000 : 300000});
+      if (res.ok === false) throw new Error(res.error || '任务失败');
+    }, true);
+  }
+  if (!confirm((kind === 'reset' ? '仅清除本地冷却，不触发重登；上游额度可能仍未恢复。'
+    : kind === 'check' ? '检查所选账号，只重登已失效的 session，不强制重登健康账号。'
+    : '将修改所选账号的启用状态。') + '\n\n账号数：' + names.length)) return;
+  BATCH_RUNNING = true;
+  document.querySelectorAll('[data-batch]').forEach(b => { b.disabled = true; });
+  $('batchMsg').textContent = '正在处理 ' + names.length + ' 个账号…';
+  try {
+    const body = kind === 'reset' ? {names} : kind === 'check' ? {names, force: false} : null;
+    if (body) {
+      const path = kind === 'reset' ? '/api/panel/accounts/reset-cooldown' : '/api/panel/accounts/check';
+      const res = await api(path, {method: 'POST', body: JSON.stringify(body), timeoutMs: 600000});
+      const failed = (res.results || []).filter(r => !r.ok);
+      $('batchMsg').textContent = '处理完成：' + (res.total ?? names.length) + ' 个账号'
+        + (failed.length ? '，' + failed.length + ' 个需处理：' + failed.slice(0, 3).map(
+          r => r.name + ' ' + (r.error || '')).join('；') : '');
+      if (res.state) { LAST_STATE = res.state; render(res.state); }
+    } else {
+      const failures = [];
+      for (let i = 0; i < names.length; i++) {
+        try {
+          await api('/api/panel/accounts/update', {method: 'POST',
+            body: JSON.stringify({name: names[i], enabled: kind === 'enable'})});
+        } catch (e) { failures.push(names[i] + ': ' + e.message); }
+        $('batchMsg').textContent = (kind === 'enable' ? '启用' : '禁用')
+          + '：' + (i + 1) + '/' + names.length;
+      }
+      $('batchMsg').textContent = '完成 ' + (names.length - failures.length) + '/' + names.length
+        + (failures.length ? '\n' + failures.slice(0, 3).join('\n') : '');
+      await load();
+    }
+    toast('所选账号操作完成', 'ok');
+  } catch (e) { $('batchMsg').textContent = '批量操作失败：' + e.message; toast(e.message, 'err'); }
+  finally {
+    BATCH_RUNNING = false;
+    renderSelection(visibleAccounts());
+  }
+}
+document.querySelectorAll('[data-batch]').forEach(b => {
+  b.onclick = () => batchAccountAction(b.dataset.batch);
+});
+
+const THEME_MEDIA = matchMedia('(prefers-color-scheme: dark)');
+function applyTheme(mode) {
+  localStorage.setItem('loomy2api_theme', mode);
+  document.documentElement.dataset.theme = mode === 'auto'
+    ? (THEME_MEDIA.matches ? 'dark' : 'light') : mode;
+  $('themeToggle').querySelector('.ico').textContent = mode === 'auto' ? '◐' : mode === 'light' ? '☀' : '☾';
+  $('themeToggle').title = mode === 'auto' ? '跟随系统（点击切浅色）' : mode === 'light' ? '浅色（点击切深色）' : '深色（点击跟随系统）';
+}
+let currentThemeMode = localStorage.getItem('loomy2api_theme') || 'auto';
+applyTheme(currentThemeMode);
+$('themeToggle').onclick = () => {
+  currentThemeMode = currentThemeMode === 'auto' ? 'light' : currentThemeMode === 'light' ? 'dark' : 'auto';
+  applyTheme(currentThemeMode);
+};
+const followSystemTheme = () => { if (currentThemeMode === 'auto') applyTheme('auto'); };
+if (THEME_MEDIA.addEventListener) THEME_MEDIA.addEventListener('change', followSystemTheme);
+const VIEW_TITLES = {overview: '运行概览', accounts: '账号池', models: '模型列表',
+  points: '积分与任务', logs: '运行日志', settings: '网关设置'};
+let currentView = '';
+function activateView(name) {
+  if (!VIEW_TITLES[name]) name = 'accounts';
+  currentView = name;
+  document.querySelectorAll('[data-view]').forEach(view => {
+    const active = view.dataset.view === name;
+    view.classList.toggle('active-view', active);
+    view.hidden = !active;
+  });
+  document.querySelectorAll('.nav-item[href^="#"]').forEach(link => {
+    const active = link.getAttribute('href') === '#' + name;
+    link.classList.toggle('active', active);
+    if (active) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
+  });
+  $('viewTitle').textContent = VIEW_TITLES[name];
+  document.title = VIEW_TITLES[name] + ' · loomy2api';
+  localStorage.setItem('loomy2api_view', name);
+  window.scrollTo(0, 0);
+  if (name === 'points') { loadPoints(); startPointsPolling(); }
+  else stopPointsPolling();
+  if (name === 'logs') loadLog();
+  if (name === 'models') loadModels(false);
+}
+document.querySelectorAll('.nav-item[href^="#"]').forEach(link => {
+  link.onclick = event => {
+    event.preventDefault();
+    const name = link.getAttribute('href').slice(1);
+    if (location.hash !== '#' + name) location.hash = name;
+    else activateView(name);
+  };
+});
+window.addEventListener('hashchange', () => activateView(location.hash.slice(1)));
+activateView(location.hash.slice(1) || localStorage.getItem('loomy2api_view') || 'accounts');
+
 $('setAllPasswords').onclick = setAllPasswords;
 $('checkPool').onclick = checkPool;
 

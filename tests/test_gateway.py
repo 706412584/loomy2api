@@ -20,6 +20,7 @@ import urllib.request
 from pathlib import Path
 
 from loomy2api.server import Gateway, Handler, Server
+from loomy2api.upstream import business_error_status
 from tests.support import FakeUpstream, free_port, make_config, write_accounts
 
 
@@ -363,6 +364,11 @@ class GatewayTestCase(_Harness, unittest.TestCase):
             self.post("/v1/chat/completions", {
                 "model": "fake-model", "messages": [{"role": "user", "content": "x"}]})
         self.assertEqual(ctx.exception.code, 402)
+
+    def test_http_200_quota_envelope_is_an_account_fault(self):
+        body = json.dumps({"error": {"message": "Team quota exhausted",
+                                     "type": "insufficient_quota"}}).encode()
+        self.assertEqual(business_error_status(body), 402)
 
     def test_stream_falls_back_to_healthy_account(self):
         self.upstream.valid_sessions = ["s2"]

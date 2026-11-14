@@ -124,6 +124,8 @@ class AccountPool:
                     acc.requests, acc.points_used, acc.failures = (
                         old.requests, old.points_used, old.failures)
                     acc.last_used, acc.last_error = old.last_used, old.last_error
+                    acc.cooldown_until = old.cooldown_until
+                    acc.cooldown_reason = old.cooldown_reason
                     if acc.expire_at == 0 and old.expire_at:
                         acc.session, acc.expire_at, acc.userid = (
                             old.session, old.expire_at, old.userid)
@@ -714,7 +716,8 @@ class AccountPool:
         acc.quota_updated_at = int(time.time())
         acc.quota_checked_at = acc.quota_updated_at
         acc.quota_auth_faults = 0
-        acc.last_error = ""
+        if not (acc.in_cooldown and acc.cooldown_reason == "quota"):
+            acc.last_error = ""
         return acc
 
     def _read_quota_with_retry(self, acc: Account) -> Dict[str, Any]:
@@ -1074,6 +1077,7 @@ class AccountPool:
             # account through would answer with a substituted model.
             all_enabled = [a for a in self.accounts
                            if a.enabled and a.name not in exclude
+                           and not (a.in_cooldown and a.cooldown_reason == "quota")
                            and self.serves_model(a, model)]
             if all_enabled:
                 candidates = all_enabled
@@ -1161,6 +1165,17 @@ class AccountPool:
             return
         if status in (401, 403):
             acc.session, acc.expire_at = "", 0
+        if status == 402:
+            # UTC+8 is fixed by the upstream's business day; using the host's
+            # timezone would move the reset when running in Docker or Windows.
+            next_midnight = (int(time.time()) // 86400 + 1) * 86400 - 8 * 3600
+            acc.failures += 1
+            acc.cooldown_until = float(next_midnight)
+            acc.cooldown_reason = "quota"
+            self.log(f"账号 {acc.name} 额度不足 HTTP 402 → 冷却至北京时间次日 00:00"
+                     f"（{acc.last_error}）")
+            self.save(force=True)
+            return
         cooldown = float(self.cfg.get("cooldown_seconds") or 300)
         acc.cooldown(cooldown, acc.last_error)
         self.log(f"账号 {acc.name} 失败 HTTP {status} → 冷却 {cooldown:.0f}s（{acc.last_error}）")
@@ -1204,7 +1219,7 @@ class AccountPool:
             try:
                 self.ensure_session(acc, force=True)
                 self.refresh_quota(acc)
-                acc.cooldown_until = 0.0
+                acc.clear_cooldown()
                 acc.last_error = ""
                 self.log(f"账号 {acc.name} 后台重登成功，已恢复可用")
             except (PoolError, AccountError, UpstreamError) as exc:

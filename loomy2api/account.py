@@ -181,8 +181,10 @@ class Account:
     multiplier: float = 0.0      # not used for routing, informational
     quota_updated_at: int = 0
 
-    # runtime state (never persisted)
+    # A quota rejection survives restarts so the pool cannot hammer the same
+    # account every five minutes. Other runtime counters remain in memory.
     cooldown_until: float = 0.0
+    cooldown_reason: str = "transient"
     #: Don't attempt a password login before this time.  Set when the account
     #: service rejects the stored password (or rate-limits logins): retrying
     #: inside the window only extends the upstream lockout, while the session
@@ -235,9 +237,17 @@ class Account:
 
     def cooldown(self, seconds: float, reason: str = "") -> None:
         self.cooldown_until = time.time() + max(1.0, float(seconds))
+        self.cooldown_reason = "transient"
         self.failures += 1
         if reason:
             self.last_error = reason
+
+    def clear_cooldown(self, *, quota: bool = False) -> None:
+        """Clear a short cooldown, or an explicitly requested quota reset."""
+        if not quota and self.in_cooldown and self.cooldown_reason == "quota":
+            return
+        self.cooldown_until = 0.0
+        self.cooldown_reason = "transient"
 
     # ------------------------------------------------------------------
     @classmethod
@@ -277,6 +287,10 @@ class Account:
             daily_balance=(int(raw["dailyBalance"])
                            if raw.get("dailyBalance") is not None else None),
             quota_updated_at=int(raw.get("quotaUpdatedAt") or 0),
+            cooldown_until=float(raw.get("cooldownUntil")
+                                 or raw.get("cooldown_until") or 0),
+            cooldown_reason=str(raw.get("cooldownReason")
+                                or raw.get("cooldown_reason") or "transient"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -331,6 +345,9 @@ class Account:
             out["models"] = list(self.models)
             if self.models_updated_at:
                 out["modelsUpdatedAt"] = self.models_updated_at
+        if self.cooldown_until > time.time():
+            out["cooldownUntil"] = self.cooldown_until
+            out["cooldownReason"] = self.cooldown_reason
         if self.banned:
             out["banned"] = True
             if self.banned_at:
@@ -375,6 +392,8 @@ class Account:
             "points_used": self.points_used,
             "failures": self.failures,
             "in_cooldown": self.in_cooldown,
+            "cooldown_until": self.cooldown_until if self.in_cooldown else 0,
+            "cooldown_reason": self.cooldown_reason if self.in_cooldown else "",
             "cooldown_seconds_left": (round(self.cooldown_until - time.time(), 1)
                                       if self.in_cooldown else 0),
             "source": self.source,

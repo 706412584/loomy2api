@@ -208,6 +208,31 @@ class TestPanelWrites(PanelHarness, unittest.TestCase):
         self.assertAlmostEqual(acc.days_left, 14, delta=0.1)
         self.assertEqual(self.gateway.pool.client.fills, ["a"])
 
+    def test_reset_cooldown_is_local_and_supports_a_batch(self):
+        self.gateway.pool.add_account("b", loginid="13900000009", session="s2")
+        for name in ("a", "b"):
+            acc = self.gateway.pool.get(name)
+            acc.cooldown_until = time.time() + 86400
+            acc.cooldown_reason = "quota"
+            acc.last_error = "insufficient_quota"
+        _s, payload = self.post("/api/panel/accounts/reset-cooldown",
+                                {"names": ["a", "b"]})
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual(self.gateway.pool.client.fills, [])
+        for name in ("a", "b"):
+            acc = self.gateway.pool.get(name)
+            self.assertFalse(acc.in_cooldown)
+            self.assertEqual(acc.last_error, "")
+            self.assertTrue(acc.session)
+
+    def test_reset_cooldown_does_not_clear_a_ban(self):
+        acc = self.gateway.pool.get("a")
+        acc.banned = True
+        _s, payload = self.post("/api/panel/accounts/reset-cooldown", {"name": "a"})
+        self.assertTrue(payload["ok"])
+        self.assertTrue(acc.banned)
+
     def test_renew_unknown_account_is_rejected(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self.post("/api/panel/accounts/renew", {"name": "nope"})

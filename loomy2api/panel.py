@@ -580,6 +580,7 @@ class Panel:
             # keep the account benched right after a successful login.
             acc.login_blocked_until = 0.0
             acc.cooldown_until = 0.0
+            acc.cooldown_reason = "transient"
             acc.last_error = ""
             # A successful SMS login is proof the account works again; a stale
             # ban flag would keep it out of routing no matter what.
@@ -913,7 +914,7 @@ class Panel:
         try:
             self.pool.ensure_session(acc, force=True)
             self.pool.refresh_quota(acc)
-            acc.cooldown_until = 0.0
+            acc.clear_cooldown()
             result["userid"] = acc.userid
             result["session_days_left"] = acc.days_left
         except (AccountError, PoolError) as exc:
@@ -922,6 +923,29 @@ class Panel:
         self.pool.save(force=True)
         result["state"] = self.state()
         return result
+
+    def reset_cooldown(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Clear local cooldowns without logging in or changing the session."""
+        raw = payload.get("names") if "names" in payload else [payload.get("name")]
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            raise PoolError("names 必须是账号名数组")
+        names = list(dict.fromkeys(str(n).strip() for n in raw if str(n or "").strip()))
+        if not names:
+            raise PoolError("至少选择一个账号")
+        results = []
+        for name in names:
+            acc = self._resolve_account(name)
+            was_cooling = acc.in_cooldown
+            acc.clear_cooldown(quota=True)
+            if was_cooling:
+                acc.last_error = ""
+            results.append({"name": name, "ok": True, "was_cooling": was_cooling})
+        self.pool.save(force=True)
+        self.log(f"[panel] 已重置 {len(results)} 个账号的冷却状态")
+        return {"ok": True, "total": len(results), "results": results,
+                "state": self.state()}
 
     def identity(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Inspect (``regenerate: false``) or rebind (``regenerate: true``)."""

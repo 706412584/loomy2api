@@ -7,6 +7,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -263,10 +265,12 @@ class GatewayViewModel : ViewModel() {
      * pool dead earlier.  Only accounts with a missing/expired/rejected
      * session are re-logged in.
      */
-    fun checkPool() = viewModelScope.launch(crashGuard) {
+    fun checkPool(names: List<String> = emptyList()) = viewModelScope.launch(crashGuard) {
         _ui.update { it.copy(batchRunning = true, batchMsg = "检测续期：检查中…") }
         try {
-            val r = Api.post("/api/panel/accounts/check", JSONObject(),
+            val body = JSONObject()
+            if (names.isNotEmpty()) body.put("names", JSONArray(names))
+            val r = Api.post("/api/panel/accounts/check", body,
                 timeoutSec = 600)
             if (!r.optBoolean("ok", true)) {
                 throw IllegalStateException(r.optString("error").ifBlank { "检测失败" })
@@ -307,11 +311,12 @@ class GatewayViewModel : ViewModel() {
      * the same).  A transient 5xx is retried once after a short pause; 4xx
      * responses are reported as-is because retrying cannot help.
      */
-    private fun runBatch(label: String, action: suspend (AccountView) -> String) =
+    private fun runBatch(label: String, targets: List<AccountView>? = null,
+                         action: suspend (AccountView) -> String) =
         viewModelScope.launch(crashGuard) {
-            val accounts = _ui.value.state?.accounts.orEmpty().filter { it.healthy }
+            val accounts = targets ?: _ui.value.state?.accounts.orEmpty().filter { it.healthy }
             if (accounts.isEmpty()) {
-                _ui.update { it.copy(batchMsg = "没有可用账号") }
+                _ui.update { it.copy(batchMsg = if (targets == null) "没有可用账号" else "请先选择账号") }
                 return@launch
             }
             _ui.update { it.copy(batchRunning = true,
@@ -370,6 +375,33 @@ class GatewayViewModel : ViewModel() {
             }
             loadState()
         }
+
+    fun batchSelected(kind: String, accounts: List<AccountView>) {
+        if (kind == "check") { checkPool(accounts.map { it.name }); return }
+        if (kind == "enable" || kind == "disable") {
+            runBatch(if (kind == "enable") "启用账号" else "禁用账号", accounts) { acc ->
+                Api.post("/api/panel/accounts/update", JSONObject().put("name", acc.name)
+                    .put("enabled", kind == "enable"))
+                "已更新"
+            }
+            return
+        }
+        if (kind == "reset") {
+            runBatch("重置冷却", accounts) { acc ->
+                Api.post("/api/panel/accounts/reset-cooldown",
+                    JSONObject().put("name", acc.name))
+                "已重置（上游额度需自行恢复）"
+            }
+            return
+        }
+        val path = if (kind == "checkin") "/api/panel/points/checkin" else "/api/panel/points/onboarding"
+        runBatch(if (kind == "checkin") "所选账号签到" else "所选账号新手任务", accounts) { acc ->
+            val r = Api.post(path, JSONObject().put("name", acc.name),
+                timeoutSec = if (kind == "checkin") 60 else 300)
+            if (!r.optBoolean("ok", true)) throw IllegalStateException(r.optString("error"))
+            if (kind == "checkin") "已处理" else "+${r.optInt("gained")} 分"
+        }
+    }
 
     /** Daily check-in for every healthy account. */
     fun batchCheckin() = runBatch("一键签到") { acc ->
@@ -587,6 +619,12 @@ class GatewayViewModel : ViewModel() {
                 }
             }
         }
+
+    suspend fun resetCooldown(acc: AccountView): String = try {
+        Api.post("/api/panel/accounts/reset-cooldown", JSONObject().put("name", acc.name))
+        loadState()
+        "已清除本地冷却；不代表上游额度已恢复"
+    } catch (e: Exception) { "失败：${e.message}" }
 
     /** Read the stored login password of one account (for the show button). */
     suspend fun showPassword(acc: AccountView): String = try {
@@ -860,30 +898,47 @@ class GatewayViewModel : ViewModel() {
 
 // ===================================================================== theme
 
-private val Blue = Color(0xFF2563EB)
-private val BlueSoft = Color(0xFFEFF4FF)
+private val Blue = Color(0xFF12A66B)
+private val BlueSoft = Color(0xFFE3F6EC)
 private val Green = Color(0xFF16A34A)
-private val GreenSoft = Color(0xFFE9F9EF)
-private val Red = Color(0xFFDC2626)
+private val GreenSoft = Color(0xFFE3F6EC)
+private val Red = Color(0xFFE5484D)
 private val RedSoft = Color(0xFFFDECEC)
-private val Amber = Color(0xFFD97706)
-private val AmberSoft = Color(0xFFFEF6E7)
-private val Bg = Color(0xFFF5F6F8)
+private val Amber = Color(0xFFD9821F)
+private val AmberSoft = Color(0xFFFFF3E4)
+private val Bg = Color(0xFFF6F8F7)
 private val CardBg = Color.White
-private val Ink = Color(0xFF111827)
-private val Muted = Color(0xFF6B7280)
-private val Line = Color(0xFFE8EAEE)
+private val Ink = Color(0xFF1C2420)
+private val Muted = Color(0xFF5B6B64)
+private val Line = Color(0xFFE4EAE7)
+private val DarkBg = Color(0xFF121614)
+private val DarkCard = Color(0xFF1C221F)
+private val DarkInk = Color(0xFFE8EEEA)
+private val DarkMuted = Color(0xFFA3B2AB)
+private val DarkLine = Color(0xFF2A322E)
+
+@Composable private fun workBg() = if (isSystemInDarkTheme()) DarkBg else Bg
+@Composable private fun workCard() = if (isSystemInDarkTheme()) DarkCard else CardBg
+@Composable private fun workInk() = if (isSystemInDarkTheme()) DarkInk else Ink
+@Composable private fun workMuted() = if (isSystemInDarkTheme()) DarkMuted else Muted
+@Composable private fun workLine() = if (isSystemInDarkTheme()) DarkLine else Line
+@Composable private fun workAccent() = if (isSystemInDarkTheme()) Color(0xFF22C07F) else Blue
+@Composable private fun workSoft() = if (isSystemInDarkTheme()) Color(0xFF16352A) else BlueSoft
+@Composable private fun workWarnSoft() = if (isSystemInDarkTheme()) Color(0xFF382B1C) else AmberSoft
+@Composable private fun workBadSoft() = if (isSystemInDarkTheme()) Color(0xFF3A1D1D) else RedSoft
 
 @Composable
 fun LoomyTheme(content: @Composable () -> Unit) {
+    val dark = isSystemInDarkTheme()
     MaterialTheme(
-        colorScheme = lightColorScheme(
-            primary = Blue,
-            onPrimary = Color.White,
-            background = Bg,
-            surface = CardBg,
-            onSurface = Ink,
-            outline = Line,
+        colorScheme = if (dark) darkColorScheme(
+            primary = workAccent(), onPrimary = DarkBg, background = workBg(),
+            surface = workCard(), onSurface = workInk(), outline = workLine(),
+            surfaceVariant = DarkCard, onSurfaceVariant = DarkMuted,
+        ) else lightColorScheme(
+            primary = workAccent(), onPrimary = Color.White, background = workBg(),
+            surface = workCard(), onSurface = workInk(), outline = workLine(),
+            surfaceVariant = CardBg, onSurfaceVariant = Muted,
         ),
         // No hard-coded colours here: a TextStyle colour overrides
         // LocalContentColor, which made the dark Snackbar render dark text on
@@ -927,7 +982,7 @@ fun GatewayApp(vm: GatewayViewModel) {
 
     LoomyTheme {
         Scaffold(
-            containerColor = Bg,
+            containerColor = workBg(),
             snackbarHost = {
                 SnackbarHost(snackbar) { data ->
                     Snackbar(
@@ -939,7 +994,7 @@ fun GatewayApp(vm: GatewayViewModel) {
                 }
             },
             bottomBar = {
-                NavigationBar(containerColor = CardBg, tonalElevation = 0.dp) {
+                NavigationBar(containerColor = workCard(), tonalElevation = 0.dp) {
                     Tab.entries.forEach { t ->
                         NavigationBarItem(
                             selected = tab == t,
@@ -947,11 +1002,11 @@ fun GatewayApp(vm: GatewayViewModel) {
                             icon = { Icon(t.icon, t.label) },
                             label = { Text(t.label, fontSize = 11.sp) },
                             colors = NavigationBarItemDefaults.colors(
-                                selectedIconColor = Blue,
-                                selectedTextColor = Blue,
-                                indicatorColor = BlueSoft,
-                                unselectedIconColor = Muted,
-                                unselectedTextColor = Muted,
+                                selectedIconColor = workAccent(),
+                                selectedTextColor = workAccent(),
+                                indicatorColor = workSoft(),
+                                unselectedIconColor = workMuted(),
+                                unselectedTextColor = workMuted(),
                             ),
                         )
                     }
@@ -979,9 +1034,9 @@ fun GatewayApp(vm: GatewayViewModel) {
 private fun LoadingScreen() {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            CircularProgressIndicator(color = Blue)
+            CircularProgressIndicator(color = workAccent())
             Spacer(Modifier.height(14.dp))
-            Text("正在启动网关…", color = Muted)
+            Text("正在启动网关…", color = workMuted())
         }
     }
 }
@@ -1012,7 +1067,7 @@ private fun HomeScreen(vm: GatewayViewModel, ui: UiState) {
                         fontSize = 18.sp, fontWeight = FontWeight.SemiBold,
                     )
                     Spacer(Modifier.weight(1f))
-                    Text("端口 ${GatewayService.PORT}", color = Muted, fontSize = 13.sp)
+                    Text("端口 ${GatewayService.PORT}", color = workMuted(), fontSize = 13.sp)
                 }
                 Spacer(Modifier.height(14.dp))
                 if (ui.ready) {
@@ -1058,24 +1113,24 @@ private fun HomeScreen(vm: GatewayViewModel, ui: UiState) {
         item {
             SectionCard {
                 CopyRow("OpenAI Base URL", "http://127.0.0.1:${GatewayService.PORT}/v1")
-                Divider(Modifier.padding(vertical = 10.dp), color = Line)
+                Divider(Modifier.padding(vertical = 10.dp), color = workLine())
                 CopyRow("Anthropic Base URL", "http://127.0.0.1:${GatewayService.PORT}")
-                Divider(Modifier.padding(vertical = 10.dp), color = Line)
+                Divider(Modifier.padding(vertical = 10.dp), color = workLine())
         if (s?.config?.host == "0.0.0.0") {
                     CopyRow("局域网地址", "http://${localIp() ?: "127.0.0.1"}:${GatewayService.PORT}")
                 } else {
-                    Text("局域网地址", color = Muted, fontSize = 13.sp)
+                    Text("局域网地址", color = workMuted(), fontSize = 13.sp)
                     Spacer(Modifier.height(4.dp))
                     Text("未开启（设置 → 网络与安全 → 允许局域网访问）",
-                        color = Muted, fontSize = 13.sp)
+                        color = workMuted(), fontSize = 13.sp)
                 }
                 val tunnel by vm.tunnel.collectAsState()
                 tunnel.url?.let { url ->
-                    Divider(Modifier.padding(vertical = 10.dp), color = Line)
+                    Divider(Modifier.padding(vertical = 10.dp), color = workLine())
                     CopyRow("公网地址", url)
                 }
-                Divider(Modifier.padding(vertical = 10.dp), color = Line)
-                Text("API Key", color = Muted, fontSize = 13.sp)
+                Divider(Modifier.padding(vertical = 10.dp), color = workLine())
+                Text("API Key", color = workMuted(), fontSize = 13.sp)
                 Spacer(Modifier.height(4.dp))
                 Text(
                     if (s?.config?.authRequired == true) "已设置（需鉴权）" else "未设置（免鉴权）",
@@ -1086,7 +1141,7 @@ private fun HomeScreen(vm: GatewayViewModel, ui: UiState) {
 
         if (ui.error != null) {
             item {
-                SectionCard(background = RedSoft) {
+                SectionCard(background = workBadSoft()) {
                     Text(ui.error, color = Red, fontSize = 13.sp)
                 }
             }
@@ -1141,20 +1196,20 @@ private fun KeepAliveHint() {
 private fun BrandHeader() {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(
-            Modifier.size(44.dp).background(Blue, RoundedCornerShape(12.dp)),
+            Modifier.size(44.dp).background(workAccent(), RoundedCornerShape(12.dp)),
             contentAlignment = Alignment.Center,
         ) { Icon(Icons.Filled.Bolt, null, tint = Color.White) }
         Spacer(Modifier.width(12.dp))
         Column {
             Text("Loomy2API", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-            Text("本地 API 网关 · 账号池调度", color = Muted, fontSize = 12.sp)
+            Text("本地 API 网关 · 账号池调度", color = workMuted(), fontSize = 12.sp)
         }
     }
 }
 
 @Composable
 private fun SectionTitle(text: String) {
-    Text(text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+    Text(text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = workInk())
 }
 
 @Composable
@@ -1162,12 +1217,12 @@ private fun StatCard(label: String, value: String, modifier: Modifier = Modifier
     Card(
         modifier = modifier,
         shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = CardBg),
+        colors = CardDefaults.cardColors(containerColor = workCard()),
         elevation = CardDefaults.cardElevation(0.dp),
     ) {
         Column(Modifier.padding(14.dp)) {
             Text(value, fontSize = 21.sp, fontWeight = FontWeight.Bold)
-            Text(label, color = Muted, fontSize = 12.sp)
+            Text(label, color = workMuted(), fontSize = 12.sp)
         }
     }
 }
@@ -1175,7 +1230,7 @@ private fun StatCard(label: String, value: String, modifier: Modifier = Modifier
 @Composable
 private fun SectionCard(
     modifier: Modifier = Modifier,
-    background: Color = CardBg,
+    background: Color = workCard(),
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Card(
@@ -1193,7 +1248,7 @@ private fun CopyRow(label: String, value: String) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     Row(verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
-            Text(label, color = Muted, fontSize = 13.sp)
+            Text(label, color = workMuted(), fontSize = 13.sp)
             Spacer(Modifier.height(3.dp))
             Text(value, fontSize = 14.sp, fontFamily = FontFamily.Monospace,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -1203,11 +1258,28 @@ private fun CopyRow(label: String, value: String) {
                     as android.content.ClipboardManager
             cm.setPrimaryClip(android.content.ClipData.newPlainText(label, value))
             android.widget.Toast.makeText(ctx, "已复制", android.widget.Toast.LENGTH_SHORT).show()
-        }) { Text("复制", color = Blue) }
+        }) { Text("复制", color = workAccent()) }
     }
 }
 
 // ================================================================ accounts
+
+private val accountStatuses = listOf("all" to "全部状态", "usable" to "可调度", "ok" to "正常",
+    "quota" to "额度冷却", "cooldown" to "其他冷却", "disabled" to "已禁用", "banned" to "已封禁",
+    "session" to "无登录态", "downgraded" to "降级/无模型", "expiring" to "即将到期", "empty" to "额度为零")
+private val accountSorts = listOf("default" to "默认排序", "available" to "积分排序",
+    "requests" to "请求排序", "failures" to "失败排序", "expiry" to "到期排序")
+
+private fun accountStatus(acc: AccountView, modelIds: List<String>): String = when {
+    !acc.enabled -> "disabled"
+    acc.banned -> "banned"
+    acc.inCooldown -> if (acc.cooldownReason == "quota") "quota" else "cooldown"
+    !acc.hasSession -> "session"
+    acc.hasNoModels || acc.isDowngraded(modelIds) -> "downgraded"
+    !acc.permanent && acc.sessionDaysLeft != null && acc.sessionDaysLeft < 3 -> "expiring"
+    acc.available == 0 -> "empty"
+    else -> "ok"
+}
 
 @Composable
 private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
@@ -1219,6 +1291,29 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     val accounts = ui.state?.accounts.orEmpty()
+    var query by remember { mutableStateOf("") }
+    var status by remember { mutableStateOf("all") }
+    var sort by remember { mutableStateOf("default") }
+    var statusExpanded by remember { mutableStateOf(false) }
+    var sortExpanded by remember { mutableStateOf(false) }
+    val selectedNames = remember { mutableStateListOf<String>() }
+    val modelIds = ui.state?.totals?.modelIds.orEmpty()
+    LaunchedEffect(accounts) { selectedNames.retainAll(accounts.map { it.name }.toSet()) }
+    val filtered = accounts.filter { acc ->
+        val matchesQuery = query.isBlank() || listOf(acc.name, acc.loginid, acc.loginidMasked, acc.devid)
+            .any { it.contains(query.trim(), ignoreCase = true) }
+        val state = accountStatus(acc, modelIds)
+        matchesQuery && (status == "all" || (if (status == "usable") state == "ok" else state == status))
+    }.let { list ->
+        when (sort) {
+            "available" -> list.sortedByDescending { it.available ?: -1 }
+            "requests" -> list.sortedByDescending { it.requests }
+            "failures" -> list.sortedByDescending { it.failures }
+            "expiry" -> list.sortedBy { it.sessionDaysLeft ?: Double.MAX_VALUE }
+            else -> list
+        }
+    }
+    val selectedAccounts = accounts.filter { it.name in selectedNames }
 
     // Export via SAF so the file lands where the user picks (Downloads etc.)
     // rather than in an app-private folder they cannot find.
@@ -1263,12 +1358,71 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
                     TextButton(onClick = { vm.refreshAll() }) { Text("刷新") }
                 }
                 Text("共 ${accounts.size} 个账号，可用 ${accounts.count { it.healthy }} 个",
-                    color = Muted, fontSize = 13.sp)
+                    color = workMuted(), fontSize = 13.sp)
             }
 
             item {
                 SectionCard {
-                    Text("批量操作", color = Muted, fontSize = 13.sp)
+                    OutlinedTextField(query, { query = it }, modifier = Modifier.fillMaxWidth(),
+                        singleLine = true, placeholder = { Text("搜索名称、手机号、设备标识…") },
+                        leadingIcon = { Icon(Icons.Filled.Search, null) },
+                        trailingIcon = { if (query.isNotEmpty()) IconButton(onClick = { query = "" }) {
+                            Icon(Icons.Filled.Clear, "清空搜索") } })
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Box(Modifier.weight(1f)) {
+                            OutlinedButton(onClick = { statusExpanded = true }, Modifier.fillMaxWidth()) {
+                                Text(accountStatuses.first { it.first == status }.second, maxLines = 1)
+                            }
+                            DropdownMenu(statusExpanded, { statusExpanded = false }) {
+                                accountStatuses.forEach { (key, label) ->
+                                    DropdownMenuItem(text = { Text(label) }, onClick = {
+                                        status = key; statusExpanded = false })
+                                }
+                            }
+                        }
+                        Box(Modifier.weight(1f)) {
+                            OutlinedButton(onClick = { sortExpanded = true }, Modifier.fillMaxWidth()) {
+                                Text(accountSorts.first { it.first == sort }.second, maxLines = 1)
+                            }
+                            DropdownMenu(sortExpanded, { sortExpanded = false }) {
+                                accountSorts.forEach { (key, label) ->
+                                    DropdownMenuItem(text = { Text(label) }, onClick = {
+                                        sort = key; sortExpanded = false })
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("可见 ${filtered.size}/${accounts.size} · 已选 ${selectedNames.size}",
+                            color = workMuted(), fontSize = 12.sp, modifier = Modifier.weight(1f))
+                        TextButton(onClick = {
+                            val visibleNames = filtered.map { it.name }
+                            if (visibleNames.all { it in selectedNames }) selectedNames.removeAll(visibleNames.toSet())
+                            else visibleNames.forEach { if (it !in selectedNames) selectedNames.add(it) }
+                        }) { Text("全选结果") }
+                        TextButton(onClick = { selectedNames.clear() }, enabled = selectedNames.isNotEmpty()) { Text("清空") }
+                    }
+                    if (selectedNames.isNotEmpty()) {
+                        Text("批量仅作用于勾选账号", color = workAccent(), fontSize = 12.sp)
+                        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            listOf("reset" to "重置冷却", "enable" to "启用", "disable" to "禁用",
+                                "check" to "检测续期", "checkin" to "签到", "onboarding" to "新手任务")
+                                .forEach { (key, label) -> OutlinedButton(onClick = {
+                                    vm.batchSelected(key, selectedAccounts) }, enabled = !ui.batchRunning) { Text(label) } }
+                        }
+                    } else {
+                        Text("勾选后可批量重置冷却、启禁用、检测、签到或新手任务",
+                            color = workMuted(), fontSize = 12.sp)
+                    }
+                }
+            }
+
+            item {
+                SectionCard {
+                    Text("全池工具（不取决于勾选）", color = workMuted(), fontSize = 13.sp)
                     Spacer(Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
@@ -1330,7 +1484,7 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
                     if (ui.batchRunning || ui.batchMsg.isNotBlank()) {
                         Spacer(Modifier.height(10.dp))
                         if (ui.batchRunning) {
-                            LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+                            LinearProgressIndicator(Modifier.fillMaxWidth(), color = workAccent())
                             Spacer(Modifier.height(6.dp))
                         }
                         Text(ui.batchMsg, color = if (ui.batchMsg.startsWith("失败")) Red else Muted,
@@ -1339,10 +1493,15 @@ private fun AccountsScreen(vm: GatewayViewModel, ui: UiState) {
                 }
             }
 
-            items(accounts, key = { it.name }) { acc ->
+            items(filtered, key = { it.name }) { acc ->
                 AccountCard(acc, onClick = { selected = acc },
-                    onRefreshQuota = { vm.refreshQuota() },
-                    modelIds = ui.state?.totals?.modelIds.orEmpty())
+                    onRefreshQuota = { vm.refreshQuota() }, modelIds = modelIds,
+                    checked = acc.name in selectedNames,
+                    onChecked = { if (it) selectedNames.add(acc.name) else selectedNames.remove(acc.name) })
+            }
+            if (filtered.isEmpty()) {
+                item { Text("没有符合搜索或筛选条件的账号", color = workMuted(),
+                    modifier = Modifier.padding(24.dp)) }
             }
         }
 
@@ -1425,7 +1584,7 @@ private fun SmsRegisterDialog(
         val n = (count.toIntOrNull() ?: 1).coerceIn(1, 20)
         AlertDialog(
             onDismissRequest = { askCharge = false },
-            containerColor = CardBg,
+            containerColor = workCard(),
             shape = RoundedCornerShape(18.dp),
             title = { Text("确认扣费", fontSize = 18.sp, fontWeight = FontWeight.Bold) },
             text = {
@@ -1451,7 +1610,7 @@ private fun SmsRegisterDialog(
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
-        containerColor = CardBg,
+        containerColor = workCard(),
         shape = RoundedCornerShape(18.dp),
         title = { Text("接码注册（fysms）", fontSize = 19.sp, fontWeight = FontWeight.Bold) },
         text = {
@@ -1533,15 +1692,18 @@ private fun SmsRegisterDialog(
 @Composable
 private fun AccountCard(acc: AccountView, onClick: () -> Unit,
                         onRefreshQuota: () -> Unit,
-                        modelIds: List<String> = emptyList()) {
+                        modelIds: List<String> = emptyList(),
+                        checked: Boolean = false, onChecked: (Boolean) -> Unit = {}) {
     Card(
         modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
         shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = CardBg),
+        colors = CardDefaults.cardColors(containerColor = workCard()),
         elevation = CardDefaults.cardElevation(0.dp),
     ) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked, onChecked)
+                Spacer(Modifier.width(4.dp))
                 Box(
                     Modifier.size(9.dp).background(
                         if (acc.healthy) Green else if (acc.inCooldown) Amber else Red,
@@ -1555,7 +1717,7 @@ private fun AccountCard(acc: AccountView, onClick: () -> Unit,
             Spacer(Modifier.height(10.dp))
             Text(
                 "可用 ${acc.available ?: "—"} · 永久 ${acc.balance ?: "—"} · 活动 ${acc.dailyBalance ?: "—"}",
-                color = Muted, fontSize = 13.sp,
+                color = workMuted(), fontSize = 13.sp,
             )
             Spacer(Modifier.height(4.dp))
             Text(
@@ -1567,8 +1729,13 @@ private fun AccountCard(acc: AccountView, onClick: () -> Unit,
                         false -> " · 未激活"
                         null -> ""
                     },
-                color = if (acc.permanent) Green else Muted, fontSize = 12.sp,
+                color = if (acc.permanent) Green else workMuted(), fontSize = 12.sp,
             )
+            if (acc.inCooldown && acc.cooldownReason == "quota") {
+                Spacer(Modifier.height(8.dp))
+                Text("北京时间次日 00:00 恢复 · " + SimpleDateFormat("MM-dd HH:mm", Locale.US)
+                    .format(Date(acc.cooldownUntil * 1000)), color = Amber, fontSize = 12.sp)
+            }
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {
                 ActionLink("管理") { onClick() }
@@ -1585,17 +1752,17 @@ private fun StatusChip(acc: AccountView, modelIds: List<String> = emptyList()) {
     // account answers fine, it just cannot serve most models any more, and the
     // upstream substitutes a free model instead of returning an error.
     val (bg, fg, label) = when {
-        !acc.enabled -> Triple(Line, Muted, acc.statusLabel)
-        acc.banned -> Triple(RedSoft, Red, acc.statusLabel)
-        acc.inCooldown -> Triple(AmberSoft, Amber, acc.statusLabel)
-        !acc.hasSession -> Triple(RedSoft, Red, acc.statusLabel)
-        acc.hasNoModels -> Triple(RedSoft, Red, "无可用模型")
-        acc.isDowngraded(modelIds) -> Triple(AmberSoft, Amber, "已降级")
+        !acc.enabled -> Triple(workLine(), workMuted(), acc.statusLabel)
+        acc.banned -> Triple(workBadSoft(), Red, acc.statusLabel)
+        acc.inCooldown -> Triple(workWarnSoft(), Amber, acc.statusLabel)
+        !acc.hasSession -> Triple(workBadSoft(), Red, acc.statusLabel)
+        acc.hasNoModels -> Triple(workBadSoft(), Red, "无可用模型")
+        acc.isDowngraded(modelIds) -> Triple(workWarnSoft(), Amber, "已降级")
         // a password account renews itself — an imminent expiry is not a risk
-        acc.permanent -> Triple(GreenSoft, Green, acc.statusLabel)
+        acc.permanent -> Triple(workSoft(), workAccent(), acc.statusLabel)
         acc.sessionDaysLeft != null && acc.sessionDaysLeft < 3 ->
-            Triple(AmberSoft, Amber, acc.statusLabel)
-        else -> Triple(GreenSoft, Green, acc.statusLabel)
+            Triple(workWarnSoft(), Amber, acc.statusLabel)
+        else -> Triple(workSoft(), workAccent(), acc.statusLabel)
     }
     Box(
         Modifier.background(bg, RoundedCornerShape(20.dp)).padding(horizontal = 10.dp, vertical = 4.dp)
@@ -1604,7 +1771,7 @@ private fun StatusChip(acc: AccountView, modelIds: List<String> = emptyList()) {
 
 @Composable
 private fun ActionLink(text: String, onClick: () -> Unit) {
-    Text(text, color = Blue, fontSize = 14.sp, modifier = Modifier.clickable(onClick = onClick))
+    Text(text, color = workAccent(), fontSize = 14.sp, modifier = Modifier.clickable(onClick = onClick))
 }
 
 // ================================================================ dialogs
@@ -1624,7 +1791,7 @@ private fun BatchPasswordDialog(
     var pwd by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = CardBg,
+        containerColor = workCard(),
         shape = RoundedCornerShape(18.dp),
         title = { Text(title, fontSize = 19.sp, fontWeight = FontWeight.Bold) },
         text = {
@@ -1634,12 +1801,12 @@ private fun BatchPasswordDialog(
                     else if (count == 0) "所有启用账号都已有密码，无需设置。"
                     else "将给 $count 个无密码账号设置登录密码。设置后它们升级为永久账号："
                         + "session 到期会自动用密码重登，不再需要短信验证码。",
-                    fontSize = 13.sp, color = if (count == 0 && intro.isBlank()) Muted else Ink,
+                    fontSize = 13.sp, color = if (count == 0 && intro.isBlank()) Muted else workInk(),
                 )
                 if (count > 0) {
                     Spacer(Modifier.height(8.dp))
                     Text("密码会保存到账号文件并随导出一起导出。",
-                        fontSize = 12.sp, color = Muted)
+                        fontSize = 12.sp, color = workMuted())
                     Spacer(Modifier.height(12.dp))
                     OutlinedTextField(
                         pwd, { pwd = it },
@@ -1712,12 +1879,12 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = CardBg,
+        containerColor = workCard(),
         shape = RoundedCornerShape(18.dp),
         title = {
             Column {
                 Text(acc.name, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                Text(acc.loginidMasked, color = Muted, fontSize = 13.sp)
+                Text(acc.loginidMasked, color = workMuted(), fontSize = 13.sp)
             }
         },
         text = {
@@ -1777,7 +1944,7 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                         fontSize = 12.sp, fontWeight = FontWeight.Medium,
                     )
                     acc.models?.forEach { id ->
-                        Text("· $id", color = Muted, fontSize = 11.sp)
+                        Text("· $id", color = workMuted(), fontSize = 11.sp)
                     }
                     if (acc.isDowngraded(allIds)) {
                         Text("请求其它模型会被上游静默换成免费模型，路由会避开该账号",
@@ -1785,6 +1952,13 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                     }
                 }
                 Spacer(Modifier.height(14.dp))
+
+                OutlinedButton(onClick = {
+                    busy = true; msg = "正在重置本地冷却…"
+                    scope.launch { msg = vm.resetCooldown(acc); busy = false }
+                }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                    Text("重置冷却（不触发重登）")
+                }
 
                 if (acc.banned) {
                     Text(
@@ -1814,7 +1988,7 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
                                 if (acc.passwordSetAt > 0)
                                     "上次设置成功但登录验证未通过，到期可能无法自动续期"
                                 else "设置密码后 session 到期会自动续期",
-                                fontSize = 11.sp, color = Muted)
+                                fontSize = 11.sp, color = workMuted())
                         }
                     }
                     OutlinedButton(
@@ -1912,7 +2086,7 @@ private fun AccountDialog(vm: GatewayViewModel, acc: AccountView, onDismiss: () 
 
                 if (busy) {
                     Spacer(Modifier.height(12.dp))
-                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = workAccent())
                 }
                 if (msg.isNotBlank()) {
                     Spacer(Modifier.height(12.dp))
@@ -1941,12 +2115,12 @@ private fun InviteDialog(
     var code by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
-        containerColor = CardBg,
+        containerColor = workCard(),
         shape = RoundedCornerShape(18.dp),
         title = { Text("填写邀请码", fontSize = 19.sp, fontWeight = FontWeight.Bold) },
         text = {
             Column {
-                Text("账号 ${acc.name}", fontSize = 13.sp, color = Muted)
+                Text("账号 ${acc.name}", fontSize = 13.sp, color = workMuted())
                 if (acc.appliedInvitationCode.isNotBlank()) {
                     Spacer(Modifier.height(6.dp))
                     Text("当前已绑定 ${acc.appliedInvitationCode}",
@@ -1961,7 +2135,7 @@ private fun InviteDialog(
                 )
                 Spacer(Modifier.height(8.dp))
                 Text("每个账号只能填写一次，提交后不可撤销。",
-                    fontSize = 12.sp, color = Muted)
+                    fontSize = 12.sp, color = workMuted())
             }
         },
         confirmButton = {
@@ -1977,9 +2151,9 @@ private fun InviteDialog(
 @Composable
 private fun MiniStat(label: String, value: String, modifier: Modifier = Modifier) {
     Column(
-        modifier.background(Bg, RoundedCornerShape(10.dp)).padding(10.dp)
+        modifier.background(workBg(), RoundedCornerShape(10.dp)).padding(10.dp)
     ) {
-        Text(label, color = Muted, fontSize = 11.sp)
+        Text(label, color = workMuted(), fontSize = 11.sp)
         Spacer(Modifier.height(2.dp))
         Text(value, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
             overflow = TextOverflow.Ellipsis)
@@ -2008,7 +2182,7 @@ private fun AddAccountDialog(vm: GatewayViewModel, onDismiss: () -> Unit) {
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
-        containerColor = CardBg,
+        containerColor = workCard(),
         shape = RoundedCornerShape(18.dp),
         title = { Text("添加账号", fontWeight = FontWeight.Bold) },
         text = {
@@ -2074,7 +2248,7 @@ private fun AddAccountDialog(vm: GatewayViewModel, onDismiss: () -> Unit) {
                         }
                         Spacer(Modifier.height(6.dp))
                         Text("验证码登录不需要密码，适合未设置密码的账号",
-                            color = Muted, fontSize = 11.sp)
+                            color = workMuted(), fontSize = 11.sp)
                     }
                     "session" -> {
                         Spacer(Modifier.height(8.dp))
@@ -2086,7 +2260,7 @@ private fun AddAccountDialog(vm: GatewayViewModel, onDismiss: () -> Unit) {
 
                 if (busy) {
                     Spacer(Modifier.height(10.dp))
-                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = workAccent())
                 }
                 if (msg.isNotBlank()) {
                     Spacer(Modifier.height(8.dp))
@@ -2171,7 +2345,7 @@ private fun ImportDialog(vm: GatewayViewModel, onDismiss: () -> Unit) {
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
-        containerColor = CardBg,
+        containerColor = workCard(),
         shape = RoundedCornerShape(18.dp),
         title = { Text("导入账号", fontWeight = FontWeight.Bold) },
         text = {
@@ -2189,13 +2363,13 @@ private fun ImportDialog(vm: GatewayViewModel, onDismiss: () -> Unit) {
                     Text("选择 accounts.json 文件")
                 }
                 Spacer(Modifier.height(12.dp))
-                Text("或直接粘贴内容（含 accounts 数组）", color = Muted, fontSize = 12.sp)
+                Text("或直接粘贴内容（含 accounts 数组）", color = workMuted(), fontSize = 12.sp)
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(text, { text = it }, minLines = 5,
                     modifier = Modifier.fillMaxWidth().heightIn(max = 200.dp))
                 if (busy) {
                     Spacer(Modifier.height(10.dp))
-                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = workAccent())
                 }
                 if (msg.isNotBlank()) {
                     Spacer(Modifier.height(8.dp))
@@ -2239,7 +2413,7 @@ private fun ModelsScreen(vm: GatewayViewModel, ui: UiState) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column {
                     Text("模型", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                    Text("共 ${ui.models.size} 个 · 内置清单", color = Muted, fontSize = 13.sp)
+                    Text("共 ${ui.models.size} 个 · 内置清单", color = workMuted(), fontSize = 13.sp)
                 }
                 Spacer(Modifier.weight(1f))
                 OutlinedButton(onClick = { vm.refreshModels() },
@@ -2254,13 +2428,13 @@ private fun ModelsScreen(vm: GatewayViewModel, ui: UiState) {
         item {
             ui.state?.config?.defaultModel?.let { def ->
                 Box(
-                    Modifier.background(BlueSoft, RoundedCornerShape(12.dp))
+                    Modifier.background(workSoft(), RoundedCornerShape(12.dp))
                         .padding(horizontal = 14.dp, vertical = 10.dp)
                 ) {
                     Row {
-                        Text("默认模型", color = Blue, fontSize = 13.sp)
+                        Text("默认模型", color = workAccent(), fontSize = 13.sp)
                         Spacer(Modifier.width(10.dp))
-                        Text(def, color = Blue, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text(def, color = workAccent(), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
@@ -2275,17 +2449,17 @@ private fun ModelCard(m: ModelView) {
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
         colors = CardDefaults.cardColors(
-            containerColor = if (m.isDefault) BlueSoft else CardBg),
+            containerColor = if (m.isDefault) workSoft() else workCard()),
         elevation = CardDefaults.cardElevation(0.dp),
     ) {
         Column(Modifier.padding(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(m.name.ifBlank { m.id }, fontSize = 16.sp,
                     fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                if (m.isDefault) Text("默认", color = Blue, fontSize = 12.sp)
+                if (m.isDefault) Text("默认", color = workAccent(), fontSize = 12.sp)
             }
             Spacer(Modifier.height(4.dp))
-            Text(m.id, color = Muted, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+            Text(m.id, color = workMuted(), fontSize = 12.sp, fontFamily = FontFamily.Monospace)
             Spacer(Modifier.height(10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Chip("x${m.multiplier ?: "—"}")
@@ -2298,9 +2472,9 @@ private fun ModelCard(m: ModelView) {
 
 @Composable
 private fun Chip(text: String) {
-    Box(Modifier.background(Bg, RoundedCornerShape(8.dp))
+    Box(Modifier.background(workBg(), RoundedCornerShape(8.dp))
         .padding(horizontal = 9.dp, vertical = 5.dp)) {
-        Text(text, color = Muted, fontSize = 11.sp)
+        Text(text, color = workMuted(), fontSize = 11.sp)
     }
 }
 
@@ -2336,7 +2510,7 @@ private fun RecordsScreen(vm: GatewayViewModel, ui: UiState) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column {
                     Text("记录", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                    Text("调用与请求日志", color = Muted, fontSize = 13.sp)
+                    Text("调用与请求日志", color = workMuted(), fontSize = 13.sp)
                 }
                 Spacer(Modifier.weight(1f))
                 TextButton(onClick = { vm.refreshRecords() }) { Text("刷新") }
@@ -2364,7 +2538,7 @@ private fun RecordsScreen(vm: GatewayViewModel, ui: UiState) {
                     Text(
                         if (ui.records.isEmpty()) "暂无记录。发起一次 API 请求后会显示在这里。"
                         else "没有符合条件的记录。",
-                        color = Muted, fontSize = 13.sp,
+                        color = workMuted(), fontSize = 13.sp,
                     )
                 }
             }
@@ -2383,7 +2557,7 @@ private fun SegmentedButton(text: String, selected: Boolean, modifier: Modifier 
     Box(
         modifier
             .padding(2.dp)
-            .background(if (selected) CardBg else Color.Transparent, RoundedCornerShape(20.dp))
+            .background(if (selected) workCard() else Color.Transparent, RoundedCornerShape(20.dp))
             .clickable(onClick = onClick)
             .padding(vertical = 9.dp),
         contentAlignment = Alignment.Center,
@@ -2417,7 +2591,7 @@ private fun RunLogPane(vm: GatewayViewModel, ui: UiState, onSwitch: () -> Unit) 
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column {
                 Text("记录", fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                Text("调用与请求日志", color = Muted, fontSize = 13.sp)
+                Text("调用与请求日志", color = workMuted(), fontSize = 13.sp)
             }
             Spacer(Modifier.weight(1f))
             TextButton(onClick = { vm.refreshLog() }) { Text("刷新") }
@@ -2428,7 +2602,7 @@ private fun RunLogPane(vm: GatewayViewModel, ui: UiState, onSwitch: () -> Unit) 
             SegmentedButton("运行日志", true, Modifier.weight(1f)) {}
         }
         Spacer(Modifier.height(10.dp))
-        Text(ui.logPath, color = Muted, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+        Text(ui.logPath, color = workMuted(), fontSize = 10.sp, fontFamily = FontFamily.Monospace,
             maxLines = 1, overflow = TextOverflow.Ellipsis)
         Spacer(Modifier.height(8.dp))
         Card(
@@ -2438,7 +2612,7 @@ private fun RunLogPane(vm: GatewayViewModel, ui: UiState, onSwitch: () -> Unit) 
         ) {
             if (ui.logLines.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("暂无日志", color = Muted, fontSize = 13.sp)
+                    Text("暂无日志", color = workMuted(), fontSize = 13.sp)
                 }
             } else {
                 LazyColumn(
@@ -2469,7 +2643,7 @@ private fun RunLogPane(vm: GatewayViewModel, ui: UiState, onSwitch: () -> Unit) 
 private fun ChipButton(selected: Boolean, text: String, onClick: () -> Unit) {
     Box(
         Modifier
-            .background(if (selected) Blue else CardBg, RoundedCornerShape(20.dp))
+            .background(if (selected) workAccent() else workCard(), RoundedCornerShape(20.dp))
             .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 8.dp)
     ) {
@@ -2479,11 +2653,11 @@ private fun ChipButton(selected: Boolean, text: String, onClick: () -> Unit) {
 
 @Composable
 private fun RecordCard(r: CallRecord) {
-    val (bg, fg) = if (r.ok) GreenSoft to Green else RedSoft to Red
+    val (bg, fg) = if (r.ok) workSoft() to Green else workBadSoft() to Red
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = CardBg),
+        colors = CardDefaults.cardColors(containerColor = workCard()),
         elevation = CardDefaults.cardElevation(0.dp),
     ) {
         Column(Modifier.padding(14.dp)) {
@@ -2495,16 +2669,16 @@ private fun RecordCard(r: CallRecord) {
                 Spacer(Modifier.width(10.dp))
                 Text(r.model, fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(formatTime(r.ts), color = Muted, fontSize = 11.sp)
+                Text(formatTime(r.ts), color = workMuted(), fontSize = 11.sp)
             }
             Spacer(Modifier.height(8.dp))
             Text(
                 "${r.kind}${if (r.stream) " · stream" else ""} · ${"%.1f".format(r.seconds)}s"
                     + " · ${r.tokens} tok · ${r.points} 分",
-                color = Muted, fontSize = 12.sp,
+                color = workMuted(), fontSize = 12.sp,
             )
             Spacer(Modifier.height(3.dp))
-            Text("账号：${r.account}", color = Muted, fontSize = 12.sp)
+            Text("账号：${r.account}", color = workMuted(), fontSize = 12.sp)
             if (r.error.isNotBlank()) {
                 Spacer(Modifier.height(6.dp))
                 Text(r.error, color = Red, fontSize = 11.sp, maxLines = 3,
@@ -2554,7 +2728,7 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
 
         SectionTitle("调度")
         SectionCard {
-            Text("选号策略", color = Muted, fontSize = 13.sp)
+            Text("选号策略", color = workMuted(), fontSize = 13.sp)
             Spacer(Modifier.height(10.dp))
             val options = listOf(
                 "balance" to "余额均衡", "daily" to "先用活动余额",
@@ -2586,14 +2760,14 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             Text(
                 "无密码账号会在 session 到期前这么多天自动设置一个随机密码，" +
                     "之后每次到期都能用密码自动重登（永久账号）。",
-                color = Muted, fontSize = 12.sp,
+                color = workMuted(), fontSize = 12.sp,
             )
             Spacer(Modifier.height(12.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("自动设置密码", fontSize = 15.sp)
                     Text("到期前自动给无密码账号设密码（默认关闭）",
-                        color = Muted, fontSize = 12.sp)
+                        color = workMuted(), fontSize = 12.sp)
                 }
                 Switch(autoSetPwd, { autoSetPwd = it })
             }
@@ -2602,7 +2776,7 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
                 Column(Modifier.weight(1f)) {
                     Text("密码错误时自动改密", fontSize = 15.sp)
                     Text("密码被上游拒绝时用现有 session 重设（默认关闭）",
-                        color = Muted, fontSize = 12.sp)
+                        color = workMuted(), fontSize = 12.sp)
                 }
                 Switch(autoRepairPwd, { autoRepairPwd = it })
             }
@@ -2610,13 +2784,13 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             Text(
                 "这两项都会在账号已登录的其他设备上把 session 顶掉（顶号）。" +
                     "同一账号还在手机客户端登录时建议保持关闭，只在面板里手动设置密码。",
-                color = Muted, fontSize = 11.sp,
+                color = workMuted(), fontSize = 11.sp,
             )
         }
 
         SectionTitle("网络与安全")
         SectionCard {
-            Text("监听范围", color = Muted, fontSize = 13.sp)
+            Text("监听范围", color = workMuted(), fontSize = 13.sp)
             Spacer(Modifier.height(8.dp))
             Text("当前：${cfg?.host ?: "127.0.0.1"}:${port}",
                 fontSize = 13.sp, fontFamily = FontFamily.Monospace)
@@ -2672,7 +2846,7 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             }
             Text("本包默认端口 ${GatewayService.defaultPort()}（正式版 17991 / 精简版 17992）。" +
                 "两个包同时安装时请让它们使用不同端口。",
-                color = Muted, fontSize = 11.sp)
+                color = workMuted(), fontSize = 11.sp)
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -2681,7 +2855,7 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
                         if (cfg?.host == "0.0.0.0")
                             "同一 Wi-Fi 下的电脑/其他设备可直连网关"
                         else "仅本机可访问；开启后需重启网关生效",
-                        color = Muted, fontSize = 12.sp,
+                        color = workMuted(), fontSize = 12.sp,
                     )
                 }
                 Switch(
@@ -2761,7 +2935,7 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("记录请求日志", fontSize = 15.sp)
-                    Text("写入用量台账与运行日志", color = Muted, fontSize = 12.sp)
+                    Text("写入用量台账与运行日志", color = workMuted(), fontSize = 12.sp)
                 }
                 Switch(logRequests, { logRequests = it })
             }
@@ -2791,7 +2965,7 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             ) { Text("检查更新", fontSize = 13.sp) }
             Spacer(Modifier.height(6.dp))
             Text("更新包来自公开仓库 706412584/loomy2api-releases，无需 Token。",
-                color = Muted, fontSize = 11.sp)
+                color = workMuted(), fontSize = 11.sp)
             if (updateMsg.contains("发现新版本")) {
                 Spacer(Modifier.height(8.dp))
                 Button(
@@ -2816,7 +2990,7 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
             }
             if (updateBusy) {
                 Spacer(Modifier.height(8.dp))
-                LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue)
+                LinearProgressIndicator(Modifier.fillMaxWidth(), color = workAccent())
             }
             if (updateMsg.isNotBlank()) {
                 Spacer(Modifier.height(6.dp))
@@ -2852,9 +3026,9 @@ private fun SettingsScreen(vm: GatewayViewModel, ui: UiState) {
         }
 
         Spacer(Modifier.height(6.dp))
-        Text("Loomy2API for Android · 核心链路移植版", color = Muted, fontSize = 12.sp)
+        Text("Loomy2API for Android · 核心链路移植版", color = workMuted(), fontSize = 12.sp)
         Text("账号数据与配置保存在应用私有目录，卸载即清除。",
-            color = Muted, fontSize = 12.sp)
+            color = workMuted(), fontSize = 12.sp)
     }
 }
 
@@ -2881,7 +3055,7 @@ private fun TunnelSettings(vm: GatewayViewModel) {
             Text("公网访问（Cloudflare Tunnel）", fontSize = 15.sp)
             Text(
                 "通过 cloudflared 把本机网关暴露到公网；无需公网 IP。",
-                color = Muted, fontSize = 12.sp,
+                color = workMuted(), fontSize = 12.sp,
             )
         }
         Switch(
@@ -2968,7 +3142,7 @@ private fun TunnelSettings(vm: GatewayViewModel) {
         Text(
             "点「验证连接」会立即用该 token 建立隧道；Cloudflare 向导显示已连接后，" +
                 "即可继续下一步添加域名。",
-            color = Muted, fontSize = 11.sp,
+            color = workMuted(), fontSize = 11.sp,
         )
         Spacer(Modifier.height(8.dp))
         OutlinedTextField(
@@ -2991,7 +3165,7 @@ private fun TunnelSettings(vm: GatewayViewModel) {
             "首次使用顺序：填 token → 打开开关（状态变为「已连接」，Cloudflare " +
                 "向导即可继续）→ 在 Zero Trust 里给该隧道添加 Public Hostname，指向 " +
                 "http://127.0.0.1:${GatewayService.PORT} → 回到这里填域名。",
-            color = Muted, fontSize = 11.sp,
+            color = workMuted(), fontSize = 11.sp,
         )
     }
 
@@ -3014,14 +3188,14 @@ private fun TunnelSettings(vm: GatewayViewModel) {
     )
     tunnel.error?.takeIf { tunnel.status != TunnelStatus.RUNNING }?.let {
         Spacer(Modifier.height(4.dp))
-        Text(it, fontSize = 11.sp, color = Muted, maxLines = 3, overflow = TextOverflow.Ellipsis)
+        Text(it, fontSize = 11.sp, color = workMuted(), maxLines = 3, overflow = TextOverflow.Ellipsis)
     }
     tunnel.url?.let { url ->
         Spacer(Modifier.height(8.dp))
         CopyRow("公网 Base URL", url)
         Text(
             "OpenAI: $url/v1 · Anthropic: $url",
-            fontSize = 11.sp, color = Muted,
+            fontSize = 11.sp, color = workMuted(),
         )
     }
 
@@ -3029,7 +3203,7 @@ private fun TunnelSettings(vm: GatewayViewModel) {
         Spacer(Modifier.height(6.dp))
         Text(
             "开启后若尚未设置 API Key，会自动生成一个，避免公网裸奔。",
-            color = Muted, fontSize = 11.sp,
+            color = workMuted(), fontSize = 11.sp,
         )
     }
 }
@@ -3039,14 +3213,14 @@ private fun StrategyTile(label: String, key: String, selected: Boolean,
                          modifier: Modifier, onClick: () -> Unit) {
     Column(
         modifier
-            .background(if (selected) BlueSoft else Color.Transparent, RoundedCornerShape(10.dp))
+            .background(if (selected) workSoft() else Color.Transparent, RoundedCornerShape(10.dp))
             .clickable(onClick = onClick)
             .padding(12.dp)
     ) {
         Text(label, fontSize = 14.sp,
-            color = if (selected) Blue else Ink,
+            color = if (selected) Blue else workInk(),
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
-        Text(key, color = Muted, fontSize = 11.sp)
+        Text(key, color = workMuted(), fontSize = 11.sp)
     }
 }
 

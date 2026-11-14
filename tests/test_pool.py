@@ -81,6 +81,43 @@ class TestPool(unittest.TestCase):
         # a 401 clears the session, so it needs credentials to come back
         self.assertFalse(pool.get("a").session_valid)
 
+    def test_quota_cooldown_lasts_until_beijing_midnight_and_survives_reload(self):
+        self._write([{"name": "a", "session": "s1",
+                      "expireAt": int(time.time()) + 14 * 86400}])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        pool.report_failure(acc, 402, "insufficient_quota")
+        expected = (int(time.time()) // 86400 + 1) * 86400 - 8 * 3600
+        self.assertEqual(acc.cooldown_until, expected)
+        self.assertEqual(acc.cooldown_reason, "quota")
+        self.assertEqual(acc.session, "s1")
+        saved = json.loads((self.dir / "accounts.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["accounts"][0]["cooldownUntil"], expected)
+        loaded = AccountPool(self.cfg).get("a")
+        self.assertTrue(loaded.in_cooldown)
+        self.assertEqual(loaded.cooldown_reason, "quota")
+        with self.assertRaises(PoolError):
+            pool.acquire()
+        loaded.clear_cooldown(quota=True)
+        self.assertFalse(loaded.in_cooldown)
+
+    def test_rate_limit_keeps_short_cooldown(self):
+        self._write([{"name": "a", "session": "s1",
+                      "expireAt": int(time.time()) + 14 * 86400}])
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        pool.report_failure(acc, 429, "rate limited")
+        self.assertEqual(acc.cooldown_reason, "transient")
+        self.assertLessEqual(acc.cooldown_until, time.time() + 301)
+        self.assertEqual(pool.acquire().name, "a")
+
+    def test_renewal_does_not_clear_quota_cooldown(self):
+        acc = Account(name="a", session="s", cooldown_until=time.time() + 5000,
+                      cooldown_reason="quota", last_error="quota rejected")
+        acc.clear_cooldown()
+        self.assertTrue(acc.in_cooldown)
+        self.assertEqual(acc.last_error, "quota rejected")
+
     def test_exhausted_account_is_skipped(self):
         self._write([
             {"name": "a", "session": "s1", "expireAt": int(time.time()) + 14 * 86400},

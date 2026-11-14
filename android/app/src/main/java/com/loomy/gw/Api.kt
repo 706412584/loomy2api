@@ -142,10 +142,13 @@ class ApiException(val status: Int, message: String) : Exception(message)
 data class AccountView(
     val name: String,
     val loginidMasked: String,
+    val loginid: String = "",
     val enabled: Boolean,
     val hasSession: Boolean,
     val inCooldown: Boolean,
     val cooldownLeft: Double,
+    val cooldownUntil: Long = 0,
+    val cooldownReason: String = "",
     val sessionDaysLeft: Double?,
     val available: Int?,
     val balance: Int?,
@@ -206,7 +209,7 @@ data class AccountView(
         get() = when {
             !enabled -> "已禁用"
             banned -> "已封禁"
-            inCooldown -> "冷却中"
+            inCooldown -> if (cooldownReason == "quota") "额度冷却" else "冷却中"
             !hasSession -> "无登录态"
             // a stored password means expiry is handled by an automatic login
             permanent -> if (sessionDaysLeft != null && sessionDaysLeft < 3) "永久" else "正常"
@@ -286,10 +289,13 @@ fun parseState(o: JSONObject): StateView {
         AccountView(
             name = a.optString("name"),
             loginidMasked = a.optString("loginid_masked"),
+            loginid = a.optString("loginid"),
             enabled = a.optBoolean("enabled", true),
             hasSession = a.optString("session").isNotEmpty(),
             inCooldown = a.optBoolean("in_cooldown"),
             cooldownLeft = a.optDouble("cooldown_seconds_left", 0.0),
+            cooldownUntil = a.optLong("cooldown_until"),
+            cooldownReason = a.optString("cooldown_reason"),
             sessionDaysLeft = if (a.isNull("session_days_left")) null
                 else a.optDouble("session_days_left"),
             available = if (a.isNull("available")) null else a.optInt("available"),

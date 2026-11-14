@@ -81,8 +81,12 @@ def business_error_status(data: bytes) -> Optional[int]:
     if payload.get("choices") or payload.get("object") is not None:
         return None
     if payload.get("error"):
-        # OpenAI-shaped error delivered with HTTP 200
-        text = json.dumps(payload.get("error"), ensure_ascii=False)
+        error = payload["error"]
+        if isinstance(error, dict):
+            kind = str(error.get("type") or error.get("code") or "").lower()
+            if kind == "insufficient_quota":
+                return 402
+        text = json.dumps(error, ensure_ascii=False)
         return 401 if any(m in text for m in SESSION_EXPIRED_MARKERS) else 502
     code = str(payload.get("code") if payload.get("code") is not None else "")
     desc = str(payload.get("desc") or payload.get("message") or "")

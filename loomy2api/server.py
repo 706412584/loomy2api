@@ -721,6 +721,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/panel/fysms/balance": panel.fysms_balance,
             "/api/panel/accounts/remove": panel.remove_account,
             "/api/panel/accounts/renew": panel.renew_account,
+            "/api/panel/accounts/reset-cooldown": panel.reset_cooldown,
             "/api/panel/accounts/check": panel.check_accounts,
             "/api/panel/accounts/identity": panel.identity,
             "/api/panel/refresh": lambda _p: panel.refresh(_p),
