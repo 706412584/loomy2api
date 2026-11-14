@@ -91,6 +91,10 @@ DEFAULTS: Dict[str, Any] = {
     #: password while someone else is logged in with the same account kicks
     #: that session ("顶号") — the mobile build defaults this to off.
     "auto_repair_password": True,
+    #: Minimum hours between automatic password repairs for one account.  A
+    #: repair rotates the upstream password and logs the account out on every
+    #: other device, so this caps the damage a failing repair loop could do.
+    "password_repair_interval_hours": 24,
     #: Give password-less accounts a random password shortly before their
     #: session expires.  Same "顶号" trade-off as above; also defaults to off
     #: on mobile, where the account list is shared with the phone's own client.

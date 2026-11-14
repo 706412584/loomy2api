@@ -125,6 +125,11 @@ class Account:
     #: The account service can report success while the password is not usable
     #: yet (``0200103``), so a password is only trusted after this check.
     password_verified_at: int = 0
+    #: unix seconds of the last automatic password repair (any outcome).
+    #: Repairing rotates the upstream password, which logs the account out on
+    #: every other device ("顶号"), so it is capped to once per day per account
+    #: — a failing repair must not retry in a loop.
+    password_repaired_at: int = 0
 
     #: per-account device identity (devid / ua / campus device id / …)
     identity: Dict[str, Any] = field(default_factory=dict)
@@ -252,6 +257,7 @@ class Account:
                                 or raw.get("password_set_at") or 0),
             password_verified_at=int(raw.get("passwordVerifiedAt")
                                      or raw.get("password_verified_at") or 0),
+            password_repaired_at=int(raw.get("passwordRepairedAt") or 0),
             identity=dict(identity) if isinstance(identity, dict) else {},
             activated=(raw.get("activated") if isinstance(raw.get("activated"), bool)
                        else None),
@@ -286,6 +292,8 @@ class Account:
             out["passwordSetAt"] = self.password_set_at
         if self.password_verified_at:
             out["passwordVerifiedAt"] = self.password_verified_at
+        if self.password_repaired_at:
+            out["passwordRepairedAt"] = self.password_repaired_at
         if self.session:
             out["session"] = self.session
         if self.userid:

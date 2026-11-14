@@ -584,6 +584,59 @@ class TestSessionLifecycle(unittest.TestCase):
         self.assertEqual(acc.password, "wrong")
         self.assertEqual(acc.session, "good")
 
+    def test_auto_repair_rotates_the_password_once_a_day(self):
+        """A rejected password is replaced while the session still works.
+
+        Repair rotates the upstream password, which logs the account out on
+        every other device — so a second attempt inside the window must be
+        refused even when the first one failed.
+        """
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "passwordVerifiedAt": int(time.time()),
+             "session": "good", "expireAt": int(time.time()) + 9 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        rotates = []
+
+        class FakeClient:
+            def fill(self, account):
+                from loomy2api.account import AccountError
+                raise AccountError("密码错误", code="220204")
+
+            def set_password(self, session, new_password, identity=None):
+                rotates.append(new_password)
+
+            def login_by_password(self, loginid, password, identity=None):
+                return {"session": "fresh", "userid": "u"}
+
+        pool.client = FakeClient()
+        acc = pool.get("a")
+
+        self.assertTrue(pool._repair_password(acc, reason="test"))
+        self.assertEqual(len(rotates), 1)
+        self.assertTrue(acc.password_repaired_at > 0)
+        self.assertNotEqual(acc.password, "wrong")
+
+        # Second attempt inside the window is refused, no second rotation.
+        self.assertFalse(pool._repair_password(acc, reason="test"))
+        self.assertEqual(len(rotates), 1)
+
+    def test_repair_stamp_is_persisted(self):
+        from tests.support import write_accounts
+
+        write_accounts(self.dir / "accounts.json", [
+            {"name": "a", "loginid": "13800000001", "password": "wrong",
+             "session": "good", "expireAt": int(time.time()) + 9 * 86400},
+        ])
+        pool = AccountPool(self.cfg)
+        pool.get("a").password_repaired_at = int(time.time())
+        pool.save(force=True)
+        again = AccountPool(self.cfg)
+        self.assertTrue(again.get("a").password_repaired_at > 0)
+
     def test_credential_error_detection(self):
         from loomy2api.account import AccountError, is_credential_error
 

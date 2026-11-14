@@ -388,6 +388,18 @@ class AccountPool:
             return False
         if not acc.persist or not acc.loginid or not acc.session_valid:
             return False
+        # Once per account per day.  A repair rotates the upstream password,
+        # which logs the account out everywhere else ("顶号"), so a repeat
+        # within the window is refused even when the last attempt failed —
+        # otherwise a persistently failing repair would rotate all day.
+        window = float(self.cfg.get("password_repair_interval_hours") or 24) * 3600
+        since = time.time() - (acc.password_repaired_at or 0)
+        if acc.password_repaired_at and since < window:
+            left = int((window - since) / 3600) or 1
+            self.log(f"账号 {acc.name} 今天已尝试过自动改密，"
+                     f"{left} 小时后再试（避免反复改密顶号）")
+            return False
+        acc.password_repaired_at = int(time.time())
         self.log(f"账号 {acc.name} 密码被上游拒绝（{reason}），"
                  f"用现有 session 自动改密")
         try:
@@ -396,6 +408,7 @@ class AccountPool:
             # Best effort: a failed repair must never break the request that
             # triggered it.  The caller falls back to the existing session.
             self.log(f"账号 {acc.name} 自动改密失败：{exc}")
+            self.save()
             return False
         self.log(f"账号 {acc.name} 自动改密成功（新密码已写入 accounts.json）")
         return True
