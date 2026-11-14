@@ -1168,7 +1168,12 @@ class AccountPool:
         if status == 402:
             # UTC+8 is fixed by the upstream's business day; using the host's
             # timezone would move the reset when running in Docker or Windows.
-            next_midnight = (int(time.time()) // 86400 + 1) * 86400 - 8 * 3600
+            # Shift the epoch into UTC+8 *before* taking the day ordinal: doing
+            # it after yields 00:00 of the *current* day — already in the past —
+            # for every failure reported between 00:00 and 08:00 Beijing time,
+            # which made the cooldown a no-op in exactly that window.
+            now = int(time.time())
+            next_midnight = ((now + 8 * 3600) // 86400 + 1) * 86400 - 8 * 3600
             acc.failures += 1
             acc.cooldown_until = float(next_midnight)
             acc.cooldown_reason = "quota"

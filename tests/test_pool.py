@@ -81,13 +81,42 @@ class TestPool(unittest.TestCase):
         # a 401 clears the session, so it needs credentials to come back
         self.assertFalse(pool.get("a").session_valid)
 
+    @staticmethod
+    def _beijing_midnight_after(now: int) -> int:
+        return ((now + 8 * 3600) // 86400 + 1) * 86400 - 8 * 3600
+
+    def test_quota_cooldown_lands_on_next_beijing_midnight_for_every_hour(self):
+        """The reset must be the *next* 00:00 UTC+8, whatever the local hour.
+
+        Taking the day ordinal before shifting into UTC+8 produced 00:00 of the
+        current day for failures between 00:00 and 08:00 Beijing time, so the
+        cooldown had already expired the moment it was written and the account
+        was re-picked on every request.
+        """
+        from unittest import mock
+        for hour in range(24):
+            with self.subTest(hour=hour):
+                now = 1794787200 - 8 * 3600 + hour * 3600 + 17 * 60
+                expected = self._beijing_midnight_after(now)
+                self.assertGreater(expected, now)
+                self.assertEqual((expected + 8 * 3600) % 86400, 0)
+                self.assertLessEqual(expected - now, 86400)
+                with mock.patch("time.time", return_value=now):
+                    self._write([{"name": "a", "session": "s1",
+                                  "expireAt": now + 14 * 86400}])
+                    pool = AccountPool(self.cfg)
+                    acc = pool.get("a")
+                    pool.report_failure(acc, 402, "insufficient_quota")
+                    self.assertEqual(acc.cooldown_until, expected)
+                    self.assertTrue(acc.in_cooldown)
+
     def test_quota_cooldown_lasts_until_beijing_midnight_and_survives_reload(self):
         self._write([{"name": "a", "session": "s1",
                       "expireAt": int(time.time()) + 14 * 86400}])
         pool = AccountPool(self.cfg)
         acc = pool.get("a")
         pool.report_failure(acc, 402, "insufficient_quota")
-        expected = (int(time.time()) // 86400 + 1) * 86400 - 8 * 3600
+        expected = self._beijing_midnight_after(int(time.time()))
         self.assertEqual(acc.cooldown_until, expected)
         self.assertEqual(acc.cooldown_reason, "quota")
         self.assertEqual(acc.session, "s1")
