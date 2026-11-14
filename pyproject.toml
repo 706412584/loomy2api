@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "loomy2api"
-version = "2.9.0"
+version = "2.9.1"
 description = "Turn the Loomy (iFlytek) desktop assistant quota into an OpenAI/Anthropic-compatible local API gateway, with a multi-account pool."
 readme = "README.md"
 requires-python = ">=3.9"
