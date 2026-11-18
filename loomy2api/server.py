@@ -854,6 +854,8 @@ class Handler(BaseHTTPRequestHandler):
         tried: list = []
         last: Tuple[int, bytes] = (0, b"")
         pool_error = ""
+        upstream_faults = 0
+        fault_limit = int(gw.cfg.get("upstream_fault_retries") or 0)
         for attempt in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
                 acc = gw.pool.acquire(exclude=tried, model=model)
@@ -921,6 +923,14 @@ class Handler(BaseHTTPRequestHandler):
             elif status in self.UPSTREAM_FAULT:
                 # upstream hiccup (502/504/500) — do NOT punish the account for
                 # it, but do wait: another account hits the same bad window.
+                # Cap the burst: retrying more accounts only keeps the client
+                # waiting, and it would retry this status itself anyway.
+                upstream_faults += 1
+                if upstream_faults > fault_limit:
+                    gw.log(f"[call] {acc.name} {model} http={status}"
+                           f" → 上游异常已达上限（{upstream_faults} 个账号），"
+                           f"快速返回给客户端重试")
+                    break
                 delay = self._upstream_backoff(attempt)
                 gw.log(f"[call] {acc.name} {model} http={status}"
                        f" → 上游异常，等 {delay:.1f}s 后重试（不冷却该账号）")
@@ -971,6 +981,9 @@ class Handler(BaseHTTPRequestHandler):
         model = req.get("model")
         tried: list = list(exclude)
         conn = resp = None
+        upstream_faults = 0
+        fault_limit = int(gw.cfg.get("upstream_fault_retries") or 0)
+        last_fault: Optional[Tuple[int, bytes]] = None
 
         for attempt in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
@@ -983,6 +996,11 @@ class Handler(BaseHTTPRequestHandler):
                 # would misattribute an upstream outage to the pool.
                 if pool_error is not None and not tried:
                     pool_error.append(str(exc))
+                if last_fault is not None:
+                    # the pool ran dry while the upstream was flaking: hand the
+                    # upstream's own 5xx back (the Anthropic path maps it to
+                    # 529) instead of a bare "all accounts failed".
+                    return None, None, _ContentRejected(*last_fault)
                 return None, None, resp
             tried.append(acc.name)
             conn, resp = gw.models_client.stream(acc.session, "chat/completions",
@@ -1024,6 +1042,7 @@ class Handler(BaseHTTPRequestHandler):
                        f"{data[:200].decode('utf-8', 'replace')}")
                 return None, None, _ContentRejected(resp.status, data)
             if resp.status in self.ACCOUNT_FAULT:
+                last_fault = None
                 gw.log(f"[{log_tag}] {acc.name} {model} stream http={resp.status}"
                        f" → 账号问题，换账号重试")
                 gw.pool.report_failure(acc, resp.status,
@@ -1031,11 +1050,22 @@ class Handler(BaseHTTPRequestHandler):
             elif resp.status in self.UPSTREAM_FAULT:
                 # the upstream's own gateway is flaking, and another account
                 # hits the same bad window — pause before retrying, otherwise
-                # every attempt burns inside the burst and this 502 is served.
-                delay = self._upstream_backoff(attempt)
-                gw.log(f"[{log_tag}] {acc.name} {model} stream http={resp.status}"
-                       f" → 上游异常，等 {delay:.1f}s 后重试（不冷却该账号）")
+                # every attempt burns inside the burst.  But only for a few
+                # tries: each 5xx round-trip costs 4-7 s of client silence,
+                # and the client retries 5xx itself, so a long in-process
+                # chain only delays an error it will ask for again anyway.
+                upstream_faults += 1
+                last_fault = (resp.status, data)
                 conn = resp = None
+                if upstream_faults > fault_limit:
+                    gw.log(f"[{log_tag}] {acc.name} {model} stream "
+                           f"http={last_fault[0]} → 上游异常已达上限"
+                           f"（{upstream_faults} 个账号），快速返回给客户端重试")
+                    return None, None, _ContentRejected(*last_fault)
+                delay = self._upstream_backoff(attempt)
+                gw.log(f"[{log_tag}] {acc.name} {model} stream "
+                       f"http={last_fault[0]} → 上游异常，等 {delay:.1f}s 后重试"
+                       f"（不冷却该账号）")
                 self._sleep_backoff(delay)
                 continue
             else:
@@ -1316,6 +1346,8 @@ class Handler(BaseHTTPRequestHandler):
         tried: list = []
         last: Tuple[int, bytes] = (0, b"")
         pool_error = ""
+        upstream_faults = 0
+        fault_limit = int(gw.cfg.get("upstream_fault_retries") or 0)
         for attempt in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
                 acc = gw.pool.acquire(exclude=tried, model=model)
@@ -1373,6 +1405,12 @@ class Handler(BaseHTTPRequestHandler):
                                        data[:200].decode("utf-8", "replace"))
                 gw.log(f"[messages] {acc.name} {model} http={status} → 账号问题，换账号重试")
             elif status in self.UPSTREAM_FAULT:
+                upstream_faults += 1
+                if upstream_faults > fault_limit:
+                    gw.log(f"[messages] {acc.name} {model} http={status}"
+                           f" → 上游异常已达上限（{upstream_faults} 个账号），"
+                           f"快速返回给客户端重试")
+                    break
                 delay = self._upstream_backoff(attempt)
                 gw.log(f"[messages] {acc.name} {model} http={status}"
                        f" → 上游异常，等 {delay:.1f}s 后重试（不冷却该账号）")
@@ -1386,6 +1424,17 @@ class Handler(BaseHTTPRequestHandler):
         if not last[0] and pool_error:
             return self._error(400, pool_error, "account_pool_error")
         status, data = last
+        if status in self.UPSTREAM_FAULT:
+            # Anthropic's own "overloaded" status: SDK clients (Claude Code
+            # included) treat 529/overloaded_error as "retry me shortly",
+            # which is exactly what an upstream 5xx burst is.  A bare 502
+            # made the client report it as a server error instead.
+            self._log_giveup("messages", model, 529, len(tried),
+                             data[:160].decode("utf-8", "replace"))
+            return self._json(529, {"type": "error", "error": {
+                "type": "overloaded_error",
+                "message": "upstream overloaded (5xx), please retry"
+                           " / 上游繁忙，请稍后重试"}})
         if status >= 400:
             self._log_giveup("messages", model, status,
                              len(tried), data[:160].decode("utf-8", "replace"))
@@ -1442,6 +1491,16 @@ class Handler(BaseHTTPRequestHandler):
                         "type": "api_error", "message": "all accounts failed"}})
                 data = resp.read()
                 resp.close() if hasattr(resp, "close") else None
+                if resp.status in self.UPSTREAM_FAULT:
+                    # Same mapping as the non-stream path: an upstream burst
+                    # becomes Anthropic's 529/overloaded_error so the client
+                    # retries quickly instead of surfacing a server error.
+                    self._log_giveup("messages-stream", model, 529, attempts,
+                                     data[:160].decode("utf-8", "replace"))
+                    return self._json(529, {"type": "error", "error": {
+                        "type": "overloaded_error",
+                        "message": "upstream overloaded (5xx), please retry"
+                                   " / 上游繁忙，请稍后重试"}})
                 self._log_giveup("messages-stream", model, resp.status, attempts,
                                  data[:160].decode("utf-8", "replace"))
                 return self._json(resp.status, {"type": "error", "error": {

@@ -58,6 +58,14 @@ DEFAULTS: Dict[str, Any] = {
     #: doubles each time, capped at ``upstream_fault_backoff_max``.
     "upstream_fault_backoff": 0.5,
     "upstream_fault_backoff_max": 4.0,
+    #: Extra accounts to burn on *upstream* (5xx) faults before giving up.
+    #: Those bursts hit every account at once — the pool can be full of healthy
+    #: sessions and all of them get 503 — so retrying more accounts only keeps
+    #: the client waiting.  Observed cost: each 5xx round-trip takes 4-7 s, so
+    #: 5 accounts meant ~30 s of silence before a 502.  Claude Code retries 5xx
+    #: on its own, so failing fast (and telling it ``529 overloaded_error``)
+    #: is better than burning the budget here.
+    "upstream_fault_retries": 2,
     #: Abort a stream that makes **no progress at all** — not one SSE byte —
     #: for this long.  This is the real stall guard: a reasoning model that
     #: keeps streaming deltas (even pure ``reasoning_content`` with no answer

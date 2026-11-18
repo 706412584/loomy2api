@@ -68,3 +68,6 @@ pstate*.json
 ph*.json
 _up*.png
 gateway.lock
+
+# config backups created before LAN/bind switches
+config.json.bak*

@@ -501,6 +501,41 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertIn("放弃", log)
         self.assertIn("返回 502 给客户端", log)
 
+    def test_upstream_5xx_burst_is_capped_and_529_for_anthropic_stream(self):
+        """A persistent upstream 5xx must stop burning accounts, and the
+        Anthropic surface must answer 529/overloaded_error so Claude Code
+        retries instead of reporting a server error.
+
+        Observed in production: five accounts × a 4-7 s round-trip meant ~30 s
+        of client silence before a bare 502, and the client often dropped the
+        connection first.  Only ``upstream_fault_retries + 1`` accounts may be
+        contacted on upstream 5xx.
+        """
+        self.cfg["upstream_fault_backoff"] = 0.01
+        self.cfg["upstream_fault_retries"] = 0
+        self.upstream.reject_with = {"fake-model": (503, "busy")}
+        status, body, _ = self.post_status("/v1/messages", {
+            "model": "fake-model", "stream": True, "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 529)
+        self.assertEqual(json.loads(body)["error"]["type"], "overloaded_error")
+        chat_calls = [c for c in self.upstream.calls
+                      if c["path"].endswith("/chat/completions")]
+        self.assertEqual(len(chat_calls), 1)      # capped, did not rotate on
+        log = Path(self.gateway.log.path).read_text(encoding="utf-8", errors="replace")
+        self.assertIn("上游异常已达上限", log)
+        self.assertIn("返回 529 给客户端", log)
+
+    def test_upstream_5xx_becomes_529_for_anthropic_non_stream(self):
+        self.cfg["upstream_fault_backoff"] = 0.01
+        self.cfg["upstream_fault_retries"] = 1
+        self.upstream.reject_with = {"fake-model": (504, "timeout")}
+        status, body, _ = self.post_status("/v1/messages", {
+            "model": "fake-model", "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(status, 529)
+        self.assertEqual(json.loads(body)["error"]["type"], "overloaded_error")
+
     def test_empty_stream_retry_switches_account(self):
         """An empty stream must not be retried on the same account."""
         self.gateway.pool.get("a").available = 1000
