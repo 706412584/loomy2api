@@ -268,6 +268,43 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertTrue(any(d["delta"].get("type") == "text_delta"
                             and d["delta"].get("text") == "hello" for d in deltas))
 
+    def test_chat_call_carries_official_attribution_headers(self):
+        """The 0.9.39 client sends ChatId/MsgId/TurnId/InvokeOrigin/purpose on
+        every chat call; the upstream's adjudication layer reads them.  The
+        gateway must look like the official client on the wire."""
+        self.post("/v1/messages", {
+            "model": "fake-model", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]})
+        call = [c for c in self.upstream.calls
+                if c["path"].endswith("/chat/completions")][-1]
+        h = call["headers"]
+        self.assertRegex(h["traceparent"],
+                         r"^00-[0-9a-f]{32}-[0-9a-f]{16}-01$")
+        self.assertEqual(h["loomy-version"], "0.9.39")
+        self.assertRegex(h["ChatId"],
+                         r"^chat-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                         r"[0-9a-f]{4}-[0-9a-f]{12}$")
+        self.assertRegex(h["MsgId"], r"^msg-")
+        self.assertEqual(h["TurnId"], h["MsgId"])
+        self.assertEqual(h["InvokeOrigin"], "user")
+        self.assertEqual(h["X-Loomy-Request-Purpose"], "chat.message")
+
+    def test_chat_id_is_stable_per_account(self):
+        """ChatId is derived from the account session, so the turns an account
+        serves stay under one attribution id instead of a new conversation per
+        request (the official client keeps one per conversation)."""
+        for _ in range(2):
+            self.post("/v1/messages", {
+                "model": "fake-model", "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}]})
+        by_token: dict = {}
+        for c in self.upstream.calls:
+            if c["path"].endswith("/chat/completions"):
+                by_token.setdefault(c["token"], set()).add(c["headers"]["ChatId"])
+        self.assertTrue(by_token)
+        for chat_ids in by_token.values():
+            self.assertEqual(len(chat_ids), 1)
+
     def test_points_endpoint(self):
         _s, payload = self.get("/v1/points")
         self.assertEqual(payload["total_available"], 300)     # 150 × 2 accounts

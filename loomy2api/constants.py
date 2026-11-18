@@ -30,7 +30,7 @@ DEFAULT_ACCESS_KEY_ID = "2thryby66wxi53sk"
 DEFAULT_ACCESS_KEY_SECRET = "zsak6eadrbawz683wf5r3m2snrwj868r"
 
 #: Sent as the ``loomy-version`` header; the gateway only checks it is present.
-DEFAULT_LOOMY_VERSION = "0.9.38"
+DEFAULT_LOOMY_VERSION = "0.9.39"
 
 #: Passphrase used by the client to obfuscate ``resources/.env.prod``
 #: (hard-coded in ``electron/utils/env-file-crypto.js`` of the client).

@@ -228,7 +228,8 @@ class FakeUpstream:
             def do_GET(self):                           # noqa: N802
                 token = fake._token(self)
                 path = self.path.split("?")[0]
-                fake.calls.append({"path": path, "token": token, "body": None})
+                fake.calls.append({"path": path, "token": token, "body": None,
+                                   "headers": dict(self.headers.items())})
                 if fake.valid_sessions is not None and token not in fake.valid_sessions:
                     return fake._reject(self, 401, "invalid session")
                 if path.endswith("/models"):
@@ -251,7 +252,8 @@ class FakeUpstream:
                 token = fake._token(self)
                 path = self.path.split("?")[0]
                 body = self._read()
-                fake.calls.append({"path": path, "token": token, "body": body})
+                fake.calls.append({"path": path, "token": token, "body": body,
+                                   "headers": dict(self.headers.items())})
                 if fake.valid_sessions is not None and token not in fake.valid_sessions:
                     return fake._reject(self, 401, "invalid session")
                 if token in fake.exhausted_sessions:

@@ -12,7 +12,7 @@
   "access_key_id": "",
   "access_key_secret": "",
 
-  "loomy_version": "0.9.38",
+  "loomy_version": "0.9.39",
   "_proxy": "empty = direct connection (recommended for these domestic endpoints)",
   "proxy": "",
 
@@ -35,6 +35,8 @@
   "_identity": "per_account = each account gets its own devid + promotions device id, bound on first login; client = mirror the shipped client exactly (devid: web)",
   "identity_mode": "per_account",
   "max_retries": 2,
+  "_upstream_fault_retries": "Extra accounts to try when the upstream itself returns 5xx. Those bursts hit every account at once, so retrying more only delays the client's own retry.",
+  "upstream_fault_retries": 2,
   "cooldown_seconds": 300,
   "session_renew_before_days": 3,
   "_password_upgrade": "Password-less accounts get a generated password this many days before the session expires, so they can re-login forever.",

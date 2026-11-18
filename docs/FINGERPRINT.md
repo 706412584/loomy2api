@@ -57,18 +57,19 @@ export function getLoomyVersion() {
 
 ## 4. 唯一明确差异
 
-### 4.1 ⚠️ `DEFAULT_LOOMY_VERSION` 版本号偏低
+### 4.1 ✅ `DEFAULT_LOOMY_VERSION` 已对齐（2026-11-18）
 
 | 项 | 值 |
 |---|---|
 | 真实客户端 0.9.39 发的 `loomy-version` | `0.9.39` |
-| loomy2api 当前写的 `DEFAULT_LOOMY_VERSION` | `0.9.38` |
+| loomy2api 当前写的 `DEFAULT_LOOMY_VERSION` | `0.9.39` |
 
-**风险评估**：低。`loomy2api/upstream.py:112` 注释写"presence-checked only"——
+**风险评估**：低。`loomy2api/upstream.py` 注释写"presence-checked only"——
 上游**只检查存在性，不校验具体值**。实测 loomy2api 用 0.9.38 也能跑通。
 
-**建议**：把 `DEFAULT_LOOMY_VERSION` 改为 `0.9.39`，与最新客户端对齐。
-但若持续跟踪客户端升级麻烦，也可以**保持现状**——上游不查值。
+**已处理**：2026-11-18 把 `DEFAULT_LOOMY_VERSION` 改为 `0.9.39`，
+并在 `/chat/completions` 上补齐 `ChatId`/`MsgId`/`TurnId`/`InvokeOrigin`/
+`X-Loomy-Request-Purpose`（见 `upstream.py` 的 `_chat_headers`）。
 
 ## 5. 客户端有但 loomy2api 未使用的可选请求头
 

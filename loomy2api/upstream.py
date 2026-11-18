@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -126,6 +127,18 @@ def build_model_headers(session: str, *, version: str = "",
     return headers
 
 
+def _chat_id_for(session: str) -> str:
+    """A stable ``chat-<uuid>`` derived from the account session.
+
+    The official client keeps one ChatId per conversation and the gateway has
+    no conversation id, so the session is the closest stable seed — turns
+    served by the same account stay under one attribution id instead of a new
+    "conversation" per request.
+    """
+    h = hashlib.sha256(session.encode("utf-8")).hexdigest()
+    return f"chat-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
 class ModelGateway:
     """Thin wrapper around the upstream HTTP API."""
 
@@ -144,6 +157,28 @@ class ModelGateway:
     def _headers(self, session: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         return build_model_headers(session, version=str(self.cfg.get("loomy_version") or ""),
                                    extra=extra)
+
+    def _chat_headers(self, session: str,
+                      extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        """Headers for ``/chat/completions`` — adds the 0.9.39 attribution set.
+
+        The official client sends ``ChatId``/``MsgId``/``TurnId``/
+        ``InvokeOrigin``/``X-Loomy-Request-Purpose`` on every chat call and the
+        upstream's adjudication layer reads them (reversed from 0.9.39 in
+        magpie-loomy-auth 0.1.28).  A caller-supplied value wins, so the
+        OpenAI path can still forward its own ids.
+        """
+        msg_id = f"msg-{uuid.uuid4()}"
+        defaults = {
+            "ChatId": _chat_id_for(session),
+            "MsgId": msg_id,
+            "TurnId": msg_id,
+            "InvokeOrigin": "user",
+            "X-Loomy-Request-Purpose": str(
+                self.cfg.get("request_purpose") or "chat.message"),
+        }
+        defaults.update(extra or {})
+        return self._headers(session, defaults)
 
     # -- read-only ------------------------------------------------------
 
@@ -353,17 +388,23 @@ class ModelGateway:
              extra_headers: Optional[Dict[str, str]] = None,
              method: str = "POST") -> Tuple[int, Dict[str, str], bytes]:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
+        headers = (self._chat_headers(session, extra_headers)
+                   if suffix == "chat/completions"
+                   else self._headers(session, extra_headers))
         return http_request(
-            self._url(suffix), method=method, headers=self._headers(session, extra_headers),
+            self._url(suffix), method=method, headers=headers,
             body=body, timeout=float(self.cfg.get("timeout") or 1200),
             proxy=str(self.cfg.get("proxy") or ""))
 
     def stream(self, session: str, suffix: str, payload: Dict[str, Any],
                extra_headers: Optional[Dict[str, str]] = None):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = (self._chat_headers(session, extra_headers)
+                   if suffix == "chat/completions"
+                   else self._headers(session, extra_headers))
         return open_stream(
             self._url(suffix), method="POST",
-            headers=self._headers(session, extra_headers), body=body,
+            headers=headers, body=body,
             timeout=float(self.cfg.get("timeout") or 1200),
             proxy=str(self.cfg.get("proxy") or ""))
 
