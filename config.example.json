@@ -24,6 +24,8 @@
 
   "timeout": 1200,
   "request_purpose": "chat.message",
+  "_image_accounts": "Account names proven to generate images. The upstream gates image generation per account and never exposes it in /models; these are tried first, then the general pool. Empty = pool only.",
+  "image_accounts": [],
   "log_dir": "logs",
   "log_requests": true,
   "log_console": true,

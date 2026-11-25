@@ -227,6 +227,20 @@ class Gateway:
                                for m in C.FALLBACK_MODELS]
             return list(self.models)
 
+    def image_accounts(self) -> list:
+        """Accounts named in ``config.image_accounts``, in config order.
+
+        Image entitlement is an account-level whitelist the upstream never
+        publishes: an account can list the image models in ``/models`` and
+        still answer 406 "当前账号暂不支持图片生成".  These names are the ones
+        proven to work, so image requests try them before the general pool.
+        """
+        names = self.cfg.get("image_accounts") or []
+        if not names:
+            return []
+        by_name = {a.name: a for a in self.pool.accounts}
+        return [by_name[str(name)] for name in names if str(name) in by_name]
+
     def note_model_substitution(self, acc, requested: str, served: str) -> None:
         """Handle the upstream answering a different model than was asked.
 
@@ -693,7 +707,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/v1/embeddings":
                 return self._passthrough("embeddings")
             if path == "/v1/images/generations":
-                return self._passthrough("images/generations")
+                return self._images()
             if path in ("/v1/admin/accounts/reload", "/admin/accounts/reload"):
                 self.gateway.pool.load()
                 self.gateway.refresh_models()
@@ -824,21 +838,11 @@ class Handler(BaseHTTPRequestHandler):
         raw = self._read_body()
         body = json.loads(raw.decode("utf-8")) if raw else {}
         extra = None
-        if suffix == "images/generations":
-            # Exactly what the official client sends (image-generation-service.js
-            # DEFAULT_IMAGE_GENERATION_OPTIONS + REQUEST_PURPOSE.IMAGE_GENERATE).
-            # Without the defaults and the purpose header the upstream answers
-            # 406 "当前账号暂不支持图片生成" even on an entitled account.
-            body.setdefault("n", 1)
-            body.setdefault("size", "2304x1728")
-            body.setdefault("response_format", "url")
-            extra = {"X-Loomy-Request-Purpose": "image.generate"}
-        elif suffix == "embeddings":
+        if suffix == "embeddings":
             # The official client declares embeddings as kb.embed
             # (REQUEST_PURPOSE.KB_EMBED); the adjudication layer reads it.
             extra = {"X-Loomy-Request-Purpose": "kb.embed"}
         requested_model = str(body.get("model") or "")
-        started = time.time()
         acc = gw.pool.acquire(model=requested_model)
         status, headers, data = gw.models_client.call(acc.session, suffix, body,
                                                       extra_headers=extra)
@@ -853,8 +857,6 @@ class Handler(BaseHTTPRequestHandler):
                                    data[:200].decode("utf-8", "replace"))
         elif status < 400:
             gw.pool.report_success(acc)
-        if suffix == "images/generations" and status == 200:
-            data = self._annotate_image_response(data, requested_model, started)
         self.send_response(status)
         self.send_header("Content-Type",
                          headers.get("Content-Type", "application/json"))
@@ -862,8 +864,81 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _images(self) -> None:
+        """``/v1/images/generations``: whitelist first, then the pool.
+
+        Image entitlement is an account-level whitelist the upstream never
+        exposes — an account can list the image models and still answer 406.
+        ``config.image_accounts`` names the accounts proven to work; they are
+        tried first (in config order), and only after every one of them failed
+        does the request fall back to the model-filtered pool.
+        """
+        gw = self.gateway
+        raw = self._read_body()
+        body = json.loads(raw.decode("utf-8")) if raw else {}
+        # exactly what the official client sends (image-generation-service.js
+        # DEFAULT_IMAGE_GENERATION_OPTIONS + REQUEST_PURPOSE.IMAGE_GENERATE)
+        body.setdefault("n", 1)
+        body.setdefault("size", "2304x1728")
+        body.setdefault("response_format", "url")
+        extra = {"X-Loomy-Request-Purpose": "image.generate"}
+        requested = str(body.get("model") or "")
+        started = time.time()
+
+        queue = [a for a in gw.image_accounts()
+                 if a.enabled and not a.in_cooldown]
+        pool_rounds = int(gw.cfg.get("max_retries") or 0) + 1
+        tried: list = []
+        status, headers, data = 0, {}, b""
+        while True:
+            if queue:
+                acc = queue.pop(0)
+            elif pool_rounds > 0:
+                pool_rounds -= 1
+                try:
+                    acc = gw.pool.acquire(exclude=tried, model=requested)
+                except PoolError as exc:
+                    gw.log(f"[images] {exc}")
+                    break
+            else:
+                break
+            tried.append(acc.name)
+            try:
+                status, headers, data = gw.models_client.call(
+                    acc.session, "images/generations", body, extra_headers=extra)
+            except Exception as exc:                    # noqa: BLE001
+                gw.log(f"[images] {acc.name} 请求异常：{exc}")
+                status, headers, data = 0, {}, b""
+                continue
+            if status == 200:
+                fault = business_error_status(data)
+                if fault is None:
+                    gw.pool.report_success(acc)
+                    data = self._annotate_image_response(
+                        data, requested, started, acc.name)
+                    break
+                status = fault
+            if status in self.ACCOUNT_FAULT:
+                # 401/403/402/429 are verdicts on the account itself.
+                gw.pool.report_failure(acc, status,
+                                       data[:200].decode("utf-8", "replace"))
+            # 406 (no image entitlement) and 5xx (upstream hiccup) are *not*
+            # the account's fault — skipping without cooling keeps the account
+            # available for chat.
+            gw.log(f"[images] {acc.name} http={status} → 换账号"
+                   f"：{data[:120].decode('utf-8', 'replace')}")
+        if status != 200:
+            self._log_giveup("images", requested, status or 502, len(tried),
+                             data[:160].decode("utf-8", "replace"))
+        self.send_response(status or 502)
+        self.send_header("Content-Type",
+                         headers.get("Content-Type", "application/json"))
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _annotate_image_response(self, data: bytes, requested: str,
-                                 started: float) -> bytes:
+                                 started: float, account: str = "") -> bytes:
         """Surface the model that actually served an image request.
 
         The upstream answers ``/images/generations`` without a ``model`` field
@@ -904,7 +979,7 @@ class Handler(BaseHTTPRequestHandler):
             note = f"实际 {served}" + (f" / {served_id}" if served_id else "")
             note += " ✅ 与请求一致" if same else " ⚠️ 与请求不一致（上游替换）"
         self.gateway.log(
-            f"[images] 请求 {requested or '-'} → {note}"
+            f"[images] {account or '-'} 请求 {requested or '-'} → {note}"
             f"（points={payload.get('points_consumed')}, "
             f"{time.time() - started:.1f}s）")
         return json.dumps(payload, ensure_ascii=False).encode("utf-8")

@@ -427,6 +427,28 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertEqual(img["body"]["response_format"], "url")
         self.assertEqual(img["body"]["n"], 1)
 
+    def test_image_whitelist_is_tried_first(self):
+        """config.image_accounts is tried before the pool: the whitelisted
+        account must serve the request even though the other one is fine."""
+        self.cfg["image_accounts"] = ["b"]
+        status, body, _ = self.post("/v1/images/generations",
+                                    {"model": "fake-model", "prompt": "cat"})
+        self.assertEqual(status, 200)
+        img_calls = [c for c in self.upstream.calls
+                     if c["path"].endswith("/images/generations")]
+        self.assertEqual([c["token"] for c in img_calls], ["s2"])   # b = s2
+
+    def test_image_whitelist_falls_back_to_pool(self):
+        """When every whitelisted account fails, the pool is tried next."""
+        self.cfg["image_accounts"] = ["b"]
+        self.upstream.image_reject_sessions = {"s2"}
+        status, body, _ = self.post("/v1/images/generations",
+                                    {"model": "fake-model", "prompt": "cat"})
+        self.assertEqual(status, 200)
+        img_calls = [c for c in self.upstream.calls
+                     if c["path"].endswith("/images/generations")]
+        self.assertEqual([c["token"] for c in img_calls], ["s2", "s1"])
+
     def test_rotation_on_rejected_session(self):
         # make the pick deterministic: the richest account is tried first
         self.gateway.pool.get("a").available = 1000

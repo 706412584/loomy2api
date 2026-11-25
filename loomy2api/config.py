@@ -37,6 +37,11 @@ DEFAULTS: Dict[str, Any] = {
     "default_model": C.DEFAULT_MODEL,
     "timeout": 1200,
     "request_purpose": "chat.message",
+    #: Account names proven to generate images.  The upstream gates image
+    #: generation per account and never exposes that in /models — an account
+    #: can list the image models and still answer 406.  Image requests try
+    #: these first (in this order), then fall back to the general pool.
+    "image_accounts": [],
     "log_dir": "logs",
     "log_requests": True,
     "strip_model_prefix": True,   # accept "imodel/deepseek-v4-flash-0731"

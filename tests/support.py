@@ -120,6 +120,9 @@ class FakeUpstream:
         self.dead_sessions_200: List[str] = []
         #: Sessions whose stream answers 200 + SSE but sends no data at all.
         self.empty_stream_sessions: List[str] = []
+        #: Sessions the image endpoint rejects with 406 (account lacks the
+        #: per-account image entitlement the upstream never publishes).
+        self.image_reject_sessions: set = set()
         #: Session token → scripted SSE events, as
         #: ``[("delta", {...}) | ("sleep", seconds) | ("done", None), ...]``.
         #: Lets a test drive a reasoning-only stream that either keeps making
@@ -319,6 +322,8 @@ class FakeUpstream:
                                  "inviteeReward": 5000, "inviterReward": 5000,
                                  "permanentBalance": 5000, "dailyBalance": 5000}})
                 if path.endswith("/images/generations"):
+                    if token in fake.image_reject_sessions:
+                        return fake._reject(self, 406, "当前账号暂不支持图片生成")
                     return fake._send_json(self, {
                         "data": [{"url": "http://x/1441669661-hy_image_v3_5_preview-"
                                           "0123456789abcdef0123456789abcdef_0.png"}],
