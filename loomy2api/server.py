@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -299,6 +300,29 @@ class Gateway:
 
 
 # ------------------------------------------------------------------ handler
+
+
+#: Image URLs end with ``<userid>-<backend_model>-<32 hex>_<n>.<ext>``.
+#: The upstream never returns the served model in the body, so the filename is
+#: the only place the real backend shows up.
+_IMAGE_BACKEND_RE = re.compile(r"-([A-Za-z0-9_]+)-[0-9a-f]{32}_\d+\.[A-Za-z0-9]+$")
+
+
+def _image_backend_tag(url: str) -> str:
+    # the URL carries a COS signature in its query string — strip it first
+    path = str(url or "").split("?", 1)[0]
+    match = _IMAGE_BACKEND_RE.search(path)
+    return match.group(1) if match else ""
+
+
+def _image_model_key(value: str) -> str:
+    """Normalise image ids/tags: ``hy_image_v3_5_preview`` ↔ ``Hy-Image-3.5-preview``.
+
+    Backend tags spell the version with underscores and a ``v`` (``v3_5``)
+    while catalogue ids use dots (``3.5``), so drop every separator and the
+    ``v`` before comparing.
+    """
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower()).replace("v", "")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -813,7 +837,9 @@ class Handler(BaseHTTPRequestHandler):
             # The official client declares embeddings as kb.embed
             # (REQUEST_PURPOSE.KB_EMBED); the adjudication layer reads it.
             extra = {"X-Loomy-Request-Purpose": "kb.embed"}
-        acc = gw.pool.acquire(model=str(body.get("model") or ""))
+        requested_model = str(body.get("model") or "")
+        started = time.time()
+        acc = gw.pool.acquire(model=requested_model)
         status, headers, data = gw.models_client.call(acc.session, suffix, body,
                                                       extra_headers=extra)
         if status == 200:
@@ -827,12 +853,61 @@ class Handler(BaseHTTPRequestHandler):
                                    data[:200].decode("utf-8", "replace"))
         elif status < 400:
             gw.pool.report_success(acc)
+        if suffix == "images/generations" and status == 200:
+            data = self._annotate_image_response(data, requested_model, started)
         self.send_response(status)
         self.send_header("Content-Type",
                          headers.get("Content-Type", "application/json"))
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _annotate_image_response(self, data: bytes, requested: str,
+                                 started: float) -> bytes:
+        """Surface the model that actually served an image request.
+
+        The upstream answers ``/images/generations`` without a ``model`` field
+        and silently routes every image id to whichever backend it has — today
+        all three ids land on ``hy_image_v3_5_preview``.  The only place the
+        real backend appears is the output filename, so parse it from the URL
+        and add ``requested_model`` / ``served_model`` / ``served_model_id`` to
+        the response (extra fields are harmless to OpenAI-shaped clients) and
+        write the same fact to the log.
+        """
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except Exception:                               # noqa: BLE001
+            return data
+        if not isinstance(payload, dict):
+            return data
+        served = ""
+        for item in payload.get("data") or []:
+            if isinstance(item, dict):
+                served = _image_backend_tag(item.get("url") or "")
+                if served:
+                    break
+        served_id = ""
+        if served:
+            key = _image_model_key(served)
+            for model in self.gateway.catalogue():
+                if _image_model_key(model.get("id")) == key:
+                    served_id = str(model.get("id"))
+                    break
+        payload["requested_model"] = requested
+        payload["served_model"] = served or "unknown"
+        if served_id:
+            payload["served_model_id"] = served_id
+        if not served:
+            note = "实际 unknown（响应里没有可识别的后端标识）"
+        else:
+            same = _image_model_key(served_id or served) == _image_model_key(requested)
+            note = f"实际 {served}" + (f" / {served_id}" if served_id else "")
+            note += " ✅ 与请求一致" if same else " ⚠️ 与请求不一致（上游替换）"
+        self.gateway.log(
+            f"[images] 请求 {requested or '-'} → {note}"
+            f"（points={payload.get('points_consumed')}, "
+            f"{time.time() - started:.1f}s）")
+        return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     # ---------------------------------------------------------- chat (core)
 

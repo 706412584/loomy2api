@@ -319,7 +319,10 @@ class FakeUpstream:
                                  "inviteeReward": 5000, "inviterReward": 5000,
                                  "permanentBalance": 5000, "dailyBalance": 5000}})
                 if path.endswith("/images/generations"):
-                    return fake._send_json(self, {"data": [{"url": "http://x/img.png"}]})
+                    return fake._send_json(self, {
+                        "data": [{"url": "http://x/1441669661-hy_image_v3_5_preview-"
+                                          "0123456789abcdef0123456789abcdef_0.png"}],
+                        "points_consumed": 110})
                 if path.endswith("/embeddings"):
                     return fake._send_json(self, {"data": [{"index": 0, "embedding": [0.1]}]})
                 return fake._reject(self, 404, "not found")

@@ -411,7 +411,11 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertEqual(json.loads(body)["data"][0]["embedding"], [0.1])
         _s, body, _ = self.post("/v1/images/generations", {"model": "fake-model",
                                                           "prompt": "cat"})
-        self.assertIn("url", json.loads(body)["data"][0])
+        img_payload = json.loads(body)
+        self.assertIn("url", img_payload["data"][0])
+        # the upstream never names the served model; the gateway must surface it
+        self.assertEqual(img_payload["requested_model"], "fake-model")
+        self.assertEqual(img_payload["served_model"], "hy_image_v3_5_preview")
         emb = [c for c in self.upstream.calls
                if c["path"].endswith("/embeddings")][-1]
         self.assertEqual(emb["headers"]["X-Loomy-Request-Purpose"], "kb.embed")
