@@ -139,6 +139,98 @@ def _chat_id_for(session: str) -> str:
     return f"chat-{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
 
+def _has_image_part(payload: Dict[str, Any]) -> bool:
+    """True when any message carries an inline image part."""
+    if not isinstance(payload, dict):
+        return False
+    for message in payload.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in ("image_url", "input_image"):
+                    return True
+    return False
+
+
+def _session_affinity(session: str, payload: Dict[str, Any]) -> str:
+    """A stable ``ses_<id>`` for backend stickiness / prefix cache.
+
+    The official opencode path sends ``x-session-affinity: ses_<session id>``
+    and it drives which upstream replica serves the turn (and thus whether the
+    prompt prefix cache can be reused).  A gateway has no conversation id, so
+    we seed with the account session plus the first user message — that stays
+    identical across the turns of one conversation and differs between them.
+    """
+    seed = ""
+    if isinstance(payload, dict):
+        for message in payload.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                seed = content
+            elif isinstance(content, list):
+                seed = json.dumps(content, ensure_ascii=False)
+            break
+    h = hashlib.sha256((session + "\x00" + seed).encode("utf-8")).hexdigest()
+    return f"ses_{h[:32]}"
+
+
+def _sanitize_chat_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill empty content / inject a text part so strict upstreams accept it.
+
+    The upstream got stricter in 2026-11: ``content: ""``, ``content: null`` and
+    multimodal arrays whose parts are all images are answered with the generic
+    400 "请求有误，请重试" (same shape aigw fixed on 2026-11-25).  Copy-on-write:
+    the caller's payload is never mutated.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return payload
+    changed = False
+    out = []
+    for message in messages:
+        if not isinstance(message, dict):
+            out.append(message)
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if not content.strip():
+                message = {**message, "content": " "}
+                changed = True
+        elif content is None:
+            message = {**message, "content": " "}
+            changed = True
+        elif isinstance(content, list):
+            if not content:
+                message = {**message, "content": [{"type": "text", "text": " "}]}
+                changed = True
+                out.append(message)
+                continue
+            has_text = any(
+                isinstance(p, dict) and p.get("type") == "text"
+                and str(p.get("text") or "").strip()
+                for p in content)
+            if not has_text:
+                message = {**message, "content": [
+                    {"type": "text", "text": "[image]"}, *content]}
+                changed = True
+            else:
+                cleaned = [
+                    p for p in content
+                    if not (isinstance(p, dict) and p.get("type") == "text"
+                            and not str(p.get("text") or "").strip())]
+                if len(cleaned) != len(content):
+                    message = {**message, "content": cleaned}
+                    changed = True
+        out.append(message)
+    return {**payload, "messages": out} if changed else payload
+
+
 class ModelGateway:
     """Thin wrapper around the upstream HTTP API."""
 
@@ -159,23 +251,34 @@ class ModelGateway:
                                    extra=extra)
 
     def _chat_headers(self, session: str,
-                      extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        """Headers for ``/chat/completions`` — adds the 0.9.39 attribution set.
+                      extra: Optional[Dict[str, str]] = None,
+                      payload: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        """Headers for ``/chat/completions`` — attribution + routing.
 
         The official client sends ``ChatId``/``MsgId``/``TurnId``/
         ``InvokeOrigin``/``X-Loomy-Request-Purpose`` on every chat call and the
         upstream's adjudication layer reads them (reversed from 0.9.39 in
-        magpie-loomy-auth 0.1.28).  A caller-supplied value wins, so the
-        OpenAI path can still forward its own ids.
+        magpie-loomy-auth 0.1.28).  The *purpose* is also what routes the turn:
+        an inline image sent as ``chat.message`` is stalled or answered blind,
+        while ``kb.vision`` serves it in ~2 s (measured 2026-11-25), so a
+        request carrying an image must be declared as vision.  The
+        ``x-session-affinity`` header comes from the opencode chat path and
+        decides backend stickiness / prefix-cache reuse.
+
+        A caller-supplied value always wins, so the OpenAI path can forward its
+        own ids and purpose.
         """
         msg_id = f"msg-{uuid.uuid4()}"
+        purpose = str(self.cfg.get("request_purpose") or "chat.message")
+        if payload is not None and _has_image_part(payload):
+            purpose = "kb.vision"
         defaults = {
             "ChatId": _chat_id_for(session),
             "MsgId": msg_id,
             "TurnId": msg_id,
             "InvokeOrigin": "user",
-            "X-Loomy-Request-Purpose": str(
-                self.cfg.get("request_purpose") or "chat.message"),
+            "X-Loomy-Request-Purpose": purpose,
+            "x-session-affinity": _session_affinity(session, payload or {}),
         }
         defaults.update(extra or {})
         return self._headers(session, defaults)
@@ -387,10 +490,12 @@ class ModelGateway:
     def call(self, session: str, suffix: str, payload: Dict[str, Any],
              extra_headers: Optional[Dict[str, str]] = None,
              method: str = "POST") -> Tuple[int, Dict[str, str], bytes]:
+        chat = suffix == "chat/completions"
+        if chat:
+            payload = _sanitize_chat_payload(payload)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload else None
-        headers = (self._chat_headers(session, extra_headers)
-                   if suffix == "chat/completions"
-                   else self._headers(session, extra_headers))
+        headers = (self._chat_headers(session, extra_headers, payload)
+                   if chat else self._headers(session, extra_headers))
         return http_request(
             self._url(suffix), method=method, headers=headers,
             body=body, timeout=float(self.cfg.get("timeout") or 1200),
@@ -398,10 +503,12 @@ class ModelGateway:
 
     def stream(self, session: str, suffix: str, payload: Dict[str, Any],
                extra_headers: Optional[Dict[str, str]] = None):
+        chat = suffix == "chat/completions"
+        if chat:
+            payload = _sanitize_chat_payload(payload)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers = (self._chat_headers(session, extra_headers)
-                   if suffix == "chat/completions"
-                   else self._headers(session, extra_headers))
+        headers = (self._chat_headers(session, extra_headers, payload)
+                   if chat else self._headers(session, extra_headers))
         return open_stream(
             self._url(suffix), method="POST",
             headers=headers, body=body,

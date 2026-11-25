@@ -66,6 +66,28 @@ The gateway derives `ChatId` from the account session (stable per account),
 generates a fresh `MsgId`/`TurnId` per request, and takes the purpose from
 `config.request_purpose`.
 
+**The purpose is a routing switch, not just attribution.** Measured 2026-11-25
+on `DeepSeek-V4.1-Flash` with one inline PNG:
+
+| `X-Loomy-Request-Purpose` | result |
+|---|---|
+| `chat.message` | 504 Gateway Time-out after 150 s (or a blind answer, `input_tokens` 65) |
+| `kb.vision` | **200 in 2.2 s, image read correctly** (served by `qwen3.8-flash`) |
+
+So any request body that carries an inline image must be declared `kb.vision`.
+The gateway does this automatically in `upstream._chat_headers`.
+
+A second chat path, the official client's **opencode** build, sends
+`x-session-affinity: ses_<id>` instead of the attribution headers above; it
+drives backend stickiness and prompt-prefix-cache reuse. The gateway derives it
+from the account session plus the first user message (stable across the turns
+of one conversation).
+
+Finally, the upstream rejects empty content since 2026-11: `content: ""`,
+`content: null` and image-only multimodal arrays get the generic
+`400 请求有误，请重试`. `upstream._sanitize_chat_payload` fills a single space /
+prepends an `[image]` text part before sending.
+
 ### Session lifetime
 
 `14 * 24 * 3600` seconds, requested explicitly at login. There is **no refresh

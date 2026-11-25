@@ -7,9 +7,11 @@ rotation when one account's session is rejected.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -17,9 +19,27 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import zlib
 from pathlib import Path
 
 from loomy2api.server import Gateway, Handler, Server
+
+
+def _tiny_png_b64() -> str:
+    """A 8×8 solid-red PNG, base64 — enough for the vision-purpose tests."""
+    w = h = 8
+    raw = b"".join(b"\x00" + bytes((220, 20, 20)) * w for _ in range(h))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return (struct.pack(">I", len(data)) + body
+                + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw))
+           + chunk(b"IEND", b""))
+    return base64.b64encode(png).decode()
 from loomy2api.upstream import business_error_status
 from tests.support import FakeUpstream, free_port, make_config, write_accounts
 
@@ -304,6 +324,73 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         self.assertTrue(by_token)
         for chat_ids in by_token.values():
             self.assertEqual(len(chat_ids), 1)
+
+    def test_vision_request_declares_kb_vision_purpose(self):
+        """An inline image must be routed as ``kb.vision``: sent as
+        ``chat.message`` the upstream stalls for ~150 s and answers blind
+        (measured 2026-11-25); ``kb.vision`` serves it in ~2 s."""
+        self.post("/v1/messages", {
+            "model": "fake-model", "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64",
+                                             "media_type": "image/png",
+                                             "data": _tiny_png_b64()}},
+                {"type": "text", "text": "what color?"}]}]})
+        call = [c for c in self.upstream.calls
+                if c["path"].endswith("/chat/completions")][-1]
+        self.assertEqual(call["headers"]["X-Loomy-Request-Purpose"], "kb.vision")
+        parts = call["body"]["messages"][-1]["content"]
+        self.assertTrue(any(p.get("type") == "image_url" for p in parts))
+
+    def test_text_request_uses_chat_message_purpose(self):
+        self.post("/v1/messages", {
+            "model": "fake-model", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]})
+        call = [c for c in self.upstream.calls
+                if c["path"].endswith("/chat/completions")][-1]
+        self.assertEqual(call["headers"]["X-Loomy-Request-Purpose"], "chat.message")
+
+    def test_chat_calls_include_session_affinity(self):
+        self.post("/v1/messages", {
+            "model": "fake-model", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]})
+        call = [c for c in self.upstream.calls
+                if c["path"].endswith("/chat/completions")][-1]
+        self.assertRegex(call["headers"]["x-session-affinity"], r"^ses_[0-9a-f]{32}$")
+
+    def test_session_affinity_is_stable_per_conversation(self):
+        """Same account + same first user turn → same affinity across turns;
+        a different conversation or account → different affinity."""
+        from loomy2api.upstream import _session_affinity
+        first = {"messages": [{"role": "user", "content": "hello"}]}
+        later = {"messages": [{"role": "user", "content": "hello"},
+                              {"role": "assistant", "content": "hi"},
+                              {"role": "user", "content": "more"}]}
+        self.assertEqual(_session_affinity("s1", first), _session_affinity("s1", later))
+        self.assertNotEqual(
+            _session_affinity("s1", first),
+            _session_affinity("s1", {"messages": [{"role": "user", "content": "other"}]}))
+        self.assertNotEqual(_session_affinity("s1", first), _session_affinity("s2", first))
+
+    def test_empty_content_is_filled_for_strict_upstream(self):
+        self.post("/v1/chat/completions", {
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": ""}]})
+        call = [c for c in self.upstream.calls
+                if c["path"].endswith("/chat/completions")][-1]
+        self.assertEqual(call["body"]["messages"][-1]["content"], " ")
+
+    def test_image_only_message_gets_text_part(self):
+        self.post("/v1/chat/completions", {
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url",
+                 "image_url": {"url": "data:image/png;base64,AAAA"}}]}]})
+        call = [c for c in self.upstream.calls
+                if c["path"].endswith("/chat/completions")][-1]
+        parts = call["body"]["messages"][-1]["content"]
+        self.assertEqual(parts[0], {"type": "text", "text": "[image]"})
+        self.assertEqual(parts[1]["type"], "image_url")
 
     def test_points_endpoint(self):
         _s, payload = self.get("/v1/points")
