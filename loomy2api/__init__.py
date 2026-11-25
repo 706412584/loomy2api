@@ -15,7 +15,7 @@ Typical use::
 
 from __future__ import annotations
 
-__version__ = "2.9.3"
+__version__ = "2.9.4"
 
 from .account import Account, AccountClient, AccountError      # noqa: F401
 from .config import Config, load_config, PROJECT_ROOT          # noqa: F401
