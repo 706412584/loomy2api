@@ -118,6 +118,10 @@ def build_model_headers(session: str, *, version: str = "",
         "Authorization": f"Bearer {session}",
         "token": session,
         "traceparent": f"00-{uuid.uuid4().hex}-{uuid.uuid4().hex[:16]}-01",
+        # Without a client-shaped UA the upstream treats the caller as unknown
+        # and routes it differently (slow queue, and image generation answers
+        # 406 even on entitled accounts).
+        "User-Agent": C.CLIENT_UA,
     }
     if version:
         headers["loomy-version"] = str(version)

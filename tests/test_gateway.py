@@ -412,6 +412,16 @@ class GatewayTestCase(_Harness, unittest.TestCase):
         _s, body, _ = self.post("/v1/images/generations", {"model": "fake-model",
                                                           "prompt": "cat"})
         self.assertIn("url", json.loads(body)["data"][0])
+        emb = [c for c in self.upstream.calls
+               if c["path"].endswith("/embeddings")][-1]
+        self.assertEqual(emb["headers"]["X-Loomy-Request-Purpose"], "kb.embed")
+        img = [c for c in self.upstream.calls
+               if c["path"].endswith("/images/generations")][-1]
+        self.assertEqual(img["headers"]["X-Loomy-Request-Purpose"], "image.generate")
+        # the official client's defaults must be filled in when the caller omits them
+        self.assertEqual(img["body"]["size"], "2304x1728")
+        self.assertEqual(img["body"]["response_format"], "url")
+        self.assertEqual(img["body"]["n"], 1)
 
     def test_rotation_on_rejected_session(self):
         # make the pick deterministic: the richest account is tried first

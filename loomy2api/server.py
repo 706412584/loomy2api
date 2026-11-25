@@ -799,8 +799,23 @@ class Handler(BaseHTTPRequestHandler):
         gw = self.gateway
         raw = self._read_body()
         body = json.loads(raw.decode("utf-8")) if raw else {}
+        extra = None
+        if suffix == "images/generations":
+            # Exactly what the official client sends (image-generation-service.js
+            # DEFAULT_IMAGE_GENERATION_OPTIONS + REQUEST_PURPOSE.IMAGE_GENERATE).
+            # Without the defaults and the purpose header the upstream answers
+            # 406 "当前账号暂不支持图片生成" even on an entitled account.
+            body.setdefault("n", 1)
+            body.setdefault("size", "2304x1728")
+            body.setdefault("response_format", "url")
+            extra = {"X-Loomy-Request-Purpose": "image.generate"}
+        elif suffix == "embeddings":
+            # The official client declares embeddings as kb.embed
+            # (REQUEST_PURPOSE.KB_EMBED); the adjudication layer reads it.
+            extra = {"X-Loomy-Request-Purpose": "kb.embed"}
         acc = gw.pool.acquire(model=str(body.get("model") or ""))
-        status, headers, data = gw.models_client.call(acc.session, suffix, body)
+        status, headers, data = gw.models_client.call(acc.session, suffix, body,
+                                                      extra_headers=extra)
         if status == 200:
             # a dead session answers 200 with a JSON envelope on these
             # endpoints too — surface it as the error it is
